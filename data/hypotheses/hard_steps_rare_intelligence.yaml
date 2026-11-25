@@ -1,0 +1,16 @@
+id: hard_steps_rare_intelligence
+name: "Hard Steps: Rare Intelligence"
+tier: 2
+summary: "A sequence of improbable evolutionary transitions makes technological origins rare; origin rate sits at the registry lower bound."
+parameter_constraints:
+  origin_rate_per_kpc2_gyr: { mode: fixed, value: 1.0e-4 }
+  expansion_speed_c: { mode: fixed, value: 0.01 }
+  radio_detect_prob: { mode: fixed, value: 0.0021 }
+channels_activated: ["radio", "solar_system"]
+falsification_condition: "Independent evidence of frequent origins (e.g. multiple nearby technosignature detections) excludes the rate bound."
+benchmark_notes: >-
+  Tier 2: the origin rate is constrained by Earth-history / hard-steps arguments,
+  not by the photon channels. Scored for context only.
+citations:
+  - "Carter 1983, Phil. Trans. R. Soc. A 310, 347"
+  - "Hanson et al. 2021 (arXiv:2102.01522)"

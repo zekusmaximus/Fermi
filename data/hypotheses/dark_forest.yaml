@@ -1,0 +1,11 @@
+id: dark_forest
+name: "Dark Forest"
+tier: 3
+summary: "Civilizations hide because revealing themselves invites pre-emptive destruction."
+quarantine_reason: "Predicts universal strategic silence; null results are equally expected whether or not civilizations exist."
+monoculture_audit:
+  required_compliance_fraction: 1.0
+  timescale_gyr: 1.0
+  defector_vulnerability: "Any civilization that is careless, young, or indifferent to the threat emits detectably; silence requires every actor to adopt the same strategy for Gyr."
+citations:
+  - "Brin 1983, QJRAS 24, 283 (the 'deadly probes' / silence-strategy class)"

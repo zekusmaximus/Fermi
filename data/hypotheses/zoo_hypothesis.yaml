@@ -1,0 +1,11 @@
+id: zoo_hypothesis
+name: "Zoo Hypothesis"
+tier: 3
+summary: "Advanced civilizations deliberately avoid contact and conceal themselves from Earth."
+quarantine_reason: "Predicts intentional concealment indistinguishable from non-existence under current photon channels."
+monoculture_audit:
+  required_compliance_fraction: 1.0
+  timescale_gyr: 1.0
+  defector_vulnerability: "A single non-compliant subgroup or breakaway probe breaks observational silence."
+citations:
+  - "Ball 1973, Icarus 19, 347"

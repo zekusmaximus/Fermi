@@ -1,0 +1,74 @@
+{
+  "generated_at_utc": "2026-11-25T22:26:21.905359+00:00",
+  "data_tier": "published_catalog",
+  "column_data_tiers": {
+    "published_catalog": [
+      "target_name",
+      "ra_deg",
+      "dec_deg",
+      "dist_legacy_pc",
+      "spectral_type",
+      "vmag"
+    ],
+    "reproduced_archive": [
+      "dist_gaia_pc",
+      "gaia_dr3_source_id",
+      "gaia_parallax_mas",
+      "gaia_parallax_err_mas",
+      "gaia_ruwe",
+      "eirp_revision_factor"
+    ],
+    "derived": [
+      "dist_pc",
+      "dist_source"
+    ]
+  },
+  "gaia_distance_rule": "dist_gaia_pc = 1/parallax when parallax > 0 and parallax_over_error >= 5",
+  "gaia_query_receipts": [
+    {
+      "endpoint": "https://gaia.ari.uni-heidelberg.de/tap/sync",
+      "queried_at_utc": "2026-11-25T22:26:21.188864+00:00",
+      "adql_sha256": "a346e0eafaf07141a16d1fa57d48a441a91503d9a127f47f85b0398813439a36",
+      "n_hip_requested": 250,
+      "n_rows_returned": 201
+    },
+    {
+      "endpoint": "https://gaia.ari.uni-heidelberg.de/tap/sync",
+      "queried_at_utc": "2026-11-25T22:26:21.571681+00:00",
+      "adql_sha256": "84fc5a9b62625cf16e11a9bea0d3d6e704e91033633b3ebd7166a257c8ad6831",
+      "n_hip_requested": 250,
+      "n_rows_returned": 188
+    },
+    {
+      "endpoint": "https://gaia.ari.uni-heidelberg.de/tap/sync",
+      "queried_at_utc": "2026-11-25T22:26:21.882109+00:00",
+      "adql_sha256": "96d5070719be43c512b63f4ef482d94873e5cb3e9e90fb66e6ecded49daee032",
+      "n_hip_requested": 165,
+      "n_rows_returned": 133
+    }
+  ],
+  "gaia_mirror_failures": [
+    "gea.esac.esa.int: Expected VOTable, got Content-Type='text/html; charset=UTF-8', 1563023 bytes: <title>Gaia Science Archive \u2014 DR1 Release</title>"
+  ],
+  "pointing_group_id": "bl_gbt_lband_2017",
+  "output_csv": "data/catalogs/bl_692_targets.csv",
+  "output_sha256": "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2",
+  "row_count": 692,
+  "isaacson_matched_count": 692,
+  "unmatched_vizier_targets": [],
+  "gaia_dr3_matched_count": 517,
+  "missing_distance_count": 0,
+  "sources": {
+    "bl": "https://seti.berkeley.edu/lband2017/692stars.csv",
+    "vizier": "https://vizier.cfa.harvard.edu/viz-bin/asu-tsv?-source=J/PASP/129/E4501/table1&-out.all&-out.max=unlimited",
+    "gaia": "https://gaia.ari.uni-heidelberg.de/tap/sync"
+  },
+  "top_eirp_distance_revisions": [
+    {
+      "target_name": "HIP 1692",
+      "dist_legacy_pc": 23.0,
+      "dist_gaia_pc": 788.7067,
+      "eirp_revision_factor": 1175.9135
+    }
+  ]
+}

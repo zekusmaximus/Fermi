@@ -1,0 +1,30 @@
+id: bl_enriquez_2017_692
+name: "Breakthrough Listen L-Band 692 Nearby Stars"
+channel: radio
+pointing_group_id: bl_gbt_lband_2017
+data_tier: published_catalog
+n_targets: 692
+frequency_ghz: [1.1, 1.9]
+# Enriquez et al. 2017 Sec. 5.1: S_min = 17 Jy for a 1 Hz-wide transmitter at
+# S/N >= 25 in 3 Hz channels over 300 s (SPEC.md's placeholder 10.0 Jy is the SEFD).
+nominal_flux_limit_jy: 17.0
+observed_detections: 0
+catalog_path: "data/catalogs/bl_692_targets.csv"
+catalog_sha256: "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2"
+catalog_provenance_path: "data/catalogs/bl_692_targets.provenance.json"
+radio_sensitivity:
+  data_tier: published_catalog
+  sefd_jy: 10.0
+  snr_threshold: 25.0
+  channel_bandwidth_hz: 3.0
+  integration_time_s: 300.0
+  n_pol: 2
+  reference_eirp_w: 5.2e12          # Table 3, 'This work', most distant target
+  reference_distance_pc: 50.0
+  citation: "Enriquez et al. 2017, arXiv:1709.03491v2, Sec. 5.1 eqs. 2-5 and Table 3 (verified 2026-11-25)"
+anchor_claims:
+  - "data/adversary_claims/hip_1692.yaml"
+citations:
+  - "Enriquez et al. 2017, ApJ 849, 104 (arXiv:1709.03491)"
+  - "Isaacson et al. 2017, PASP 129, 054501 (VizieR J/PASP/129/E4501)"
+  - "Gaia Collaboration 2023, A&A 674, A1 (Gaia DR3)"

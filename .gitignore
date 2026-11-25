@@ -1,0 +1,34 @@
+# Python & uv
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local run outputs & SQLite queues (reproducible via seed + git SHA)
+runs/
+*.sqlite
+*.sqlite3
+*.db
+
+# Large astronomical archive caches (Milestone 2+ FITS cutouts / raw downloads)
+data/fits/
+data/cache/
+*.fits
+*.fits.gz
+
+# Frontend (Milestone 3)
+web/node_modules/
+web/dist/
+
+# Editors & OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.env
+.env.local

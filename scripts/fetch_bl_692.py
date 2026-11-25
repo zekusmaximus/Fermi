@@ -2,17 +2,16 @@
 """Fetch, cross-match, and checksum the Breakthrough Listen 692-star target catalog.
 
 Provenance pipeline:
-1. Downloads the Enriquez et al. (2017) L-band 692-star target CSV from the
-   Berkeley SETI publications page (or a user-supplied --bl-csv local file).
-2. Queries CDS VizieR TAP for Isaacson et al. (2017) Table 1
-   ("J/PASP/129/E4501/table1") to attach J2000 coordinates, spectral types,
-   and published legacy distances (pc).
-3. Queries ESA Gaia DR3 TAP (gaiadr3.hipparcos2_best_neighbour joined to
-   gaiadr3.gaia_source) in deterministic batches to attach Gaia DR3 parallaxes
-   and flag major distance / minimum-EIRP revisions (e.g., HIP 1692).
-4. Writes:
-   - data/catalogs/bl_692_targets.csv
-   - data/catalogs/bl_692_targets.provenance.json (with SHA-256 & query receipts)
+1. Enriquez et al. (2017) L-band 692-star target list (Berkeley SETI, or --bl-csv).
+2. Isaacson et al. (2017) Table 1 (VizieR ``J/PASP/129/E4501/table1``): J2000
+   coordinates, spectral types, and published legacy distances.
+3. Gaia DR3 parallaxes via ``gaiadr3.hipparcos2_best_neighbour`` joined to
+   ``gaiadr3.gaia_source`` over TAP (VOTable responses parsed with
+   ``astropy.io.votable``; HTML / error responses are rejected explicitly).
+4. Writes ``data/catalogs/bl_692_targets.csv`` and
+   ``data/catalogs/bl_692_targets.provenance.json`` (SHA-256 + query receipts).
+
+This script performs live network access and is never invoked by the test suite.
 
 Usage:
     uv run python scripts/fetch_bl_692.py
@@ -26,10 +25,11 @@ import hashlib
 import io
 import json
 import re
-import sys
+import ssl
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,284 +37,338 @@ import astropy.units as u
 import numpy as np
 import pandas as pd
 from astropy.coordinates import SkyCoord
+from astropy.io.votable import parse as parse_votable
 
-BL_PUBLICATIONS_URL = "https://seti.berkeley.edu/lband2017/publications.html"
-VIZIER_TAP_SYNC_URL = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
-GAIA_TAP_SYNC_URL = "https://gea.esac.esa.int/tap-server/tap/sync"
-VIZIER_ISAACSON_TABLE = '"J/PASP/129/E4501/table1"'
-POINTING_GROUP_ID = "bl_gbt_lband_2017"
-USER_AGENT = "fermi-desk-catalog-fetcher/0.1 (MIT; https://github.com)"
+BL_PUB = "https://seti.berkeley.edu/lband2017/publications.html"
+VIZ_SRC = "J/PASP/129/E4501/table1"
+VIZ_ASU = [
+    f"https://vizier.cfa.harvard.edu/viz-bin/asu-tsv?-source={VIZ_SRC}&-out.all&-out.max=unlimited",
+    f"https://vizier.cds.unistra.fr/viz-bin/asu-tsv?-source={VIZ_SRC}&-out.all&-out.max=unlimited",
+]
+VIZ_TAP = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
+GAIA_TAPS = [
+    "https://gea.esac.esa.int/tap-server/tap/sync",
+    "https://gaia.ari.uni-heidelberg.de/tap/sync",
+]
+GROUP_ID = "bl_gbt_lband_2017"
+UA = "fermi-desk-fetcher/0.3 (MIT)"
+STAR_RE = re.compile(
+    r"^(HIP|GJ|HD|LHS|GL|WD|TYC|HR|BD|CD|CPD|LP|ROSS|WOLF|PROXIMA|BARNARD)\s*[\d+-]",
+    re.I,
+)
 
 
-def http_get_text(url: str, timeout: int = 60) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def get_text(url: str, timeout: int = 45) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
 
-def tap_sync_csv(endpoint: str, adql: str, timeout: int = 90) -> pd.DataFrame:
-    payload = urllib.parse.urlencode(
+class TapResponseError(RuntimeError):
+    """A TAP endpoint answered, but not with a usable VOTable result."""
+
+
+def _snippet(raw: bytes, n: int = 160) -> str:
+    txt = raw[:2000].decode("utf-8", errors="replace")
+    title = re.search(r"<title>(.*?)</title>", txt, flags=re.I | re.S)
+    if title:
+        return f"<title>{title.group(1).strip()}</title>"
+    return re.sub(r"\s+", " ", txt)[:n]
+
+
+def tap_query(url: str, adql: str, timeout: int = 90) -> pd.DataFrame:
+    """Run a synchronous ADQL query and return the result table.
+
+    Requests a VOTable (the TAP default serialization) and validates the reply:
+    - Non-XML replies (e.g. an archive web page served with HTTP 200 instead of
+      the TAP service, as observed on gea.esac.esa.int) raise ``TapResponseError``.
+    - VOTables carrying ``INFO name="QUERY_STATUS" value="ERROR"`` raise with the
+      server's ADQL error message instead of an opaque parser failure.
+    TLS certificate verification is never disabled.
+    """
+    body = urllib.parse.urlencode(
         {
             "REQUEST": "doQuery",
             "LANG": "ADQL",
-            "FORMAT": "csv",
+            "FORMAT": "votable",
+            "RESPONSEFORMAT": "votable",
             "QUERY": adql,
         }
-    ).encode("utf-8")
+    ).encode()
     req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
+        url,
+        data=body,
+        headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-    return pd.read_csv(io.StringIO(raw))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        # TAP services often return a VOTable error document with HTTP 400/500.
+        ctype, raw = exc.headers.get("Content-Type", ""), exc.read()
+        if b"QUERY_STATUS" not in raw:
+            raise TapResponseError(f"HTTP {exc.code}: {_snippet(raw)}") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise TapResponseError(
+                f"TLS certificate verification failed ({exc.reason.verify_message}); "
+                "verification is intentionally not disabled. Point SSL_CERT_FILE at a "
+                "CA bundle containing the server's chain if your OS store is incomplete."
+            ) from exc
+        raise
+
+    head = raw.lstrip()[:512].lower()
+    if b"<votable" not in head and not head.startswith(b"<?xml"):
+        raise TapResponseError(
+            f"Expected VOTable, got Content-Type={ctype!r}, {len(raw)} bytes: {_snippet(raw)}"
+        )
+    vot = parse_votable(io.BytesIO(raw), verify="warn")
+    for res in vot.resources:
+        for info in res.infos:
+            if info.name == "QUERY_STATUS" and str(info.value).upper() == "ERROR":
+                msg = (info.content or "").strip() or "unspecified error"
+                raise TapResponseError(f"ADQL QUERY_STATUS=ERROR: {msg}")
+    tables = list(vot.iter_tables())
+    if not tables:
+        raise TapResponseError("VOTable contained no TABLE element")
+    return tables[0].to_table(use_names_over_ids=True).to_pandas()
 
 
-def normalize_star_id(raw: Any) -> str:
-    """Canonicalize star names (e.g., 'HIP  1692', 'HIP1692', 'hip_1692' -> 'HIP 1692')."""
-    if pd.isna(raw):
+def norm_id(val: Any) -> str:
+    if pd.isna(val):
         return ""
-    text = str(raw).strip().upper().replace("_", " ")
-    text = re.sub(r"\s+", " ", text)
-    # Normalize common catalog prefixes missing a space: HIP1692 -> HIP 1692
-    text = re.sub(r"^(HIP|GJ|HD|LHS|GL|WD|TYC)\s*0*(\d+)", r"\1 \2", text)
-    return text
+    s = re.sub(r"\s+", " ", str(val).strip().upper().replace("_", " "))
+    return re.sub(r"^(HIP|GJ|HD|LHS|GL|WD|TYC)\s*0*(\d+)", r"\1 \2", s)
 
 
-def extract_hip_number(canonical_name: str) -> int | None:
-    match = re.match(r"^HIP\s+(\d+)$", canonical_name)
-    return int(match.group(1)) if match else None
+def hip_num(name: str) -> int | None:
+    m = re.match(r"^HIP\s+(\d+)$", name)
+    return int(m.group(1)) if m else None
 
 
-def discover_bl_csv_url(publications_url: str) -> str:
-    """Parse the Berkeley SETI L-band 2017 publications page for its target CSV link."""
-    html = http_get_text(publications_url)
-    matches = re.findall(r'href=["\']([^"\']+\.csv)["\']', html, flags=re.IGNORECASE)
-    if not matches:
-        raise RuntimeError(
-            f"Could not find a .csv link on {publications_url}. "
-            "Pass --bl-csv with a local copy or direct URL."
-        )
-    # Prefer a link referencing target/star/692 if multiple CSVs exist
-    for href in matches:
-        if any(k in href.lower() for k in ("target", "star", "692", "enriquez", "list")):
-            return urllib.parse.urljoin(publications_url, href)
-    return urllib.parse.urljoin(publications_url, matches[0])
-
-
-def load_enriquez_692(bl_csv: str | None) -> tuple[pd.DataFrame, str]:
-    """Load the observed 692-star target list from Berkeley SETI or a local CSV."""
+def load_bl_692(bl_csv: str | None) -> tuple[pd.DataFrame, str]:
     if bl_csv:
-        source_ref = bl_csv
-        if bl_csv.startswith(("http://", "https://")):
-            raw = http_get_text(bl_csv)
-            df = pd.read_csv(io.StringIO(raw))
-        else:
-            df = pd.read_csv(Path(bl_csv))
-    else:
-        source_ref = discover_bl_csv_url(BL_PUBLICATIONS_URL)
-        raw = http_get_text(source_ref)
-        df = pd.read_csv(io.StringIO(raw))
-
-    # Defensive column discovery (Berkeley CSVs sometimes omit headers or name it Star/Target/Source)
-    cols_lower = {c.lower().strip(): c for c in df.columns}
-    name_col = None
-    for candidate in ("target_name", "target", "star", "source", "source_name", "name"):
-        if candidate in cols_lower:
-            name_col = cols_lower[candidate]
-            break
-
-    if name_col is None:
-        # Handle single-column headerless CSVs cleanly
-        if df.shape[1] == 1:
-            first_val = str(df.columns[0])
-            series = pd.concat([pd.Series([first_val]), df.iloc[:, 0]], ignore_index=True)
-            df = pd.DataFrame({"raw_target_name": series})
-            name_col = "raw_target_name"
-        else:
-            name_col = df.columns[0]
-
-    out = pd.DataFrame()
-    out["raw_target_name"] = df[name_col].astype(str).str.strip()
-    out["target_name"] = out["raw_target_name"].map(normalize_star_id)
-    out = out[out["target_name"] != ""].drop_duplicates(subset=["target_name"]).reset_index(drop=True)
-    return out, source_ref
-
-
-def fetch_isaacson_vizier() -> tuple[pd.DataFrame, str]:
-    """Fetch Isaacson et al. (2017) Table 1 from CDS VizieR TAP."""
-    adql = f"SELECT * FROM {VIZIER_ISAACSON_TABLE}"
-    df = tap_sync_csv(VIZIER_TAP_SYNC_URL, adql)
-
-    # Identify key columns robustly across VizieR formatting
-    col_map = {c.lower(): c for c in df.columns}
-    star_col = col_map.get("star") or col_map.get("name")
-    ra_col = col_map.get("raj2000") or col_map.get("_raj2000")
-    de_col = col_map.get("dej2000") or col_map.get("_dej2000")
-    dist_col = col_map.get("dist")
-    sptype_col = col_map.get("sptype")
-    vmag_col = col_map.get("vmag")
-    simbad_col = col_map.get("simbadname")
-
-    if not all([star_col, ra_col, de_col, dist_col]):
-        raise RuntimeError(
-            f"Unexpected VizieR columns in {VIZIER_ISAACSON_TABLE}: {list(df.columns)}"
+        src = bl_csv
+        txt = (
+            get_text(bl_csv)
+            if bl_csv.startswith(("http://", "https://"))
+            else Path(bl_csv).read_text(encoding="utf-8", errors="replace")
         )
+    else:
+        html = get_text(BL_PUB)
+        links = re.findall(r'href=["\']([^"\']+\.csv)["\']', html, flags=re.I)
+        if not links:
+            raise RuntimeError(f"No CSV link found on {BL_PUB}")
+        pick = next(
+            (h for h in links if any(k in h.lower() for k in ("692", "star", "target"))), links[0]
+        )
+        src = urllib.parse.urljoin(BL_PUB, pick)
+        txt = get_text(src)
 
-    # Convert coordinates via Astropy (supports either decimal deg or h:m:s / d:m:s)
-    ra_vals = df[ra_col].astype(str).str.strip()
-    de_vals = df[de_col].astype(str).str.strip()
-    if ra_vals.str.contains(r"[:\s]").any():
-        coords = SkyCoord(ra_vals.tolist(), de_vals.tolist(), unit=(u.hourangle, u.deg), frame="icrs")
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    first = lines[0].split(",")[0].strip().strip("\"'")
+    if STAR_RE.match(first):
+        df = pd.read_csv(io.StringIO(txt), header=None)
+        col = 0
+        print(f"      Headerless CSV ({df.shape[1]} cols, {len(df)} raw rows)")
+    else:
+        df = pd.read_csv(io.StringIO(txt))
+        cmap = {str(c).lower().strip(): c for c in df.columns}
+        col = next(
+            (cmap[k] for k in ("target_name", "target", "star", "source", "name") if k in cmap),
+            df.columns[0],
+        )
+        print(f"      Headered CSV; cols={list(df.columns)} (using '{col}')")
+
+    out = pd.DataFrame({"target_name": df[col].map(norm_id)})
+    out = out[out["target_name"] != ""].reset_index(drop=True)
+    dupes = out[out.duplicated("target_name", keep=False)]
+    if not dupes.empty:
+        print(f"      Collapsed duplicates: {sorted(dupes['target_name'].unique())}")
+    return out.drop_duplicates("target_name").reset_index(drop=True), src
+
+
+def parse_asu_tsv(raw: str) -> pd.DataFrame:
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+    header = [c.strip() for c in lines[0].split("\t")]
+    start = 1
+    for i in range(1, min(6, len(lines))):
+        s = lines[i].replace("\t", "").strip()
+        if s and set(s) <= {"-", " "}:
+            start = i + 1
+            break
+    return pd.read_csv(io.StringIO("\n".join(lines[start:])), sep="\t", names=header, dtype=str)
+
+
+def fetch_vizier() -> tuple[pd.DataFrame, str]:
+    df, used, errs = None, "", []
+    for url in VIZ_ASU:
+        host = urllib.parse.urlparse(url).netloc
+        try:
+            print(f"      Trying VizieR mirror: {host}")
+            df, used = parse_asu_tsv(get_text(url)), url
+            break
+        except Exception as exc:
+            errs.append(f"{host}: {exc}")
+    if df is None:
+        try:
+            print("      Falling back to CDS VizieR TAP")
+            df, used = tap_query(VIZ_TAP, f'SELECT * FROM "{VIZ_SRC}"').astype(str), VIZ_TAP
+        except Exception as exc:
+            errs.append(f"TAP: {exc}")
+    if df is None:
+        raise RuntimeError("VizieR mirrors failed: " + "; ".join(errs))
+
+    cm = {str(c).strip().lower(): c for c in df.columns}
+    sc = cm.get("star") or cm.get("name")
+    rc = cm.get("raj2000") or cm.get("_raj2000")
+    dc = cm.get("dej2000") or cm.get("_dej2000")
+    lc = cm.get("dist")
+    if not all([sc, rc, dc, lc]):
+        raise RuntimeError(f"Unexpected VizieR columns: {list(df.columns)}")
+
+    ra_s = df[rc].astype(str).str.strip()
+    de_s = df[dc].astype(str).str.strip()
+    if ra_s.str.contains(r"[:\s]").any():
+        coords = SkyCoord(ra_s.tolist(), de_s.tolist(), unit=(u.hourangle, u.deg))
     else:
         coords = SkyCoord(
-            ra_vals.astype(float).to_numpy() * u.deg,
-            de_vals.astype(float).to_numpy() * u.deg,
-            frame="icrs",
+            ra_s.astype(float).to_numpy() * u.deg, de_s.astype(float).to_numpy() * u.deg
         )
 
-    parsed = pd.DataFrame(
+    sp, vm = cm.get("sptype"), cm.get("vmag")
+    res = pd.DataFrame(
         {
-            "target_name": df[star_col].map(normalize_star_id),
-            "simbad_name": df[simbad_col].astype(str).str.strip() if simbad_col else "",
+            "target_name": df[sc].map(norm_id),
             "ra_deg": np.round(coords.ra.to(u.deg).value, 6),
             "dec_deg": np.round(coords.dec.to(u.deg).value, 6),
-            "dist_legacy_pc": pd.to_numeric(df[dist_col], errors="coerce"),
-            "spectral_type": df[sptype_col].astype(str).str.strip() if sptype_col else "",
-            "vmag": pd.to_numeric(df[vmag_col], errors="coerce") if vmag_col else np.nan,
+            "dist_legacy_pc": pd.to_numeric(df[lc], errors="coerce"),
+            "spectral_type": df[sp].astype(str).str.strip() if sp else "",
+            "vmag": pd.to_numeric(df[vm], errors="coerce") if vm else np.nan,
         }
     )
-    parsed = parsed.drop_duplicates(subset=["target_name"]).reset_index(drop=True)
-    return parsed, adql
+    return res.drop_duplicates("target_name").reset_index(drop=True), used
 
 
-def fetch_gaia_dr3_for_hips(hip_ids: list[int], batch_size: int = 250) -> tuple[pd.DataFrame, list[str]]:
-    """Query ESA Gaia DR3 TAP for Hipparcos-matched parallaxes and quality metrics."""
-    frames: list[pd.DataFrame] = []
-    queries: list[str] = []
-    sorted_hips = sorted(set(hip_ids))
-
-    for i in range(0, len(sorted_hips), batch_size):
-        batch = sorted_hips[i : i + batch_size]
-        in_clause = ", ".join(str(h) for h in batch)
-        adql = (
-            "SELECT xm.original_ext_source_id AS hip_id, "
-            "gs.source_id AS gaia_dr3_source_id, "
-            "gs.ra AS gaia_ra_deg, gs.dec AS gaia_dec_deg, "
-            "gs.parallax AS gaia_parallax_mas, "
-            "gs.parallax_error AS gaia_parallax_err_mas, "
-            "gs.parallax_over_error AS gaia_parallax_snr, "
-            "gs.ruwe AS gaia_ruwe, "
-            "xm.angular_distance AS xmatch_sep_arcsec "
-            "FROM gaiadr3.hipparcos2_best_neighbour AS xm "
-            "JOIN gaiadr3.gaia_source AS gs ON xm.source_id = gs.source_id "
-            f"WHERE xm.original_ext_source_id IN ({in_clause})"
-        )
-        queries.append(adql)
-        frames.append(tap_sync_csv(GAIA_TAP_SYNC_URL, adql))
-
-    if not frames:
-        return pd.DataFrame(columns=["hip_id"]), queries
-
-    gaia_df = pd.concat(frames, ignore_index=True)
-    gaia_df["hip_id"] = pd.to_numeric(gaia_df["hip_id"], errors="coerce").astype("Int64")
-    # Keep closest match if multiple best_neighbour rows exist
-    gaia_df = (
-        gaia_df.sort_values(["hip_id", "xmatch_sep_arcsec"], ascending=[True, True])
-        .drop_duplicates(subset=["hip_id"], keep="first")
-        .reset_index(drop=True)
-    )
-
-    # Convert parallax (mas) -> distance (pc) using Astropy equivalencies where SNR > 5 and parallax > 0
-    valid = (gaia_df["gaia_parallax_mas"] > 0) & (gaia_df["gaia_parallax_snr"] >= 5.0)
-    dist_pc = np.full(len(gaia_df), np.nan, dtype=float)
-    if valid.any():
-        plx_qty = gaia_df.loc[valid, "gaia_parallax_mas"].to_numpy() * u.mas
-        dist_pc[valid.to_numpy()] = plx_qty.to(u.pc, equivalencies=u.parallax()).value
-    gaia_df["dist_gaia_pc"] = np.round(dist_pc, 4)
-    return gaia_df, queries
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def fetch_gaia(
+    hips: list[int], batch: int = 250
+) -> tuple[pd.DataFrame, str, list[dict], list[str]]:
+    ids = sorted(set(hips))
+    errs = []
+    for url in GAIA_TAPS:
+        host = urllib.parse.urlparse(url).netloc
+        try:
+            print(f"      Trying Gaia TAP mirror: {host}")
+            frames, receipts = [], []
+            for i in range(0, len(ids), batch):
+                in_list = ",".join(map(str, ids[i : i + batch]))
+                q = (
+                    "SELECT xm.original_ext_source_id AS hip_id, gs.source_id AS gaia_dr3_source_id, "
+                    "gs.parallax AS gaia_parallax_mas, gs.parallax_error AS gaia_parallax_err_mas, "
+                    "gs.parallax_over_error AS plx_snr, gs.ruwe AS gaia_ruwe, xm.angular_distance AS sep "
+                    "FROM gaiadr3.hipparcos2_best_neighbour AS xm "
+                    "JOIN gaiadr3.gaia_source AS gs ON xm.source_id = gs.source_id "
+                    f"WHERE xm.original_ext_source_id IN ({in_list})"
+                )
+                part = tap_query(url, q)
+                frames.append(part)
+                receipts.append(
+                    {
+                        "endpoint": url,
+                        "queried_at_utc": datetime.now(UTC).isoformat(),
+                        "adql_sha256": hashlib.sha256(q.encode()).hexdigest(),
+                        "n_hip_requested": len(ids[i : i + batch]),
+                        "n_rows_returned": len(part),
+                    }
+                )
+                print(f"        batch {i // batch + 1}: {len(part)} rows")
+            g = pd.concat(frames, ignore_index=True)
+            g["hip_id"] = pd.to_numeric(g["hip_id"], errors="coerce").astype("Int64")
+            # 64-bit Gaia source IDs must stay integer (float64 silently corrupts them).
+            g["gaia_dr3_source_id"] = g["gaia_dr3_source_id"].astype("Int64")
+            g = g.sort_values(["hip_id", "sep"]).drop_duplicates("hip_id").reset_index(drop=True)
+            ok = (g["gaia_parallax_mas"] > 0) & (g["plx_snr"] >= 5.0)
+            dist = np.full(len(g), np.nan)
+            if ok.any():
+                dist[ok.to_numpy()] = (
+                    (g.loc[ok, "gaia_parallax_mas"].to_numpy() * u.mas)
+                    .to(u.pc, equivalencies=u.parallax())
+                    .value
+                )
+            g["dist_gaia_pc"] = np.round(dist, 4)
+            return g, url, receipts, errs
+        except Exception as exc:
+            print(f"      {host} failed: {exc}")
+            errs.append(f"{host}: {exc}")
+    raise RuntimeError("Gaia mirrors failed: " + "; ".join(errs))
 
 
-def build_catalog(
-    output_csv: Path,
-    bl_csv: str | None = None,
-    skip_gaia: bool = False,
-) -> dict[str, Any]:
-    print("[1/4] Fetching Enriquez et al. (2017) 692-star target list...")
-    bl_df, bl_source = load_enriquez_692(bl_csv)
-    print(f"      Loaded {len(bl_df)} unique targets from {bl_source}")
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--output", type=Path, default=Path("data/catalogs/bl_692_targets.csv"))
+    ap.add_argument("--bl-csv", type=str, default=None)
+    ap.add_argument("--skip-gaia", action="store_true")
+    args = ap.parse_args()
 
-    print("[2/4] Querying CDS VizieR for Isaacson et al. (2017) Table 1...")
-    isaacson_df, vizier_adql = fetch_isaacson_vizier()
-    print(f"      Retrieved {len(isaacson_df)} rows from {VIZIER_ISAACSON_TABLE}")
+    print("[1/4] Fetching Enriquez et al. (2017) target list...")
+    bl, bl_src = load_bl_692(args.bl_csv)
+    print(f"      Loaded {len(bl)} unique targets from {bl_src}")
 
-    merged = bl_df.merge(isaacson_df, on="target_name", how="left")
-    merged["hip_id"] = merged["target_name"].map(extract_hip_number).astype("Int64")
+    print("[2/4] Fetching Isaacson et al. (2017) Table 1 from VizieR...")
+    viz, viz_url = fetch_vizier()
+    print(f"      Retrieved {len(viz)} rows")
 
-    gaia_queries: list[str] = []
-    if skip_gaia:
-        print("[3/4] Skipping Gaia DR3 cross-match (--skip-gaia set).")
-        merged["gaia_dr3_source_id"] = pd.NA
-        merged["gaia_parallax_mas"] = np.nan
-        merged["gaia_parallax_err_mas"] = np.nan
-        merged["gaia_ruwe"] = np.nan
-        merged["dist_gaia_pc"] = np.nan
+    m = bl.merge(viz, on="target_name", how="left")
+    m["hip_id"] = m["target_name"].map(hip_num).astype("Int64")
+    unmatched = m.loc[m["ra_deg"].isna(), "target_name"].tolist()
+    if unmatched:
+        print(f"      Unmatched in VizieR: {len(unmatched)} (e.g., {unmatched[:8]})")
+
+    gaia_url, gaia_receipts, gaia_errors = None, [], []
+    if args.skip_gaia:
+        for c in (
+            "gaia_dr3_source_id",
+            "gaia_parallax_mas",
+            "gaia_parallax_err_mas",
+            "gaia_ruwe",
+            "dist_gaia_pc",
+        ):
+            m[c] = np.nan
     else:
-        hip_list = merged["hip_id"].dropna().astype(int).tolist()
-        print(f"[3/4] Cross-matching {len(hip_list)} HIP targets against ESA Gaia DR3 TAP...")
-        gaia_df, gaia_queries = fetch_gaia_dr3_for_hips(hip_list)
-        merged = merged.merge(
-            gaia_df[
-                [
-                    "hip_id",
-                    "gaia_dr3_source_id",
-                    "gaia_parallax_mas",
-                    "gaia_parallax_err_mas",
-                    "gaia_ruwe",
-                    "dist_gaia_pc",
-                ]
-            ],
-            on="hip_id",
-            how="left",
+        hips = m["hip_id"].dropna().astype(int).tolist()
+        print(f"[3/4] Cross-matching {len(hips)} HIP targets against Gaia DR3...")
+        g, gaia_url, gaia_receipts, gaia_errors = fetch_gaia(hips)
+        cols = [
+            "hip_id",
+            "gaia_dr3_source_id",
+            "gaia_parallax_mas",
+            "gaia_parallax_err_mas",
+            "gaia_ruwe",
+            "dist_gaia_pc",
+        ]
+        m = m.merge(g[cols], on="hip_id", how="left")
+        print(
+            f"      Matched high-SNR Gaia DR3 distances: {int(m['dist_gaia_pc'].notna().sum())}/{len(m)}"
         )
-        matched_gaia = int(merged["dist_gaia_pc"].notna().sum())
-        print(f"      Matched high-SNR Gaia DR3 distances for {matched_gaia}/{len(merged)} targets")
 
-    # Select canonical distance (prefer high-SNR Gaia DR3, fall back to Isaacson 2017)
-    has_gaia = merged["dist_gaia_pc"].notna()
-    merged["dist_pc"] = np.where(has_gaia, merged["dist_gaia_pc"], merged["dist_legacy_pc"])
-    merged["dist_source"] = np.where(
-        has_gaia,
+    has_g = m["dist_gaia_pc"].notna()
+    m["dist_pc"] = np.where(has_g, m["dist_gaia_pc"], m["dist_legacy_pc"])
+    m["dist_source"] = np.where(
+        has_g,
         "gaia_dr3_parallax",
-        np.where(merged["dist_legacy_pc"].notna(), "isaacson_2017_vizier", "missing"),
+        np.where(m["dist_legacy_pc"].notna(), "isaacson_2017_vizier", "missing"),
     )
-
-    # Compute minimum-EIRP revision multiplier = (d_gaia / d_legacy)^2
-    both_valid = merged["dist_gaia_pc"].notna() & (merged["dist_legacy_pc"] > 0)
-    merged["eirp_revision_factor"] = np.nan
-    merged.loc[both_valid, "eirp_revision_factor"] = np.round(
-        (merged.loc[both_valid, "dist_gaia_pc"] / merged.loc[both_valid, "dist_legacy_pc"]) ** 2,
-        4,
+    both = has_g & (m["dist_legacy_pc"] > 0)
+    m["eirp_revision_factor"] = np.nan
+    m.loc[both, "eirp_revision_factor"] = np.round(
+        (m.loc[both, "dist_gaia_pc"] / m.loc[both, "dist_legacy_pc"]) ** 2, 4
     )
+    m["pointing_group_id"] = GROUP_ID
+    m["data_tier"] = "published_catalog"
 
-    merged["pointing_group_id"] = POINTING_GROUP_ID
-    merged["data_tier"] = "published_catalog"
-
-    # Deterministic column order and row sort
-    ordered_cols = [
+    keep = [
         "target_name",
         "ra_deg",
         "dec_deg",
@@ -332,93 +386,74 @@ def build_catalog(
         "pointing_group_id",
         "data_tier",
     ]
-    merged = merged[ordered_cols].sort_values("target_name", kind="mergesort").reset_index(drop=True)
+    m = m[keep].sort_values("target_name", kind="mergesort").reset_index(drop=True)
 
-    print(f"[4/4] Writing verified catalog to {output_csv}...")
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(output_csv, index=False)
-    digest = sha256_file(output_csv)
+    print(f"[4/4] Writing {args.output} ...")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Fixed LF terminator so the pinned SHA-256 is platform-independent.
+    m.to_csv(args.output, index=False, lineterminator="\n")
+    sha = hashlib.sha256(args.output.read_bytes()).hexdigest()
 
-    # Audit summary: flag severe distance/EIRP revisions (>2x EIRP shift)
-    severe = merged[
-        merged["eirp_revision_factor"].notna()
-        & ((merged["eirp_revision_factor"] >= 2.0) | (merged["eirp_revision_factor"] <= 0.5))
-    ].sort_values("eirp_revision_factor", ascending=False)
-
-    flagged_revisions = [
+    sev = m[
+        m["eirp_revision_factor"].notna()
+        & ((m["eirp_revision_factor"] >= 2.0) | (m["eirp_revision_factor"] <= 0.5))
+    ]
+    sev = sev.sort_values("eirp_revision_factor", ascending=False)
+    top_rev = [
         {
-            "target_name": row.target_name,
-            "dist_legacy_pc": float(row.dist_legacy_pc),
-            "dist_gaia_pc": float(row.dist_gaia_pc),
-            "eirp_revision_factor": float(row.eirp_revision_factor),
+            "target_name": r.target_name,
+            "dist_legacy_pc": float(r.dist_legacy_pc),
+            "dist_gaia_pc": float(r.dist_gaia_pc),
+            "eirp_revision_factor": float(r.eirp_revision_factor),
         }
-        for row in severe.head(15).itertuples(index=False)
+        for r in sev.head(15).itertuples(index=False)
     ]
 
-    provenance = {
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    prov = {
+        "generated_at_utc": datetime.now(UTC).isoformat(),
         "data_tier": "published_catalog",
-        "pointing_group_id": POINTING_GROUP_ID,
-        "output_csv": str(output_csv),
-        "output_sha256": digest,
-        "row_count": int(len(merged)),
-        "expected_enriquez_2017_count": 692,
-        "isaacson_matched_count": int(merged["ra_deg"].notna().sum()),
-        "gaia_dr3_matched_count": int(merged["dist_gaia_pc"].notna().sum()),
-        "missing_distance_count": int(merged["dist_pc"].isna().sum()),
-        "sources": {
-            "enriquez_2017_target_list": bl_source,
-            "vizier_endpoint": VIZIER_TAP_SYNC_URL,
-            "vizier_adql": vizier_adql,
-            "gaia_endpoint": GAIA_TAP_SYNC_URL if not skip_gaia else None,
-            "gaia_query_batch_count": len(gaia_queries),
+        "column_data_tiers": {
+            "published_catalog": [
+                "target_name",
+                "ra_deg",
+                "dec_deg",
+                "dist_legacy_pc",
+                "spectral_type",
+                "vmag",
+            ],
+            "reproduced_archive": [
+                "dist_gaia_pc",
+                "gaia_dr3_source_id",
+                "gaia_parallax_mas",
+                "gaia_parallax_err_mas",
+                "gaia_ruwe",
+                "eirp_revision_factor",
+            ],
+            "derived": ["dist_pc", "dist_source"],
         },
-        "top_eirp_distance_revisions": flagged_revisions,
+        "gaia_distance_rule": "dist_gaia_pc = 1/parallax when parallax > 0 and parallax_over_error >= 5",
+        "gaia_query_receipts": gaia_receipts,
+        "gaia_mirror_failures": gaia_errors,
+        "pointing_group_id": GROUP_ID,
+        "output_csv": args.output.as_posix(),
+        "output_sha256": sha,
+        "row_count": len(m),
+        "isaacson_matched_count": int(m["ra_deg"].notna().sum()),
+        "unmatched_vizier_targets": unmatched,
+        "gaia_dr3_matched_count": int(m["dist_gaia_pc"].notna().sum()),
+        "missing_distance_count": int(m["dist_pc"].isna().sum()),
+        "sources": {"bl": bl_src, "vizier": viz_url, "gaia": gaia_url},
+        "top_eirp_distance_revisions": top_rev,
     }
+    prov_path = args.output.with_suffix(".provenance.json")
+    prov_path.write_text(json.dumps(prov, indent=2) + "\n", encoding="utf-8")
 
-    prov_path = output_csv.with_suffix(".provenance.json")
-    prov_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
-
-    print(f"      SHA-256: {digest}")
-    print(f"      Provenance receipt: {prov_path}")
-    if flagged_revisions:
-        top = flagged_revisions[0]
+    print(f"      SHA-256: {sha}")
+    if top_rev:
+        t = top_rev[0]
         print(
-            f"      Largest EIRP shift: {top['target_name']} "
-            f"({top['dist_legacy_pc']} pc -> {top['dist_gaia_pc']} pc, "
-            f"{top['eirp_revision_factor']}x EIRP_min)"
+            f"      Largest EIRP shift: {t['target_name']} ({t['dist_legacy_pc']} -> {t['dist_gaia_pc']} pc, {t['eirp_revision_factor']}x)"
         )
-    return provenance
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Fetch and verify the Breakthrough Listen 692-star catalog with Gaia DR3 distances."
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/catalogs/bl_692_targets.csv"),
-        help="Destination CSV path (default: data/catalogs/bl_692_targets.csv)",
-    )
-    parser.add_argument(
-        "--bl-csv",
-        type=str,
-        default=None,
-        help="Optional local path or direct URL to the Enriquez et al. (2017) 692-star CSV.",
-    )
-    parser.add_argument(
-        "--skip-gaia",
-        action="store_true",
-        help="Skip ESA Gaia DR3 cross-match (keeps Isaacson 2017 VizieR distances only).",
-    )
-    args = parser.parse_args()
-
-    try:
-        build_catalog(output_csv=args.output, bl_csv=args.bl_csv, skip_gaia=args.skip_gaia)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
     return 0
 
 

@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fermi-desk"
+version = "0.1.0"
+description = "Executable empirical constraint engine and Bayesian Optimal Experimental Design (BOED) desk for the Fermi paradox."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "zekusmaximus" },
+]
+keywords = [
+    "fermi-paradox",
+    "seti",
+    "technosignatures",
+    "astrobiology",
+    "bayesian-inference",
+    "optimal-experimental-design",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+dependencies = [
+    "astropy>=6.1",
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "scipy>=1.13",
+    "typer>=0.12",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+fermi-desk = "fermi_desk.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fermi_desk"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "network: marks tests requiring live external archive access (excluded from offline CI)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "E501", # handled by ruff format
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

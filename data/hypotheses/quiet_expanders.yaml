@@ -1,0 +1,18 @@
+id: quiet_expanders
+name: "Quiet Expanders"
+tier: 1
+summary: "Settlement proceeds as in the frequent/slow benchmark but leaves no detectable radio, waste-heat, or Solar System signature."
+parameter_constraints:
+  origin_rate_per_kpc2_gyr: { mode: fixed, value: 4.0 }
+  expansion_speed_c: { mode: fixed, value: 0.005 }
+  radio_detect_prob: { mode: fixed, value: 0.0 }
+  ir_host_fraction: { mode: fixed, value: 1.0e-5 }
+  ir_conspicuous_fraction: { mode: fixed, value: 0.0 }
+  solar_system_artifact_detect_prob: { mode: fixed, value: 0.0 }
+channels_activated: ["radio", "infrared", "solar_system"]
+falsification_condition: "Not falsifiable by null photon-channel data alone (all emission probabilities are zero); serves as the zero-emission reference."
+benchmark_notes: >-
+  Shares ir_host_fraction with partial_dyson_conspicuous so the IR comparison
+  isolates signature loudness. Every likelihood ratio vs. silence must equal 1.0.
+citations:
+  - "Suazo et al. 2024, MNRAS 531, 695 (arXiv:2405.02927)"

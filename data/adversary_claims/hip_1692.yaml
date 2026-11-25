@@ -1,0 +1,30 @@
+# HIP 1692 distance revision (Milestone 2 Adversary input; recorded in M1 so the
+# legacy / Gaia distances can be toggled). Values are data, not code branches.
+id: hip_1692_distance_revision
+target_name: "HIP 1692"
+pointing_group_id: bl_gbt_lband_2017
+gaia_dr3_source_id: 2430036837596487424
+claim: >-
+  The Isaacson et al. (2017) legacy distance of 23.0 pc is superseded by Gaia;
+  minimum detectable EIRP scales as d^2, i.e. by >1000x.
+distances:
+  - label: isaacson_2017_legacy
+    value_pc: 23.0
+    data_tier: published_catalog
+    catalog_column: dist_legacy_pc
+    source: "VizieR J/PASP/129/E4501/table1 (via data/catalogs/bl_692_targets.csv, dist_legacy_pc)"
+  - label: gaia_dr2_bailer_jones_2018_r_est
+    value_pc: 752.614616349562
+    interval_pc: [725.732599819726, 781.521451301833]
+    data_tier: reproduced_archive
+    source: "ARI Gaia TAP gaiadr2_complements.geometric_distance (Bailer-Jones et al. 2018), source_id 2430036837596487424"
+    queried_at_utc: "2026-11-25"
+    note: "This is the ~752.6 pc value used by Wlodarczyk-Sroka et al. 2020; it is NOT 1/parallax (DR2 1/parallax = 769.37 pc)."
+  - label: gaia_dr3_inverse_parallax
+    value_pc: 788.7067
+    data_tier: reproduced_archive
+    catalog_column: dist_gaia_pc
+    source: "data/catalogs/bl_692_targets.csv (dist_gaia_pc; parallax 1.26790 +/- 0.02734 mas)"
+citations:
+  - "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720"
+  - "Bailer-Jones et al. 2018, AJ 156, 58"

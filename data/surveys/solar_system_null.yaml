@@ -1,0 +1,17 @@
+id: solar_system_null
+name: "Local Solar System Artifact / Interstellar-Object Null"
+channel: solar_system
+pointing_group_id: local_solar_system
+# The observation (no confirmed artifact) is a qualitative literature summary; the
+# detection probability it is paired with is illustrative.
+data_tier: illustrative_calibration
+n_targets: 1
+observed_detections: 0
+solar_system:
+  description: >-
+    No confirmed non-terrestrial artifact in the Solar System. The forward model is
+    1 - P(Earth reached) * p_ss. When the engine conditions on Earth being unreached,
+    this channel contributes exactly 1.0 (already implied; never double-counted).
+citations:
+  - "Haqq-Misra & Kopparapu 2012, Acta Astronautica 72, 15"
+  - "Freitas 1983, JBIS 36, 501"

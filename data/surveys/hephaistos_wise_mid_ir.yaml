@@ -1,0 +1,46 @@
+id: hephaistos_wise_mid_ir
+name: "Project Hephaistos II: Gaia DR3 + 2MASS + AllWISE Partial Dyson Sphere Search"
+channel: infrared
+pointing_group_id: wise_gaia_hephaistos
+# Survey-level tier is the LEAST verified input entering the likelihood: the
+# completeness / false-positive pairs below are illustrative, so any likelihood
+# computed from this file is an illustrative sensitivity bracket, not a bound.
+data_tier: illustrative_calibration
+n_targets: 200000
+observed_detections: 7
+infrared:
+  counts_data_tier: published_catalog
+  counts_citation: >-
+    Suazo et al. 2024 (arXiv:2405.02927v1): ~5e6 Gaia-2MASS-AllWISE sources within
+    300 pc; ~320,000 with W3/W4 detections; ~200,000 with W3/W4 SNR >= 3.5 (Sec. 4);
+    7 final candidates (Sec. 5). n_targets uses the ~200,000 SNR-cut sample.
+  anchor_false_positive_rate: 1.1e-5
+  anchor_false_positive_citation: >-
+    Suazo et al. 2024 Sec. 4: background-galaxy contamination rate ~1.1e-5 per source
+    (~2 expected contaminants among ~200,000). Covers ONE confounder class only.
+  calibration_data_tier: illustrative_calibration
+  calibration_construction: >-
+    3 completeness values x 5 false-positive rates spanning 0.1x to 5x the published
+    background-galaxy contamination anchor (expected false positives 0.22 to 11 vs. 7
+    observed). This is a sensitivity bracket while the empirical blend-recovery grid
+    (Milestone 2) is open; it is NOT a measured calibration.
+  calibrations:
+    - { id: c25_fp0p1x, completeness: 0.25, false_positive_rate: 1.1e-6 }
+    - { id: c25_fp0p5x, completeness: 0.25, false_positive_rate: 5.5e-6 }
+    - { id: c25_fp1x,   completeness: 0.25, false_positive_rate: 1.1e-5 }
+    - { id: c25_fp2x,   completeness: 0.25, false_positive_rate: 2.2e-5 }
+    - { id: c25_fp5x,   completeness: 0.25, false_positive_rate: 5.5e-5 }
+    - { id: c50_fp0p1x, completeness: 0.50, false_positive_rate: 1.1e-6 }
+    - { id: c50_fp0p5x, completeness: 0.50, false_positive_rate: 5.5e-6 }
+    - { id: c50_fp1x,   completeness: 0.50, false_positive_rate: 1.1e-5 }
+    - { id: c50_fp2x,   completeness: 0.50, false_positive_rate: 2.2e-5 }
+    - { id: c50_fp5x,   completeness: 0.50, false_positive_rate: 5.5e-5 }
+    - { id: c75_fp0p1x, completeness: 0.75, false_positive_rate: 1.1e-6 }
+    - { id: c75_fp0p5x, completeness: 0.75, false_positive_rate: 5.5e-6 }
+    - { id: c75_fp1x,   completeness: 0.75, false_positive_rate: 1.1e-5 }
+    - { id: c75_fp2x,   completeness: 0.75, false_positive_rate: 2.2e-5 }
+    - { id: c75_fp5x,   completeness: 0.75, false_positive_rate: 5.5e-5 }
+citations:
+  - "Suazo et al. 2024, MNRAS 531, 695 (arXiv:2405.02927)"
+  - "Ren et al. 2026 (Hephaistos Candidates D/E follow-up; citation hook per SPEC.md, details to be verified in Milestone 2)"
+  - "Zackrisson et al. 2026 (Hephaistos Candidates D/E follow-up; citation hook per SPEC.md, details to be verified in Milestone 2)"

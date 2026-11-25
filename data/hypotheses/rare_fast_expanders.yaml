@@ -1,0 +1,19 @@
+id: rare_fast_expanders
+name: "Rare Origins, Fast Expansion Fronts"
+tier: 1
+summary: "Civilizations arise rarely but expand at a large fraction of c."
+parameter_constraints:
+  origin_rate_per_kpc2_gyr: { mode: fixed, value: 4.0e-4 }
+  expansion_speed_c: { mode: fixed, value: 0.5 }
+  radio_detect_prob: { mode: fixed, value: 0.0021 }
+channels_activated: ["radio", "solar_system"]
+falsification_condition: "Joint multi-channel null detections push likelihood ratio below 1e-3."
+benchmark_notes: >-
+  Constructed (not fitted) as the exact thin_disk_2d degenerate partner of
+  frequent_slow_expanders: v_exp x100 and Gamma_2d x1e-4 keep Gamma_2d * v_exp^2
+  fixed, so P(Earth reached) is identical in 2D. Same p_radio, so any separation
+  comes only from spatial-correlation geometry, 3D volume scaling, and light-travel
+  delays. v_exp = 0.5 c makes v_exp*T exceed the local-approximation radius for any
+  T > ~52 kyr; receipts flag this.
+citations:
+  - "Hanson et al. 2021 (arXiv:2102.01522)"

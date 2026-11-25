@@ -1,0 +1,126 @@
+# Canonical physical Parameter Registry (SPEC.md Section 4.1).
+#
+# Every hypothesis and survey binds to these ids. Unit strings are parsed with
+# astropy.units.Unit at load time; the single alias "dimensionless" maps to
+# astropy's dimensionless_unscaled (astropy itself does not parse that word).
+#
+# log_uniform priors whose lower bound is 0 (allowed by SPEC for probabilities)
+# MUST declare a positive `log_floor`, otherwise the prior is undefined.
+schema_version: 1
+parameters:
+  - id: origin_rate_per_kpc2_gyr
+    symbol: "Gamma_2d"
+    unit: "1 / (kpc2 * Gyr)"
+    prior_type: log_uniform
+    bounds: [1.0e-4, 1.0e3]
+    description: "Civilization origin rate per unit Galactic disk area per Gyr."
+
+  - id: expansion_speed_c
+    symbol: "v_exp"
+    unit: "dimensionless"
+    prior_type: log_uniform
+    bounds: [1.0e-5, 0.5]
+    description: "Mean isotropic settlement front velocity as a fraction of c."
+
+  - id: disk_scale_height_pc
+    symbol: "h_z"
+    unit: "pc"
+    prior_type: fixed_or_bounded
+    default: 300.0
+    bounds: [100.0, 1000.0]
+    description: >-
+      Galactic stellar thin-disk vertical scale height. In thick_disk_3d mode the
+      origin process is a uniform slab |z_mid| <= h_z with volumetric rate
+      Gamma_2d / (2 h_z), so the column-integrated rate equals Gamma_2d.
+
+  - id: lookback_window_gyr
+    symbol: "T"
+    unit: "Gyr"
+    prior_type: log_uniform
+    default: 1.0e-3
+    bounds: [1.0e-6, 10.0]
+    description: >-
+      Duration of the origin process before the present epoch. The expansion
+      kernel uses a local, translation-invariant disk/slab, valid only while
+      v_exp * T is small compared with the Sun's Galactocentric radius (~8 kpc);
+      run receipts flag violations. The 1 Myr default is a round-decade
+      convention, NOT a fitted value; results depend strongly on T.
+
+  - id: solar_height_pc
+    symbol: "z_sun"
+    unit: "pc"
+    prior_type: fixed
+    default: 20.8
+    bounds: [0.0, 50.0]
+    description: "Height of the Sun above the local Galactic mid-plane (thick_disk_3d only)."
+    citations:
+      - "Bennett & Bovy 2019, MNRAS 482, 1417 (arXiv:1809.03507): z_sun = 20.8 +/- 0.3 pc"
+
+  - id: radio_detect_prob
+    symbol: "p_radio"
+    unit: "dimensionless"
+    prior_type: log_uniform
+    bounds: [0.0, 1.0]
+    log_floor: 1.0e-8
+    description: >-
+      Probability a settled system emits a detectable narrowband radio signature
+      during observation. In radio_mode=distance_scaled_eirp it is the emitting
+      (duty-cycle) fraction, further thinned by P(EIRP >= EIRP_min(d)).
+
+  - id: transmitter_eirp_median_w
+    symbol: "L_med"
+    unit: "W"
+    prior_type: log_uniform
+    default: 1.0e13
+    bounds: [1.0e8, 1.0e20]
+    description: >-
+      Median of the log-normal transmitter EIRP luminosity function used by
+      radio_mode=distance_scaled_eirp. Default is the ~1e13 W scale quoted by
+      Enriquez et al. 2017 as 'readily achievable by our own civilization'
+      (illustrative, not a measured population property).
+
+  - id: transmitter_eirp_sigma_dex
+    symbol: "sigma_L"
+    unit: "dimensionless"
+    prior_type: uniform
+    default: 1.0
+    bounds: [0.1, 3.0]
+    description: "Log10 (dex) width of the log-normal transmitter EIRP luminosity function (illustrative)."
+
+  - id: ir_covering_fraction
+    symbol: "gamma_ir"
+    unit: "dimensionless"
+    prior_type: log_uniform
+    bounds: [0.0, 1.0]
+    log_floor: 1.0e-8
+    description: "Fraction of host stellar bolometric luminosity reprocessed into mid-IR waste heat (not used by M1 kernels)."
+
+  - id: ir_conspicuous_fraction
+    symbol: "f_ir_loud"
+    unit: "dimensionless"
+    prior_type: log_uniform
+    bounds: [0.0, 1.0]
+    log_floor: 1.0e-8
+    description: "Fraction of settled systems maintaining a detectable mid-IR waste-heat signature."
+
+  - id: ir_host_fraction
+    symbol: "f_ir_host"
+    unit: "dimensionless"
+    prior_type: log_uniform
+    bounds: [0.0, 1.0]
+    log_floor: 1.0e-10
+    description: >-
+      Fraction of stars in the mid-IR survey footprint that host a settled
+      system. Declared per hypothesis (micro layer) rather than derived from the
+      macro expansion kernel, keeping the IR channel decoupled (AGENTS.md law 6).
+
+  - id: solar_system_artifact_detect_prob
+    symbol: "p_ss"
+    unit: "dimensionless"
+    prior_type: uniform
+    default: 0.5
+    bounds: [0.0, 1.0]
+    description: >-
+      Probability that a settlement front having reached the Solar System would
+      have left evidence detectable by existing Solar System / ISO searches
+      (illustrative). Only enters when NOT conditioning on Earth-unreached.

@@ -50,3 +50,7 @@ class QueueStateError(FermiDeskError):
 
 class ReplayMismatchError(FermiDeskError):
     """A deterministic replay did not reproduce the recorded output_sha256."""
+
+
+class LeakageError(FermiDeskError):
+    """Withheld (out-of-sample) data reached a step that must see calibration data only."""

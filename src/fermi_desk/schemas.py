@@ -221,6 +221,10 @@ class InfraredSpec(_Frozen):
     # pinned by the SHA-256 of the file bytes like a catalog.
     sigma_sys_calibration_path: str | None = None
     sigma_sys_calibration_sha256: str | None = None
+    # v0.1.2 / Launch Gate #2: frozen-method real-FITS withheld blend-recovery result
+    # (reproduced_archive), pinned by file SHA-256 the same way.
+    fits_gate2_path: str | None = None
+    fits_gate2_sha256: str | None = None
 
     @model_validator(mode="after")
     def _unique_ids(self) -> InfraredSpec:
@@ -233,6 +237,12 @@ class InfraredSpec(_Frozen):
             self.sigma_sys_calibration_sha256
         ):
             raise ProvenanceError("sigma_sys_calibration_sha256 must be a 64-hex SHA-256")
+        if (self.fits_gate2_path is None) != (self.fits_gate2_sha256 is None):
+            raise ProvenanceError("fits_gate2_path and fits_gate2_sha256 must be given together")
+        if self.fits_gate2_sha256 is not None and not _SHA256_RE.match(self.fits_gate2_sha256):
+            raise ProvenanceError("fits_gate2_sha256 must be a 64-hex SHA-256")
+        if self.fits_gate2_path is not None and self.sigma_sys_calibration_path is None:
+            raise ProvenanceError("fits_gate2 requires the locked sigma_sys calibration it froze")
         return self
 
 
@@ -378,4 +388,147 @@ class SigmaSysCalibrationFile(_Open):
         n_cal = sum(c.split == "calibration" for c in self.controls)
         if abs(2 * n_cal - len(self.controls)) > 1:
             raise SchemaValidationError("calibration / withheld split is not 50/50")
+        return self
+
+
+# ------------------------------------- reproduced_archive Gate #2 (real AllWISE FITS)
+class Gate2LockedInputs(_Frozen):
+    sigma_sys_calibration_path: str
+    sigma_sys_calibration_sha256: str
+    sigma_sys_arcsec: float = Field(gt=0)
+
+    @field_validator("sigma_sys_calibration_sha256")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not _SHA256_RE.match(v):
+            raise ProvenanceError("locked sigma_sys_calibration_sha256 must be a 64-hex SHA-256")
+        return v
+
+
+class Gate2Fetch(_Open):
+    n_requested: int = Field(ge=1)
+    n_ok: int = Field(ge=0)
+    n_failed: int = Field(ge=0)
+    files: list[dict]
+
+    @model_validator(mode="after")
+    def _complete(self) -> Gate2Fetch:
+        if self.n_ok + self.n_failed != self.n_requested:
+            raise SchemaValidationError("fetch counts do not add up")
+        if self.n_failed or self.n_ok != self.n_requested:
+            raise ProvenanceError("Gate #2 file built from an incomplete cutout fetch")
+        if any(
+            not _SHA256_RE.match(str(f.get(k, "")))
+            for f in self.files
+            for k in ("int_sha256", "unc_sha256")
+        ):
+            raise ProvenanceError("every fetched cutout needs int_sha256 and unc_sha256")
+        if len(self.files) != self.n_ok:
+            raise SchemaValidationError("fetch.files disagrees with n_ok")
+        return self
+
+
+class Gate2PSF(_Open):
+    stamp: list[list[float]] = Field(min_length=3)
+    stamp_half_pix: int = Field(ge=1)
+    pixel_scale_arcsec: float = Field(gt=0)
+    n_stars: int = Field(ge=5)
+    star_ids: list[int]
+    fwhm_gaussian_arcsec: float = Field(gt=0)
+    fwhm_halfmax_arcsec: float = Field(gt=0)
+    nominal_fwhm_arcsec: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _shape(self) -> Gate2PSF:
+        n = 2 * self.stamp_half_pix + 1
+        if len(self.stamp) != n or any(len(r) != n for r in self.stamp):
+            raise SchemaValidationError("PSF stamp shape disagrees with stamp_half_pix")
+        if len(self.star_ids) != self.n_stars:
+            raise SchemaValidationError("PSF n_stars disagrees with star_ids")
+        return self
+
+
+class Gate2Frozen(_Open):
+    rule_version: str
+    target_false_alarm: float = Field(gt=0, lt=1)
+    centroid: dict
+    image: dict
+    calibration: dict
+    psf_star_ids: list[int]
+    calibration_false_alarm_in_sample: dict
+
+
+class Gate2Withheld(_Open):
+    rng_seed: int
+    n_stars: int = Field(ge=1)
+    star_ids: list[int]
+    w3snr: list[float]
+    separations_arcsec: list[float] = Field(min_length=1)
+    flux_fractions: list[float] = Field(min_length=1)
+    statistics: dict
+    summary: dict
+
+    @model_validator(mode="after")
+    def _shapes(self) -> Gate2Withheld:
+        n, ns, nf = self.n_stars, len(self.separations_arcsec), len(self.flux_fractions)
+        if len(self.star_ids) != n or len(self.w3snr) != n:
+            raise SchemaValidationError("withheld per-star arrays disagree with n_stars")
+        want = {"null": (n,), "arm_a": (n, ns, nf), "arm_b": (n, nf)}
+        for arm, shape in want.items():
+            block = self.statistics.get(arm)
+            if not isinstance(block, dict):
+                raise SchemaValidationError(f"withheld statistics missing arm {arm!r}")
+            for key in ("centroid_offset_arcsec", "delta_chi2", "flux_ratio"):
+                if _shape_of(block.get(key)) != shape:
+                    raise SchemaValidationError(f"withheld {arm}.{key} is not shaped {shape}")
+        return self
+
+
+def _shape_of(v: object) -> tuple[int, ...]:
+    shape: list[int] = []
+    while isinstance(v, list):
+        shape.append(len(v))
+        v = v[0] if v else None
+    return tuple(shape)
+
+
+class WiseFitsGate2File(_Open):
+    """``data/calibrations/wise_fits_gate2_withheld.json`` (v0.1.2, Launch Gate #2)."""
+
+    id: str
+    schema_version: Literal[1]
+    data_tier: Literal["reproduced_archive"]
+    code_git_sha: str
+    rng_seed: int
+    query_window_utc: tuple[str, str]
+    frozen_at_utc: str
+    locked_inputs: Gate2LockedInputs
+    fetch: Gate2Fetch
+    empirical_psf: Gate2PSF
+    frozen_screens: Gate2Frozen
+    withheld: Gate2Withheld
+    source_receipt: SourceReceipt
+    content_sha256: str
+
+    @model_validator(mode="after")
+    def _contract(self) -> WiseFitsGate2File:
+        if not _GIT_SHA_RE.match(self.code_git_sha):
+            raise ProvenanceError(
+                f"code_git_sha {self.code_git_sha!r} is not a clean 40-hex commit (dirty run?)"
+            )
+        if not _SHA256_RE.match(self.content_sha256):
+            raise ProvenanceError("content_sha256 must be a 64-hex SHA-256")
+        cal = set(self.frozen_screens.calibration.get("star_ids", []))
+        wh = set(self.withheld.star_ids)
+        if not cal or cal & wh:
+            raise ProvenanceError("calibration and withheld star sets must be non-empty, disjoint")
+        if not set(self.empirical_psf.star_ids) <= cal:
+            raise ProvenanceError("empirical PSF uses stars outside the calibration split")
+        if list(self.frozen_screens.psf_star_ids) != list(self.empirical_psf.star_ids):
+            raise ProvenanceError("frozen screens were calibrated with a different PSF")
+        start, end = self.query_window_utc
+        if not start <= self.frozen_at_utc <= end:
+            raise ProvenanceError("frozen_at_utc lies outside the run window")
+        if self.withheld.rng_seed != self.rng_seed:
+            raise SchemaValidationError("withheld rng_seed disagrees with rng_seed")
         return self

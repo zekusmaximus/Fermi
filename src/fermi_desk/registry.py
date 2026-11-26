@@ -26,8 +26,14 @@ from fermi_desk.errors import (
     ProvenanceError,
     SchemaValidationError,
 )
-from fermi_desk.models import hephaistos
-from fermi_desk.schemas import Hypothesis, ParameterRegistry, SigmaSysCalibrationFile, Survey
+from fermi_desk.models import hephaistos, hephaistos_fits
+from fermi_desk.schemas import (
+    Hypothesis,
+    ParameterRegistry,
+    SigmaSysCalibrationFile,
+    Survey,
+    WiseFitsGate2File,
+)
 
 MergePolicy = Literal["keep_first"]
 CATALOG_REQUIRED_COLUMNS = (
@@ -442,6 +448,157 @@ def load_sigma_sys_calibration(survey: Survey, root: Path) -> SigmaSysCalibratio
     return SigmaSysCalibration(survey.id, ir.sigma_sys_calibration_path, sha, rec)
 
 
+# ------------------------------------- reproduced_archive Gate #2 (real AllWISE FITS)
+def _close(a: object, b: object, path: str = "", tol: float = 1e-9) -> None:
+    """Recursive equality with an absolute float tolerance (raises ProvenanceError)."""
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        if set(a) != set(b):
+            raise ProvenanceError(f"{path}: keys differ ({sorted(set(a) ^ set(b))})")
+        for k in a:
+            _close(a[k], b[k], f"{path}.{k}", tol)
+    elif isinstance(a, list | tuple) and isinstance(b, list | tuple):
+        if len(a) != len(b):
+            raise ProvenanceError(f"{path}: lengths differ")
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
+            _close(x, y, f"{path}[{i}]", tol)
+    elif isinstance(a, bool | str) or isinstance(b, bool | str) or a is None or b is None:
+        if a != b:
+            raise ProvenanceError(f"{path}: {a!r} != {b!r}")
+    elif not math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=tol):
+        raise ProvenanceError(f"{path}: recomputed {a!r} != stored {b!r}")
+
+
+@dataclass(frozen=True)
+class FitsGate2Result:
+    """Verified real-FITS withheld blend-recovery result (``reproduced_archive``)."""
+
+    survey_id: str
+    path: str
+    file_sha256: str
+    record: WiseFitsGate2File
+
+    def summary(self) -> dict:
+        r = self.record
+        fz, wh, psf = r.frozen_screens, r.withheld, r.empirical_psf
+        return {
+            "id": r.id,
+            "path": self.path,
+            "file_sha256": self.file_sha256,
+            "content_sha256": r.content_sha256,
+            "data_tier": r.data_tier,
+            "code_git_sha": r.code_git_sha,
+            "rng_seed": r.rng_seed,
+            "query_window_utc": list(r.query_window_utc),
+            "frozen_at_utc": r.frozen_at_utc,
+            "n_requested": r.fetch.n_requested,
+            "n_fetched_ok": r.fetch.n_ok,
+            "n_calibration": len(fz.calibration["star_ids"]),
+            "n_withheld": wh.n_stars,
+            "locked_sigma_sys_arcsec": r.locked_inputs.sigma_sys_arcsec,
+            "empirical_psf": {
+                "fwhm_gaussian_arcsec": psf.fwhm_gaussian_arcsec,
+                "fwhm_halfmax_arcsec": psf.fwhm_halfmax_arcsec,
+                "nominal_fwhm_arcsec": psf.nominal_fwhm_arcsec,
+                "n_stars": psf.n_stars,
+                "pixel_scale_arcsec": psf.pixel_scale_arcsec,
+            },
+            "frozen_screens": {
+                "rule_version": fz.rule_version,
+                "target_false_alarm": fz.target_false_alarm,
+                "centroid_multiplier": fz.centroid["multiplier"],
+                "centroid_threshold_arcsec_at_calibration_median_snr": fz.centroid[
+                    "threshold_arcsec_at_calibration_median_snr"
+                ],
+                "delta_chi2_scale": fz.image["delta_chi2_scale"],
+                "delta_chi2_threshold": fz.image["delta_chi2_threshold"],
+                "calibration_false_alarm_in_sample": fz.calibration_false_alarm_in_sample,
+                "snr_eff_rule": fz.model_extra.get("snr_eff_rule"),
+            },
+            "separations_arcsec": wh.separations_arcsec,
+            "flux_fractions": wh.flux_fractions,
+            "screens": wh.summary["screens"],
+            "survival_weighting": wh.summary["survival_weighting"],
+            "caveats": r.model_extra.get("caveats", []),
+        }
+
+
+def _recompute_fits_gate2(rec: WiseFitsGate2File, locked: SigmaSysCalibration) -> str:
+    """Offline re-derivation of the Gate #2 summaries + split-integrity audit."""
+    li = rec.locked_inputs
+    if li.sigma_sys_calibration_path != locked.path or (
+        li.sigma_sys_calibration_sha256 != locked.file_sha256
+    ):
+        raise ProvenanceError("Gate #2 was frozen against a different sigma_sys calibration")
+    sys_locked = float(locked.sigma_sys.to_value(u.arcsec))
+    for v in (li.sigma_sys_arcsec, rec.frozen_screens.centroid["sigma_sys_arcsec_locked"]):
+        if not math.isclose(float(v), sys_locked, rel_tol=0, abs_tol=1e-12):
+            raise ProvenanceError(f"Gate #2 sigma_sys {v} != locked {sys_locked}")
+    split = {
+        s: {c.gaia_dr3_source_id for c in locked.record.controls if c.split == s}
+        for s in ("calibration", "withheld")
+    }
+    if set(rec.frozen_screens.calibration["star_ids"]) != split["calibration"]:
+        raise ProvenanceError("Gate #2 calibration stars != locked calibration split")
+    if set(rec.withheld.star_ids) != split["withheld"]:
+        raise ProvenanceError("Gate #2 withheld stars != locked withheld split (incomplete?)")
+    payload = {
+        "empirical_psf": rec.empirical_psf.model_dump(),
+        "frozen_screens": rec.frozen_screens.model_dump(),
+        "withheld": rec.withheld.model_dump(),
+    }
+    got = hephaistos_fits.recompute_gate2(payload)
+    psf, fz = rec.empirical_psf, rec.frozen_screens
+    _close(got["stamp_sum"], 1.0, "empirical_psf.stamp_sum")
+    _close(got["fwhm_gaussian_arcsec"], psf.fwhm_gaussian_arcsec, "fwhm_gaussian", 1e-6)
+    _close(got["fwhm_halfmax_arcsec"], psf.fwhm_halfmax_arcsec, "fwhm_halfmax", 1e-9)
+    _close(got["delta_chi2_scale"], fz.image["delta_chi2_scale"], "delta_chi2_scale")
+    _close(got["delta_chi2_threshold"], fz.image["delta_chi2_threshold"], "delta_chi2_threshold")
+    _close(got["centroid_multiplier"], fz.centroid["multiplier"], "centroid_multiplier")
+    _close(
+        got["calibration_false_alarm_in_sample"],
+        fz.calibration_false_alarm_in_sample,
+        "calibration_false_alarm_in_sample",
+    )
+    _close(got["summary"], rec.withheld.summary, "withheld.summary")
+    img = rec.withheld.summary["screens"]["image"]
+    cen = rec.withheld.summary["screens"]["centroid"]
+    return (
+        f"PSF FWHM {psf.fwhm_gaussian_arcsec:.3f} arcsec (nominal {psf.nominal_fwhm_arcsec}); "
+        f"thresholds re-derived from {len(split['calibration'])} calibration stars; "
+        f"{rec.withheld.n_stars} withheld summaries recomputed (survival <= 3.25 arcsec: "
+        f"centroid {cen['blend_survival_within_3p25_arcsec']:.3f}, image "
+        f"{img['blend_survival_within_3p25_arcsec']:.3f})"
+    )
+
+
+def load_fits_gate2(survey: Survey, root: Path) -> FitsGate2Result | None:
+    """Load and fully verify a survey's pinned Gate #2 result (None if absent).
+
+    Checks: file SHA-256 == survey pin; schema; content_sha256; locked sigma_sys input
+    (file hash and value); calibration / withheld star sets == the locked split; and
+    offline recomputation of thresholds, PSF width and every withheld summary.
+    """
+    ir = survey.infrared
+    if ir is None or ir.fits_gate2_path is None:
+        return None
+    locked = load_sigma_sys_calibration(survey, root)
+    if locked is None:
+        raise ProvenanceError("Gate #2 result pinned without the locked sigma_sys calibration")
+    raw = (root / ir.fits_gate2_path).read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha != ir.fits_gate2_sha256:
+        raise ProvenanceError(
+            f"{ir.fits_gate2_path}: sha256 {sha} != pinned {ir.fits_gate2_sha256}"
+        )
+    doc = json.loads(raw)
+    rec = WiseFitsGate2File.model_validate(doc)
+    body = {k: v for k, v in doc.items() if k != "content_sha256"}
+    if _canonical_sha256(body) != rec.content_sha256:
+        raise ProvenanceError(f"{ir.fits_gate2_path}: content_sha256 mismatch")
+    _recompute_fits_gate2(rec, locked)
+    return FitsGate2Result(survey.id, ir.fits_gate2_path, sha, rec)
+
+
 # --------------------------------------------------------------------- validation
 @dataclass(frozen=True)
 class CheckResult:
@@ -577,4 +734,18 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
                 )
 
             record(f"sigma_sys_calibration:{s.infrared.sigma_sys_calibration_path}", _calib)
+        if s.infrared is not None and s.infrared.fits_gate2_path is not None:
+
+            def _gate2(s: Survey = s) -> str:
+                locked = load_sigma_sys_calibration(s, graph.root)
+                g = load_fits_gate2(s, graph.root)
+                assert g is not None and locked is not None
+                return (
+                    f"sha256 {g.file_sha256[:16]}..., {g.record.data_tier}, git "
+                    f"{g.record.code_git_sha[:12]}, {g.record.fetch.n_ok}/"
+                    f"{g.record.fetch.n_requested} cutouts; "
+                    + _recompute_fits_gate2(g.record, locked)
+                )
+
+            record(f"fits_gate2:{s.infrared.fits_gate2_path}", _gate2)
     return results

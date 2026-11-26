@@ -22,6 +22,7 @@ from fermi_desk.inference.engine import (
     resolve_parameters,
     score_hypotheses,
 )
+from fermi_desk.inference.ir_drilldown import LEGACY, MEASURED, registration_floors
 from fermi_desk.models import hephaistos, radio
 from fermi_desk.models.expansion import C_KPC_PER_GYR
 from fermi_desk.registry import FactorGraph
@@ -153,23 +154,43 @@ def run_eirp_luminosity_function_sweep(graph: FactorGraph, p: Mapping, seed: int
 
 
 def run_hephaistos_blend_recovery_grid(graph: FactorGraph, p: Mapping, seed: int) -> dict:
-    spec = hephaistos.CutoutSpec(
-        psf_fwhm=p["psf_fwhm_arcsec"] * u.arcsec,
-        sigma_sys=p["sigma_sys_arcsec"] * u.arcsec,
-        snr=p["snr"],
-    )
-    grid = hephaistos.blend_recovery_grid(
-        spec,
-        np.array(p["separations_arcsec"]) * u.arcsec,
-        np.array(p["flux_fractions"]),
-        int(p["n_trials"]),
-        np.random.default_rng(np.random.SeedSequence(seed)),
-    )
+    """Blend-recovery grid under the legacy AND measured registration floors, side by side.
+
+    Same floors and common-random-numbers convention as ``fermi-desk ir-drilldown``: each
+    floor's grid is drawn from ``SeedSequence(seed)``, so cell deltas reflect sigma_sys
+    alone. The measured floor's file SHA-256 enters the output, so a changed calibration
+    can never replay to the same output_sha256.
+    """
+    floors, info = registration_floors(graph, float(p["sigma_sys_arcsec"]))
+    blocks, grids = {}, {}
+    for floor in floors:
+        spec = hephaistos.CutoutSpec(
+            psf_fwhm=p["psf_fwhm_arcsec"] * u.arcsec, sigma_sys=floor.sigma_sys, snr=p["snr"]
+        )
+        grid = hephaistos.blend_recovery_grid(
+            spec,
+            np.array(p["separations_arcsec"]) * u.arcsec,
+            np.array(p["flux_fractions"]),
+            int(p["n_trials"]),
+            np.random.default_rng(np.random.SeedSequence(seed)),
+        )
+        grids[floor.label] = grid
+        blocks[floor.label] = {
+            "registration_floor": floor.as_dict(),
+            "grid": grid.as_dict(),
+            "survival_within_3p25_arcsec": {
+                m: hephaistos.blend_survival(grid, m, 3.25 * u.arcsec)
+                for m in ("centroid", "image")
+            },
+        }
+    meas = info["measured_calibration"]
     return {
-        "grid": grid.as_dict(),
-        "survival_within_3p25_arcsec": {
-            m: hephaistos.blend_survival(grid, m, 3.25 * u.arcsec) for m in ("centroid", "image")
-        },
+        "registration_floors": [f.as_dict() for f in floors],
+        "measured_calibration_file_sha256": meas["file_sha256"] if meas else None,
+        "by_floor": blocks,
+        "floor_shift": hephaistos.grid_shift(grids[LEGACY], grids[MEASURED])
+        if MEASURED in grids
+        else None,
     }
 
 
@@ -207,12 +228,14 @@ def diagnose_lookback_window_t_sweep(graph: FactorGraph, p: Mapping) -> str:
 
 
 def diagnose_hephaistos_blend_recovery_grid(graph: FactorGraph, p: Mapping) -> str:
+    floors, _ = registration_floors(graph, float(p["sigma_sys_arcsec"]))
+    shown = " vs ".join(f"{f.sigma_sys.to_value(u.arcsec):.3f} arcsec ({f.label})" for f in floors)
     return (
         f"Maps centroid vs. image-level blend recovery over theta = "
         f"{_span(p['separations_arcsec'])} arcsec x f_bg = {_span(p['flux_fractions'])} at W3 "
-        f"SNR {p['snr']:g}, sigma_sys {p['sigma_sys_arcsec']:g} arcsec; fixes the blend-survival "
-        "and false-alarm rates that turn the illustrative IR false-positive bracket into "
-        "screened calibrations"
+        f"SNR {p['snr']:g} under registration floors {shown} side by side; fixes the "
+        "blend-survival and false-alarm rates that turn the illustrative IR false-positive "
+        "bracket into screened calibrations"
     )
 
 

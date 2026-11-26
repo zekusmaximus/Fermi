@@ -323,6 +323,11 @@ class SigmaSysCalibration:
                     "rate": wh[k]["empirical_false_alarm"],
                     "clopper_pearson_95": wh[k]["clopper_pearson_95"],
                     "sigma_sys_arcsec": wh[k]["sigma_sys_arcsec"],
+                    "ks_rayleigh_p_value": wh[k]["ks_rayleigh_p_value"],
+                    "binomial_p_at_least_k_given_nominal": wh[k][
+                        "binomial_p_at_least_k_given_nominal"
+                    ],
+                    "nominal_false_alarm": wh[k]["nominal_false_alarm"],
                 }
                 for k in (
                     "out_of_sample_false_alarm_at_calibrated_floor",
@@ -330,6 +335,46 @@ class SigmaSysCalibration:
                     "false_alarm_with_no_floor",
                 )
             },
+            "calibration_in_sample_false_alarm": {
+                k: cal["in_sample_false_alarm_at_calibrated_floor"][k]
+                for k in (
+                    "n_flagged",
+                    "n_stars",
+                    "empirical_false_alarm",
+                    "clopper_pearson_95",
+                    "binomial_p_at_least_k_given_nominal",
+                    "ks_rayleigh_p_value",
+                    "nominal_false_alarm",
+                    "sigma_sys_arcsec",
+                )
+            },
+            "patches": [
+                {
+                    "patch_id": p.patch_id,
+                    "l_deg": p.l_deg,
+                    "b_deg": p.b_deg,
+                    "ra_deg": p.ra_deg,
+                    "dec_deg": p.dec_deg,
+                    "radius_deg": p.radius_deg,
+                    "measured_controls": p.cut_counts.get("measured_controls"),
+                    "rejected_gaia_neighbour_within_15arcsec": p.cut_counts.get(
+                        "rejected_gaia_neighbour_within_15arcsec"
+                    ),
+                    "n_calibration": sum(
+                        c.patch_id == p.patch_id and c.split == "calibration"
+                        for c in self.record.controls
+                    ),
+                    "n_withheld": sum(
+                        c.patch_id == p.patch_id and c.split == "withheld"
+                        for c in self.record.controls
+                    ),
+                }
+                for p in self.record.patches
+            ],
+            "cut_counts_total": self.record.model_extra.get("cut_counts_total", {}),
+            "min_abs_b_deg": float(
+                self.record.model_extra.get("config", {}).get("min_abs_b", 20.0)
+            ),
         }
 
 

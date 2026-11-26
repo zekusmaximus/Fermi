@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import socket
 from pathlib import Path
 
 import astropy.units as u
@@ -12,6 +13,44 @@ import pytest
 from fermi_desk.registry import TargetTable, load_factor_graph, load_targets
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# ------------------------------------------------------------ network isolation
+# AGENTS.md Sec. 4: the suite must run 100% offline. Every outbound (non-loopback)
+# connection or DNS lookup raises; loopback stays allowed because Starlette's TestClient
+# and the Windows asyncio event loop use local socket pairs.
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "0.0.0.0", ""}
+
+
+class NetworkBlockedError(RuntimeError):
+    pass
+
+
+def _is_loopback(address) -> bool:
+    host = address[0] if isinstance(address, tuple) else address
+    return isinstance(host, str) and (host in _LOOPBACK or host.startswith("127."))
+
+
+def _guard(orig):
+    def connect(self, address):
+        if self.family in (socket.AF_INET, socket.AF_INET6) and not _is_loopback(address):
+            raise NetworkBlockedError(f"outbound network access blocked in tests: {address!r}")
+        return orig(self, address)
+
+    return connect
+
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo(host, *args, **kwargs):
+    if not _is_loopback(host if isinstance(host, str) else str(host)):
+        raise NetworkBlockedError(f"DNS lookup blocked in tests: {host!r}")
+    return _orig_getaddrinfo(host, *args, **kwargs)
+
+
+socket.socket.connect = _guard(socket.socket.connect)
+socket.socket.connect_ex = _guard(socket.socket.connect_ex)
+socket.getaddrinfo = _getaddrinfo
 
 
 @pytest.fixture(scope="session")

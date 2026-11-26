@@ -39,6 +39,7 @@ SEPARATIONS_ARCSEC = (0.5, 1.0, 2.0, 3.0, 4.0, 6.0)
 FLUX_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
 BASE_COMPLETENESS = 0.5  # illustrative: middle of the Milestone-1 completeness bracket
 LEGACY_SIGMA_SYS_ARCSEC = 0.5
+LINKED_ARCHIVAL_JOB = "wise_independent_control_fields"
 LEGACY = "legacy_baseline"
 MEASURED = "measured_reproduced_archive"
 
@@ -71,6 +72,127 @@ def registration_floors(graph: FactorGraph, legacy_sigma_sys_arcsec: float) -> t
         )
         info["measured_calibration"] = cal.summary()
     return floors, info
+
+
+def _fa(block: dict) -> dict:
+    lo, hi = block["clopper_pearson_95"]
+    return {
+        "n_flagged": block["n_flagged"],
+        "n_stars": block["n_stars"],
+        "rate": block.get("rate", block.get("empirical_false_alarm")),
+        "clopper_pearson_95": [lo, hi],
+        "clopper_pearson_95_upper": hi,
+        "ks_rayleigh_p_value": block.get("ks_rayleigh_p_value"),
+        "binomial_p_at_least_k_given_nominal": block.get("binomial_p_at_least_k_given_nominal"),
+        "nominal_false_alarm": block.get("nominal_false_alarm"),
+        "sigma_sys_arcsec": block.get("sigma_sys_arcsec"),
+    }
+
+
+def small_sample_bounds(meas: dict | None) -> dict | None:
+    """Structured small-sample false-alarm statements (Milestone 3 Part A.1)."""
+    if meas is None:
+        return None
+    wh = meas["withheld_false_alarm"]
+    out = {
+        "linked_archival_job": LINKED_ARCHIVAL_JOB,
+        "withheld_at_measured_floor": _fa(wh["out_of_sample_false_alarm_at_calibrated_floor"]),
+        "withheld_at_legacy_floor": _fa(wh["false_alarm_at_legacy_baseline_floor"]),
+        "withheld_with_no_floor": _fa(wh["false_alarm_with_no_floor"]),
+        "calibration_in_sample_tail": _fa(meas["calibration_in_sample_false_alarm"]),
+    }
+    w = out["withheld_at_measured_floor"]
+    c = out["calibration_in_sample_tail"]
+    z = out["withheld_with_no_floor"]
+    out["statement"] = (
+        f"Withheld {w['n_flagged']}/{w['n_stars']} 3-sigma centroid false alarms at the measured "
+        f"floor (Clopper-Pearson 95% upper bound {w['clopper_pearson_95_upper']:.3f}; Rayleigh KS "
+        f"p = {w['ks_rayleigh_p_value']:.2g}); calibration-half in-sample tail "
+        f"{c['n_flagged']}/{c['n_stars']} (binomial p = "
+        f"{c['binomial_p_at_least_k_given_nominal']:.2g} vs nominal); no floor: "
+        f"{z['n_flagged']}/{z['n_stars']}. n = {w['n_stars']} only bounds the rate below "
+        f"{w['clopper_pearson_95_upper']:.1%}; the {LINKED_ARCHIVAL_JOB} job is the larger test."
+    )
+    return out
+
+
+def control_experiment(meas: dict | None) -> dict | None:
+    if meas is None:
+        return None
+    return {
+        "n_controls": meas["n_controls"],
+        "n_patches_with_controls": meas["n_patches_with_controls"],
+        "n_calibration": meas["n_calibration"],
+        "n_withheld": meas["n_withheld"],
+        "min_abs_b_deg": meas["min_abs_b_deg"],
+        "patches": meas["patches"],
+        "cut_counts_total": meas["cut_counts_total"],
+        "query_window_utc": meas["query_window_utc"],
+        "code_git_sha": meas["code_git_sha"],
+        "file_sha256": meas["file_sha256"],
+    }
+
+
+def atlas_smoothing_caveat(meas: dict | None) -> str:
+    if meas is None:
+        return "No measured sigma_sys calibration is pinned; the legacy floor is an adopted value."
+    return (
+        f"sigma_sys = {meas['sigma_sys_arcsec']:.3f} arcsec was measured on AllWISE Atlas W3 "
+        "coadds, which are resampled and smoothed by the coadd interpolation kernel; the floor "
+        "therefore absorbs Atlas image smoothing together with astrometric registration (and any "
+        "departure of the real centroid noise from the FWHM / (2.355 SNR) model). It is not a pure "
+        "registration error. Follow-up (SPEC.md v0.2): re-measure on unWISE coadds, which preserve "
+        "the native PSF, to separate the two contributions."
+    )
+
+
+def anchor_benchmarks(by_floor: dict) -> list[dict]:
+    """Candidates D / E under each floor: offset significance, p-value, verdict."""
+    rows: dict[str, dict] = {}
+    for label, block in by_floor.items():
+        sys_arcsec = block["registration_floor"]["sigma_sys_arcsec"]
+        for c in block["anchors"]["candidates"]:
+            r = rows.setdefault(
+                c["candidate"],
+                {
+                    "candidate": c["candidate"],
+                    "gaia_dr3_source_id": c["gaia_dr3_source_id"],
+                    "measured_w3_offset_arcsec": c["measured_w3_offset_arcsec"],
+                    "measured_err_arcsec": c["measured_err_arcsec"],
+                    "predicted_photocentre_shift_arcsec": c["predicted_photocentre_shift_arcsec"],
+                    "shift_tension_sigma": c["shift_tension_sigma"],
+                    "published_verdict": c["published_verdict"],
+                    "by_floor": {},
+                },
+            )
+            sigma = float(np.hypot(c["measured_err_arcsec"], sys_arcsec))
+            r["by_floor"][label] = {
+                "sigma_sys_arcsec": sys_arcsec,
+                "combined_sigma_arcsec": sigma,
+                "offset_significance_sigma": c["measured_w3_offset_arcsec"] / sigma,
+                "centroid_screen_p_value": c["centroid_screen_p_value"],
+                "reproduced_verdict": c["reproduced_verdict"],
+                "verdict_matches_published": c["verdict_matches"],
+            }
+    return list(rows.values())
+
+
+def contamination_flip(by_floor: dict, scenarios: dict) -> dict:
+    """LR under both published contamination conventions; no convention is preferred."""
+    table = []
+    for label, block in by_floor.items():
+        for screen in ("none", "centroid", "image"):
+            row = {"registration_floor": label, "screen": screen}
+            for r in block["likelihood_ratio_rows"]:
+                if r["screen"] == screen:
+                    row[r["contamination_scenario"]] = {"lr": r["lr"], "log10_lr": r["log10_lr"]}
+            table.append(row)
+    return {
+        "scenarios": scenarios,
+        "rows": table,
+        "policy": "both published conventions side by side; neither is preferred",
+        "lr_reading": "LR < 1 favours the denominator (conspicuous Dyson), LR > 1 the numerator",
+    }
 
 
 def _evaluate_floor(graph, floor, seed, n_trials, snr, scenarios, grids, k, n) -> tuple:
@@ -206,8 +328,14 @@ def run_ir_drilldown(
             ],
         }
 
+    meas = floor_info["measured_calibration"]
     results = {
         "registration_floors": [f.as_dict() for f in floors],
+        "small_sample_false_alarm_bounds": small_sample_bounds(meas),
+        "control_experiment": control_experiment(meas),
+        "atlas_smoothing_caveat": atlas_smoothing_caveat(meas),
+        "anchor_benchmarks": anchor_benchmarks(by_floor),
+        "contamination_flip": contamination_flip(by_floor, scenarios),
         "registration_floor_sources": floor_info,
         "by_floor": by_floor,
         "floor_shift": shift,

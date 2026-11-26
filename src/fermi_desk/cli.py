@@ -133,6 +133,15 @@ def _print_bf(bf: dict, title: str) -> None:
                     f"{hl['includes_illustrative_channels'] or 'none'})"
                 )
             )
+    for n in (hl or {}).get("headline_exclusion_notes", []):
+        verb = "held out of" if n["held_out_of_reported_headline"] else "INCLUDED in"
+        console.print(
+            "[yellow]  headline_exclusion_note[/] "
+            + escape(
+                f"{n['channel']} ({verb} this headline; tiers {n['data_tiers']}): "
+                + "; ".join(n["reasons"])
+            )
+        )
     console.print(
         escape(
             f"  channels shared: {bf['channels_in_bf']} | Earth-unreached term: "
@@ -509,6 +518,36 @@ def ir_drilldown(
             f"results_sha256={rec['results_sha256']}"
         )
     )
+
+
+# ---------------------------------------------------------------------- serve
+@app.command()
+def serve(
+    host: Annotated[str, typer.Option(help="Bind address (loopback by default).")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(min=1, max=65535, help="TCP port.")] = 8000,
+    static_dir: Annotated[
+        Path | None,
+        typer.Option(help="Built Vite bundle to serve at / (default: web/dist if present)."),
+    ] = None,
+    root: Root = None,
+) -> None:
+    """Serve the offline desk: /api/* plus the compiled web UI (Milestone 3)."""
+    import uvicorn
+
+    from fermi_desk.api import create_app
+
+    graph = load_factor_graph(root)
+    static = static_dir or graph.root / "web" / "dist"
+    if not static.is_absolute():
+        static = (Path.cwd() / static).resolve()
+    has_ui = (static / "index.html").is_file()
+    console.print(
+        escape(
+            f"fermi-desk serve | http://{host}:{port} | api=/api/health | "
+            f"ui={'served from ' + _rel(static, graph.root) if has_ui else 'not built (npm run build)'}"
+        )
+    )
+    uvicorn.run(create_app(graph.root, static_dir=static if has_ui else None), host=host, port=port)
 
 
 # ------------------------------------------------------------------ adversary

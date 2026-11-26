@@ -78,7 +78,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   ├── queue/
 │   │   └── store.py                # SQLite job queue, run receipts, and deterministic replay
 │   ├── cli.py                      # Reproducible CLI entrypoints
-│   └── api.py                      # FastAPI read/query layer (Milestone 2/3)
+│   └── api.py                      # FastAPI offline read / replay layer (Milestone 3; `fermi-desk serve`)
 ├── web/                            # React + Vite interactive public desk (Milestone 3)
 └── tests/
     ├── test_schemas.py
@@ -263,7 +263,7 @@ Every queued or executed job records:
 - **Adversary Runner:** Automated reproduction of real catalog/methodology failure modes—starting with **HIP 1692** (distance revision from ~23 pc to ~752.6 pc raising minimum detectable EIRP by >1,000x; Wlodarczyk-Sroka et al. 2020) and duplicate-pointing detection.
 - **SQLite Job Queue & EIG Scorer:** Computes exact expected bits gained per trial plus CPU/review cost; registers open jobs (including Wlodarczyk-Sroka 288,315-star background extension and independent WISE control fields).
 
-### Milestone 2.5: Audit Closeout & Live WISE Control Experiment (Current; brief: `docs/MILESTONE_2_5.md`)
+### Milestone 2.5: Audit Closeout & Live WISE Control Experiment (Complete; brief: `docs/MILESTONE_2_5.md`)
 - Close the ten Milestone 2 audit rulings (verified-only headline BF, Tier-0 diagnostic queue,
   `slow` test marker, finalized Milestone 2 brief, structured beam-sharing records).
 - Public-Launch Gate #1: live multi-patch AllWISE/Gaia control experiment measuring the W3
@@ -271,7 +271,7 @@ Every queued or executed job records:
   false-alarm rate (withheld half), promoted to `data/calibrations/wise_sigma_sys_control.json`
   (`reproduced_archive`) and reported side-by-side with the legacy 0.50 arcsec baseline.
 
-### Milestone 3: Public Live Desk UI (FastAPI + React/Vite)
+### Milestone 3: Public Live Desk UI (FastAPI + React/Vite) (Current; brief: `docs/MILESTONE_3.md`)
 - **Homepage (Macro Desk):** Live comparison of *Frequent/Slow* vs. *Rare/Fast* expansion regimes against toggleable Radio, Mid-IR, Solar System, and Earth-unreached conditioning.
 - **Drill-Down Views:** Radio 692-star spatial map & EIRP sensitivity toggle; Mid-IR calibration sensitivity & Hephaistos Candidate D failure card.
 - **Adversary Feed, Tier-3 Quarantine Shelf & Claimable Action Queue:** Live run feed with git SHA + seed replay commands.
@@ -297,6 +297,14 @@ Every queued or executed job records:
    `R_gal = 15 kpc` (edge truncation of origin sites and bubble intersection with the disk
    boundary) replaces the local limit; until then the `lookback_window_t_sweep` Tier-0 job
    records the cutoff and BF sensitivity across 50 kyr-10 Myr.
+
+3. **unWISE coadd re-measurement of `sigma_sys` (Milestone 3 Part A.3).** The
+   Milestone 2.5 floor (`sigma_sys = 0.436 arcsec`, 154 controls / 12 patches) was
+   measured on AllWISE Atlas W3 coadds, whose resampling kernel smooths the PSF; the
+   floor therefore absorbs Atlas smoothing together with astrometric registration (the
+   `atlas_smoothing_caveat` in `ir-drilldown` receipts). Re-measure the same controls on
+   unWISE coadds (native, unblurred PSF) and report both floors side by side; never
+   overwrite the locked Atlas artifact.
 
 ### Public-Launch Scientific Exit Gate (Mandatory Before Promotion)
 1. One previously unrun experiment executed on real archival images/catalogs (with query receipt).

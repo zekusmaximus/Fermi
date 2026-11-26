@@ -32,6 +32,7 @@ classifiers = [
 
 dependencies = [
     "astropy>=6.1",
+    "fastapi>=0.165.0",
     "numpy>=1.26",
     "pandas>=2.2",
     "pydantic>=2.7",
@@ -39,10 +40,12 @@ dependencies = [
     "rich>=13.7",
     "scipy>=1.13",
     "typer>=0.12",
+    "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.2",
     "ruff>=0.6",
 ]
@@ -60,6 +63,9 @@ package = true
 minversion = "8.0"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+# Starlette 1.x deprecates httpx for its TestClient; httpx is the dependency the
+# Milestone 3 brief specifies, so this single known warning is silenced.
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]
 markers = [
     "network: marks tests requiring live external archive access (excluded from offline CI)",
     "slow: multi-second Monte Carlo / blend-grid tests; skip with -m \"not slow\" for fast iteration (core-invariant tests are never marked slow)",

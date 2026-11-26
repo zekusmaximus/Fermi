@@ -5,7 +5,8 @@ Queue job ``wise_independent_control_fields`` (Tier-1 archival); Public-Launch G
 Never imported or run by pytest. Milestone 2.5 design:
 
 1. **Multi-patch sampling.** ``--n-patches`` (default 12) seeded, mutually separated
-   sky patches whose entire cone lies at |b| > ``--min-abs-b`` (default 20 deg), away
+   sky patches whose entire cone lies at |b| > ``--min-abs-b`` (default 30 deg since
+   Milestone 3; the locked Milestone 2.5 artifact used 20 deg), away
    from the Magellanic Clouds and M31, so no single tile or crowded field dominates.
 2. **Control population.** Gaia DR3 M dwarfs within 300 pc (parallax > 3.333 mas,
    parallax_over_error > 10, BP-RP >= 1.84, 10 <= G <= 16) with an AllWISE best
@@ -491,7 +492,7 @@ def promote(receipt_path: Path) -> int:
 
 
 # ------------------------------------------------------------------------ main
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--n-controls", type=int, default=120, help="minimum measured controls")
     ap.add_argument("--seed", type=int)
@@ -499,7 +500,10 @@ def main() -> int:
     ap.add_argument("--min-patches", type=int, default=8)
     ap.add_argument("--patch-radius-deg", type=float, default=2.0)
     ap.add_argument("--min-patch-separation-deg", type=float, default=20.0)
-    ap.add_argument("--min-abs-b", type=float, default=20.0)
+    # Milestone 3 Part A.5: default raised from 20 to 30 deg for FUTURE runs (inner-Galaxy
+    # crowding, e.g. patch P01 lost 44 stars to the isolation cut). The locked 154-star
+    # artifact records its own min_abs_b = 20 in its config and is not re-run.
+    ap.add_argument("--min-abs-b", type=float, default=30.0)
     ap.add_argument("--w3-snr-min", type=float, default=8.0)
     ap.add_argument("--w3-snr-max", type=float, default=20.0)
     ap.add_argument("--ruwe-max", type=float, default=1.4)
@@ -507,6 +511,11 @@ def main() -> int:
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--out", type=Path, default=ROOT / "runs/wise_control")
     ap.add_argument("--promote-from", type=Path, default=None)
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
     args = ap.parse_args()
     if args.promote_from is not None:
         return promote(args.promote_from)

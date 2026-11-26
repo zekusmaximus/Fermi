@@ -381,7 +381,9 @@ class JobStore:
         self._record(job_id, "run", seed, git_sha, out["output_sha256"], None)
         return {**out, "output_path": path.as_posix(), "code_git_sha": git_sha}
 
-    def replay(self, graph: FactorGraph, job_id: str, out_dir: Path) -> dict:
+    def replay(
+        self, graph: FactorGraph, job_id: str, out_dir: Path, raise_on_mismatch: bool = True
+    ) -> dict:
         row = self.require(job_id)
         if row["status"] != "completed" or row["output_sha256"] is None:
             raise QueueStateError(f"{job_id} has no completed run to replay")
@@ -397,7 +399,7 @@ class JobStore:
             "recorded_output_sha256": row["output_sha256"],
             "matches_recorded": match,
         }
-        if not match:
+        if not match and raise_on_mismatch:
             raise ReplayMismatchError(
                 f"{job_id}: replay sha {out['output_sha256']} != recorded {row['output_sha256']}"
             )

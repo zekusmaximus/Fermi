@@ -68,7 +68,14 @@ uv run fermi-desk queue run lookback_window_t_sweep --seed 42
 uv run fermi-desk queue replay lookback_window_t_sweep   # must reproduce output_sha256 exactly
 
 # Opt-in LIVE archive experiment (never run by pytest): WISE W3 centroid floor on control stars
-uv run python scripts/run_wise_control_experiment.py --n-controls 30 --seed 42
+uv run python scripts/run_wise_control_experiment.py --n-controls 120 --seed 42
+```
+
+### Interactive desk (Milestone 3, fully offline)
+```bash
+cd web && npm ci && npm run build && cd ..        # React + TypeScript + Vite bundle -> web/dist
+uv run fermi-desk serve                           # http://127.0.0.1:8000  (UI at /, API at /api/*, docs at /docs)
+# UI development with hot reload: run `uv run fermi-desk serve` and, in web/, `npm run dev` (proxies /api)
 ```
 
 ---

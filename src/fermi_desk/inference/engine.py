@@ -41,6 +41,23 @@ CHANNELS = ("radio", "infrared", "solar_system")
 ILLUSTRATIVE_TIERS = frozenset(
     {"illustrative_calibration", "synthetic_proxy", "synthetic_proxy_692"}
 )
+RECEIPT_SCHEMA_VERSION = 4
+# Why each illustrative input is illustrative (surfaced as headline_exclusion_notes).
+ILLUSTRATIVE_INPUT_REASONS = {
+    "transmitter_eirp_luminosity_function": (
+        "distance_scaled_eirp mode: the log-normal transmitter EIRP luminosity function "
+        "(median / sigma_dex) is illustrative_calibration, not a measured population, so the "
+        "radio term is held out of the verified headline"
+    ),
+    "ir_calibration_bracket": (
+        "the mid-IR completeness / false-positive calibration bracket is "
+        "illustrative_calibration (a sensitivity bracket, not a measured calibration)"
+    ),
+    "solar_system_null": (
+        "the Solar System artifact null is a qualitative literature summary paired with an "
+        "illustrative_calibration detection probability"
+    ),
+}
 HEADLINE_VERIFIED = "verified_channels_only"
 HEADLINE_WITH_ILLUSTRATIVE = "including_illustrative_channels"
 EXPANSION_PARAMS = ("origin_rate_per_kpc2_gyr", "expansion_speed_c")
@@ -271,7 +288,14 @@ def build_context(graph: FactorGraph, cfg: RunConfig) -> RunContext:
     return RunContext(graph, cfg, by_channel, targets, footprint, tuple(sorted(col_tiers)))
 
 
-def _component(raw_ln: float, null_ln: float, name: str, channels: list[str], tiers) -> dict:
+def _component(
+    raw_ln: float,
+    null_ln: float,
+    name: str,
+    channels: list[str],
+    tiers,
+    illustrative_inputs: Sequence[str] = (),
+) -> dict:
     return {
         "channels": channels,
         "log10_p_data_given_h": raw_ln / LN10,
@@ -279,6 +303,7 @@ def _component(raw_ln: float, null_ln: float, name: str, channels: list[str], ti
         "log10_lr_vs_null": (raw_ln - null_ln) / LN10,
         "null_model": NULL_MODELS[name],
         "data_tiers": sorted(set(tiers)),
+        "illustrative_inputs": sorted(set(illustrative_inputs)),
     }
 
 
@@ -365,8 +390,10 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
         radio_tiers = [sv.data_tier, *ctx.catalog_column_tiers]
         if sv.radio_sensitivity:
             radio_tiers.append(sv.radio_sensitivity.data_tier)
+        radio_illustrative = []
         if lf is not None:
             radio_tiers.append("illustrative_calibration")  # transmitter luminosity function
+            radio_illustrative.append("transmitter_eirp_luminosity_function")
         out["radio"] = {
             "survey_id": sv.id,
             "radio_mode": cfg.radio_mode,
@@ -397,7 +424,12 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             },
         }
         comps["radio"] = _component(
-            math.log(mc.p_zero_targets_only), 0.0, "radio", ["radio"], radio_tiers
+            math.log(mc.p_zero_targets_only),
+            0.0,
+            "radio",
+            ["radio"],
+            radio_tiers,
+            radio_illustrative,
         )
         if joint_ss:
             comps[RADIO_SS] = _component(
@@ -406,6 +438,7 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
                 RADIO_SS,
                 ["radio", "solar_system"],
                 radio_tiers + ss_tiers,
+                [*radio_illustrative, "solar_system_null"],
             )
 
     if ss_active:
@@ -426,6 +459,7 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             "solar_system",
             ["solar_system"],
             ss_tiers,
+            ["solar_system_null"] if any(t in ILLUSTRATIVE_TIERS for t in ss_tiers) else [],
         )
 
     if "infrared" in active:
@@ -452,6 +486,9 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             "infrared",
             ["infrared"],
             [sv.data_tier, sv.infrared.counts_data_tier, sv.infrared.calibration_data_tier],
+            ["ir_calibration_bracket"]
+            if sv.infrared.calibration_data_tier in ILLUSTRATIVE_TIERS
+            else [],
         )
 
     out["components"] = comps
@@ -528,6 +565,22 @@ def compare_pair(a: dict, b: dict) -> dict:
         )
     )
     verified_channels = sorted(set(shared) - set(illustrative_channels))
+    notes = []
+    for c in illustrative_channels:
+        comp = [h["components"].get(c, {}) for h in (a, b)]
+        inputs = sorted({x for k in comp for x in k.get("illustrative_inputs", [])})
+        notes.append(
+            {
+                "channel": c,
+                "active_in_run": True,
+                "held_out_of_verified_headline": True,
+                "illustrative_inputs": inputs,
+                "reasons": [ILLUSTRATIVE_INPUT_REASONS[x] for x in inputs]
+                or ["component carries an illustrative / synthetic data tier"],
+                "data_tiers": sorted({x for k in comp for x in k.get("data_tiers", [])}),
+                "log10_bf_term": bf(c) if c in a["components"] and c in b["components"] else None,
+            }
+        )
     tv = _pair_terms(a, b, set(verified_channels), earth)
     per_v = {t: bf(t) for t in tv}
     verified = {
@@ -552,6 +605,7 @@ def compare_pair(a: dict, b: dict) -> dict:
         "illustrative_channels": illustrative_channels,
         "log10_bf_excluding_illustrative": verified["log10_bf"],
         "verified": verified,
+        "headline_exclusion_notes": notes,
         "data_tiers_in_bf": tiers,
         "excluded_channels": {
             "numerator_only": sorted(set(a["channels_evaluated"]) - set(shared)),
@@ -570,6 +624,10 @@ def headline_summary(bf: dict, include_illustrative: bool) -> dict:
             "channels": bf["channels_in_bf"],
             "includes_illustrative_channels": bf["illustrative_channels"],
             "data_tiers": bf["data_tiers_in_bf"],
+            "headline_exclusion_notes": [
+                {**n, "held_out_of_reported_headline": False}
+                for n in bf["headline_exclusion_notes"]
+            ],
             "warning": (
                 "ILLUSTRATIVE CHANNELS INCLUDED: this headline folds illustrative_calibration "
                 "terms into the joint Bayes factor; it is a sensitivity statement, NOT an "
@@ -586,6 +644,9 @@ def headline_summary(bf: dict, include_illustrative: bool) -> dict:
         "channels": v["channels"],
         "includes_illustrative_channels": [],
         "excluded_illustrative_channels": v["excluded_illustrative_channels"],
+        "headline_exclusion_notes": [
+            {**n, "held_out_of_reported_headline": True} for n in bf["headline_exclusion_notes"]
+        ],
         "data_tiers": v["data_tiers"],
         "warning": None,
     }
@@ -702,7 +763,7 @@ def run_comparison(
     created = datetime.now(UTC)
     digest = hashlib.sha256(json.dumps(cfg_dict, sort_keys=True).encode()).hexdigest()[:10]
     return {
-        "receipt_schema_version": 3,
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "run_id": f"{created.strftime('%Y%m%dT%H%M%S%fZ')}-{digest}",
         "created_at_utc": created.isoformat(),
         "git_sha": git_sha,
@@ -729,6 +790,9 @@ def run_comparison(
         "headline_log10_bf": results["headline"]["headline"]["log10_bf"]
         if "headline" in results
         else None,
+        "headline_exclusion_notes": results["headline"]["headline"]["headline_exclusion_notes"]
+        if "headline" in results
+        else [],
         "results": results,
     }
 

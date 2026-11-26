@@ -195,7 +195,8 @@ superseded. Command: `fermi-desk compare --geometry <g> --radio-mode flat_probab
 | log10 BF term `infrared` (illustrative, excluded from headline) | +0.128843 | +0.16936 |
 | **Headline log10 BF, verified channels only** (`earth_unreached + radio`) | **-8.04966e-05** | **+9.62322e-05** |
 | all shared terms incl. illustrative (`--include-illustrative`) | +0.128762 | +0.169457 |
-| `results_sha256` (seed 42) | `3bbdbc8e89f27fd4…` | `cd8743def6e73eed…` |
+| `results_sha256` (seed 42, receipt schema v3, Milestone 2.5) | `3bbdbc8e89f27fd4…` | `cd8743def6e73eed…` |
+| `results_sha256` (seed 42, receipt schema v4, Milestone 3: adds `illustrative_inputs` / `headline_exclusion_notes`; every number above unchanged) | `4b70118aaded7861…` | `be2053912fc0a1d6…` |
 
 Superseded pre-fix thin_disk_2d values (for audit only): radio term -5.62041e-05,
 E[N] frequent_slow 0.0760993 / rare_fast 0.000179312.

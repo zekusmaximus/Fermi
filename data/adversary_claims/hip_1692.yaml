@@ -4,6 +4,9 @@ id: hip_1692_distance_revision
 target_name: "HIP 1692"
 pointing_group_id: bl_gbt_lband_2017
 gaia_dr3_source_id: 2430036837596487424
+canonical_distance_label: gaia_dr3_inverse_parallax   # planning ruling (SPEC.md Sec. 4.3)
+historical_anchor_label: gaia_dr2_bailer_jones_2018_r_est
+min_eirp_factor_threshold: 1000.0   # audit asserts EIRP_min(revised)/EIRP_min(legacy) exceeds this
 claim: >-
   The Isaacson et al. (2017) legacy distance of 23.0 pc is superseded by Gaia;
   minimum detectable EIRP scales as d^2, i.e. by >1000x.

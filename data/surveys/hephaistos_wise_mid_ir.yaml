@@ -10,6 +10,7 @@ n_targets: 200000
 observed_detections: 7
 infrared:
   counts_data_tier: published_catalog
+  footprint_max_distance_pc: 300.0  # Suazo et al. 2024 Sec. 2.1: Gaia EDR3 geometric distance < 300 pc
   counts_citation: >-
     Suazo et al. 2024 (arXiv:2405.02927v1): ~5e6 Gaia-2MASS-AllWISE sources within
     300 pc; ~320,000 with W3/W4 detections; ~200,000 with W3/W4 SNR >= 3.5 (Sec. 4);

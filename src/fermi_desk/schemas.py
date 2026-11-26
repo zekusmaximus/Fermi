@@ -186,6 +186,7 @@ class RadioSensitivity(_Frozen):
     n_pol: int = Field(ge=1, le=2)
     reference_eirp_w: float | None = Field(default=None, gt=0)
     reference_distance_pc: float | None = Field(default=None, gt=0)
+    beam_fwhm_arcmin: float | None = Field(default=None, gt=0)
     citation: str
 
     @property
@@ -210,6 +211,7 @@ class IRCalibrationPoint(_Frozen):
 class InfraredSpec(_Frozen):
     counts_data_tier: DataTier
     counts_citation: str
+    footprint_max_distance_pc: float = Field(gt=0)
     anchor_false_positive_rate: float | None = None
     anchor_false_positive_citation: str | None = None
     calibration_data_tier: DataTier
@@ -237,7 +239,8 @@ class Survey(_Frozen):
     n_targets: int = Field(ge=0)
     observed_detections: int = Field(ge=0)
     frequency_ghz: tuple[float, float] | None = None
-    nominal_flux_limit_jy: float | None = None
+    minimum_flux_limit_jy: float | None = Field(default=None, gt=0)
+    sefd_jy: float | None = Field(default=None, gt=0)
     catalog_path: str | None = None
     catalog_sha256: str | None = None
     catalog_provenance_path: str | None = None
@@ -255,6 +258,12 @@ class Survey(_Frozen):
             raise SchemaValidationError(
                 f"Radio survey {self.id!r} needs radio_sensitivity and catalog_path"
             )
+        if (
+            self.sefd_jy is not None
+            and self.radio_sensitivity is not None
+            and self.sefd_jy != self.radio_sensitivity.sefd_jy
+        ):
+            raise SchemaValidationError(f"{self.id}: sefd_jy disagrees with radio_sensitivity")
         if self.channel == "infrared" and self.infrared is None:
             raise SchemaValidationError(f"Infrared survey {self.id!r} needs an `infrared` block")
         if self.channel == "solar_system" and self.solar_system is None:

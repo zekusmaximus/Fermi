@@ -1,0 +1,364 @@
+"""SQLite BOED job queue: registered jobs, EIG-ranked listing, claims, runs, replays.
+
+Schema follows SPEC.md Sec. 4.4 (job_id, tier, title, target_module,
+parameters_json, expected_eig_bits + prior, est_cpu_seconds,
+est_reviewer_minutes, status, code_git_sha, rng_seed, output_sha256,
+created_at) plus claim / replay bookkeeping in an ``executions`` table.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+
+from fermi_desk.errors import QueueStateError, ReplayMismatchError
+from fermi_desk.inference.eig import utility_bits_per_hour
+from fermi_desk.inference.engine import canonical_sha256, git_state
+from fermi_desk.queue import runners
+from fermi_desk.registry import FactorGraph
+
+PAIR = ["frequent_slow_expanders", "rare_fast_expanders"]
+ALL_CHANNELS = ["radio", "infrared", "solar_system"]
+
+
+@dataclass(frozen=True)
+class JobDefinition:
+    job_id: str
+    tier: str  # 0_compute | 1_archival
+    title: str
+    target_module: str
+    parameters: dict
+    est_cpu_seconds: float
+    est_reviewer_minutes: float
+    source: str  # where the job comes from (SPEC / planning / INFERRED)
+    archival_script: str | None = None
+    notes: str = ""
+    tags: tuple[str, ...] = field(default_factory=tuple)
+
+
+JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
+    JobDefinition(
+        job_id="wlodarczyk_sroka_288k_background_extension",
+        tier="1_archival",
+        title="Condition on the published 288,315-star BL background-field null",
+        target_module="fermi_desk.models.radio",
+        parameters={
+            "pair": PAIR,
+            "geometry": "thin_disk_2d",
+            "radio_mode": "distance_scaled_eirp",
+            "shell_table": "data/queue/wlodarczyk_sroka_2020_gbt_shells.yaml",
+            "lowest_eirp_w": 1.0e10,
+            "n_quantiles": 64,
+            "n_directions": 8,
+        },
+        est_cpu_seconds=600.0,
+        est_reviewer_minutes=180.0,
+        source="SPEC.md Sec. 5 (Milestone 2)",
+        archival_script="(not yet written) needs the Wlodarczyk-Sroka 2020 online Table 1",
+        notes="Shares pointing_group_id bl_gbt_lband_2017 with BL 692: needs a merge policy.",
+    ),
+    JobDefinition(
+        job_id="wise_independent_control_fields",
+        tier="1_archival",
+        title="Measure WISE W3 false-positive / centroid floor on independent control stars",
+        target_module="fermi_desk.models.hephaistos",
+        parameters={"ir_survey": "hephaistos_wise_mid_ir", "n_control_stars": 200000},
+        est_cpu_seconds=3600.0,
+        est_reviewer_minutes=240.0,
+        source="SPEC.md Sec. 5 (Milestone 2)",
+        archival_script="scripts/run_wise_control_experiment.py",
+    ),
+    JobDefinition(
+        job_id="hephaistos_blend_recovery_grid",
+        tier="0_compute",
+        title="WISE centroid vs. image-level blend-recovery grid (separation x flux fraction)",
+        target_module="fermi_desk.models.hephaistos",
+        parameters={
+            "separations_arcsec": [0.5, 1.0, 2.0, 3.0, 4.0, 6.0],
+            "flux_fractions": [0.1, 0.3, 0.5, 0.7, 0.9],
+            "n_trials": 40,
+            "snr": 12.5,
+            "psf_fwhm_arcsec": 6.5,
+            "sigma_sys_arcsec": 0.5,
+        },
+        est_cpu_seconds=10.0,
+        est_reviewer_minutes=20.0,
+        source="INFERRED (docs/MILESTONE_2.md B3)",
+    ),
+    JobDefinition(
+        job_id="disk_scale_height_sweep",
+        tier="0_compute",
+        title="Thick-disk scale-height sweep of the benchmark Bayes factor",
+        target_module="fermi_desk.models.expansion",
+        parameters={
+            "pair": PAIR,
+            "scale_heights_pc": [100.0, 200.0, 300.0, 500.0, 1000.0],
+            "radio_mode": "flat_probability",
+            "channels": ALL_CHANNELS,
+            "n_mc": 4000,
+        },
+        est_cpu_seconds=30.0,
+        est_reviewer_minutes=15.0,
+        source="INFERRED (docs/MILESTONE_2.md B3)",
+    ),
+    JobDefinition(
+        job_id="eirp_luminosity_function_sweep",
+        tier="0_compute",
+        title="Transmitter EIRP luminosity-function sweep (distance_scaled_eirp radio)",
+        target_module="fermi_desk.models.radio",
+        parameters={
+            "pair": PAIR,
+            "geometry": "thin_disk_2d",
+            "medians_w": [1e11, 1e12, 1e13, 1e14, 1e15],
+            "sigmas_dex": [0.5, 1.0, 2.0],
+            "n_mc": 2000,
+        },
+        est_cpu_seconds=30.0,
+        est_reviewer_minutes=15.0,
+        source="INFERRED (docs/MILESTONE_2.md B3)",
+    ),
+    JobDefinition(
+        job_id="lookback_window_t_sweep",
+        tier="0_compute",
+        title="Lookback-window T sweep (50 kyr - 10 Myr), 2D and 3D, benchmark pair",
+        target_module="fermi_desk.models.expansion",
+        parameters={
+            "pair": PAIR,
+            "t_min_gyr": 5.0e-5,
+            "t_max_gyr": 1.0e-2,
+            "n_points": 12,
+            "geometries": ["thin_disk_2d", "thick_disk_3d"],
+            "radio_mode": "flat_probability",
+            "channels": ALL_CHANNELS,
+            "n_mc": 4000,
+        },
+        est_cpu_seconds=120.0,
+        est_reviewer_minutes=15.0,
+        source="planning agent Milestone 2 assignment (6th job)",
+    ),
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    tier TEXT NOT NULL CHECK (tier IN ('0_compute', '1_archival')),
+    title TEXT NOT NULL,
+    target_module TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    expected_eig_bits REAL NOT NULL,
+    eig_prior_json TEXT NOT NULL,
+    eig_basis TEXT NOT NULL,
+    eig_details_json TEXT NOT NULL,
+    est_cpu_seconds REAL NOT NULL,
+    est_reviewer_minutes REAL NOT NULL,
+    utility_bits_per_hour REAL NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'claimed', 'completed', 'rejected')),
+    source TEXT NOT NULL,
+    archival_script TEXT,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    code_git_sha TEXT,
+    rng_seed INTEGER,
+    output_sha256 TEXT,
+    output_path TEXT,
+    rejection_reason TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS executions (
+    exec_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id),
+    kind TEXT NOT NULL CHECK (kind IN ('run', 'replay')),
+    rng_seed INTEGER NOT NULL,
+    code_git_sha TEXT NOT NULL,
+    output_sha256 TEXT NOT NULL,
+    matches_recorded INTEGER,
+    created_at TEXT NOT NULL
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def compute_job_eig(graph: FactorGraph, job: JobDefinition):
+    if job.tier == "0_compute":
+        return runners.tier0_eig()
+    return runners.ARCHIVAL_EIG[job.job_id](graph, job.parameters)
+
+
+def execute_job(graph: FactorGraph, job_id: str, parameters: Mapping, seed: int) -> dict:
+    """Run a Tier-0 job and return its deterministic output payload (with sha256)."""
+    if job_id not in runners.TIER0_RUNNERS:
+        raise QueueStateError(f"{job_id} has no offline runner (Tier-1 archival job)")
+    results = runners.TIER0_RUNNERS[job_id](graph, parameters, seed)
+    payload = {
+        "job_id": job_id,
+        "parameters": dict(parameters),
+        "rng_seed": seed,
+        "results": results,
+    }
+    return {**payload, "output_sha256": canonical_sha256(payload)}
+
+
+class JobStore:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA)
+
+    def close(self) -> None:
+        self.conn.close()
+
+    # ------------------------------------------------------------------ seed
+    def seed(
+        self, graph: FactorGraph, jobs: Iterable[JobDefinition] = JOB_DEFINITIONS
+    ) -> list[str]:
+        """Register jobs that are not yet present (existing rows keep their status)."""
+        inserted = []
+        for job in jobs:
+            if self.get(job.job_id) is not None:
+                continue
+            res = compute_job_eig(graph, job)
+            self.conn.execute(
+                """INSERT INTO jobs (job_id, tier, title, target_module, parameters_json,
+                expected_eig_bits, eig_prior_json, eig_basis, eig_details_json, est_cpu_seconds,
+                est_reviewer_minutes, utility_bits_per_hour, status, source, archival_script,
+                created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)""",
+                (
+                    job.job_id,
+                    job.tier,
+                    job.title,
+                    job.target_module,
+                    json.dumps(job.parameters, sort_keys=True),
+                    res.bits,
+                    json.dumps(res.prior, sort_keys=True),
+                    res.basis,
+                    json.dumps(res.details, sort_keys=True),
+                    job.est_cpu_seconds,
+                    job.est_reviewer_minutes,
+                    utility_bits_per_hour(res.bits, job.est_cpu_seconds, job.est_reviewer_minutes),
+                    job.source,
+                    job.archival_script,
+                    _now(),
+                ),
+            )
+            inserted.append(job.job_id)
+        self.conn.commit()
+        return inserted
+
+    # ---------------------------------------------------------------- reads
+    def get(self, job_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return dict(row) if row else None
+
+    def require(self, job_id: str) -> dict:
+        row = self.get(job_id)
+        if row is None:
+            raise QueueStateError(f"unknown job {job_id!r} (run `fermi-desk queue seed`)")
+        return row
+
+    def list(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM jobs ORDER BY utility_bits_per_hour DESC, job_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def executions(self, job_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM executions WHERE job_id = ? ORDER BY exec_id", (job_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ----------------------------------------------------------- transitions
+    def claim(self, job_id: str, by: str) -> None:
+        row = self.require(job_id)
+        if row["status"] != "open":
+            raise QueueStateError(f"{job_id} is {row['status']}, only open jobs can be claimed")
+        self.conn.execute(
+            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=? WHERE job_id=?",
+            (by, _now(), job_id),
+        )
+        self.conn.commit()
+
+    def reject(self, job_id: str, reason: str) -> None:
+        row = self.require(job_id)
+        if row["status"] not in ("open", "claimed"):
+            raise QueueStateError(f"{job_id} is {row['status']}; cannot reject")
+        self.conn.execute(
+            "UPDATE jobs SET status='rejected', rejection_reason=? WHERE job_id=?", (reason, job_id)
+        )
+        self.conn.commit()
+
+    def run(self, graph: FactorGraph, job_id: str, seed: int, out_dir: Path) -> dict:
+        row = self.require(job_id)
+        if row["tier"] != "0_compute":
+            raise QueueStateError(
+                f"{job_id} is Tier-1 archival (live data); run its script instead: "
+                f"{row['archival_script']}"
+            )
+        if row["status"] != "claimed":
+            raise QueueStateError(f"{job_id} is {row['status']}; claim it before running")
+        out = execute_job(graph, job_id, json.loads(row["parameters_json"]), seed)
+        git_sha, git_head = git_state(graph.root)
+        path = self._write(out, out_dir, git_sha, git_head, "run")
+        self.conn.execute(
+            """UPDATE jobs SET status='completed', code_git_sha=?, rng_seed=?, output_sha256=?,
+            output_path=?, completed_at=? WHERE job_id=?""",
+            (git_sha, seed, out["output_sha256"], path.as_posix(), _now(), job_id),
+        )
+        self._record(job_id, "run", seed, git_sha, out["output_sha256"], None)
+        return {**out, "output_path": path.as_posix(), "code_git_sha": git_sha}
+
+    def replay(self, graph: FactorGraph, job_id: str, out_dir: Path) -> dict:
+        row = self.require(job_id)
+        if row["status"] != "completed" or row["output_sha256"] is None:
+            raise QueueStateError(f"{job_id} has no completed run to replay")
+        seed = int(row["rng_seed"])
+        out = execute_job(graph, job_id, json.loads(row["parameters_json"]), seed)
+        git_sha, git_head = git_state(graph.root)
+        path = self._write(out, out_dir, git_sha, git_head, "replay")
+        match = out["output_sha256"] == row["output_sha256"]
+        self._record(job_id, "replay", seed, git_sha, out["output_sha256"], match)
+        result = {
+            **out,
+            "output_path": path.as_posix(),
+            "recorded_output_sha256": row["output_sha256"],
+            "matches_recorded": match,
+        }
+        if not match:
+            raise ReplayMismatchError(
+                f"{job_id}: replay sha {out['output_sha256']} != recorded {row['output_sha256']}"
+            )
+        return result
+
+    # --------------------------------------------------------------- helpers
+    def _record(self, job_id, kind, seed, git_sha, sha, match) -> None:
+        self.conn.execute(
+            """INSERT INTO executions (job_id, kind, rng_seed, code_git_sha, output_sha256,
+            matches_recorded, created_at) VALUES (?,?,?,?,?,?,?)""",
+            (job_id, kind, seed, git_sha, sha, None if match is None else int(match), _now()),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _write(out: dict, out_dir: Path, git_sha: str, git_head: str, kind: str) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        path = out_dir / f"{out['job_id']}-{kind}-seed{out['rng_seed']}-{stamp}.json"
+        doc = {
+            **out,
+            "kind": kind,
+            "code_git_sha": git_sha,
+            "git_head": git_head,
+            "written_at": _now(),
+        }
+        path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        return path

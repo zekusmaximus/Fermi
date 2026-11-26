@@ -1,0 +1,23 @@
+# Wlodarczyk-Sroka, Garrett & Siemion 2020 (MNRAS 498, 5720; arXiv:2006.09756v2), Table 2:
+# cumulative number of GBT-observed stars (L + S band) with EIRP_min at or below each shell,
+# and Sec. 3: EIRP_min = 2.1e+12 W at 50 pc on-axis (Price et al. 2020 sensitivity, delta_nu_t = 1 Hz).
+# Used ONLY as the input of the queue job `wlodarczyk_sroka_288k_background_extension` (EIG).
+# It is NOT a survey file: these stars share the BL 692 pointings (pointing_group_id
+# bl_gbt_lband_2017), so promoting it to data/surveys/ requires an explicit merge policy.
+id: wlodarczyk_sroka_2020_gbt_shells
+data_tier: published_catalog
+shares_pointing_group_id: bl_gbt_lband_2017
+n_stars_total_published: 288315
+reference_eirp_w_at_50pc: 2.1e+12
+shells:                     # [EIRP_min upper edge (W), cumulative N (central value)]
+  - [1.0e+11, 145]
+  - [1.0e+12, 1180]
+  - [1.0e+13, 1491]
+  - [1.0e+14, 3736]
+  - [1.0e+15, 26384]
+  - [1.0e+16, 149518]
+  - [1.0e+17, 249734]
+  - [1.0e+18, 249990]
+citations:
+  - "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720 (arXiv:2006.09756), Table 2 and Sec. 3"
+  - "Price et al. 2020, AJ 159, 86"

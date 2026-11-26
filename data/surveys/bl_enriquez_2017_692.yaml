@@ -5,9 +5,10 @@ pointing_group_id: bl_gbt_lband_2017
 data_tier: published_catalog
 n_targets: 692
 frequency_ghz: [1.1, 1.9]
-# Enriquez et al. 2017 Sec. 5.1: S_min = 17 Jy for a 1 Hz-wide transmitter at
-# S/N >= 25 in 3 Hz channels over 300 s (SPEC.md's placeholder 10.0 Jy is the SEFD).
-nominal_flux_limit_jy: 17.0
+# Planning ruling (SPEC.md Sec. 4.3): Enriquez et al. 2017 Sec. 5.1 S_min = 17 Jy for a
+# 1 Hz-wide transmitter at S/N >= 25 in 3 Hz channels over 300 s; SEFD = 10 Jy.
+minimum_flux_limit_jy: 17.0
+sefd_jy: 10.0
 observed_detections: 0
 catalog_path: "data/catalogs/bl_692_targets.csv"
 catalog_sha256: "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2"
@@ -21,6 +22,7 @@ radio_sensitivity:
   n_pol: 2
   reference_eirp_w: 5.2e12          # Table 3, 'This work', most distant target
   reference_distance_pc: 50.0
+  beam_fwhm_arcmin: 8.4             # GBT L-band FWHM, Wlodarczyk-Sroka et al. 2020 Sec. 2 (Enriquez Table 3 rounds to 8)
   citation: "Enriquez et al. 2017, arXiv:1709.03491v2, Sec. 5.1 eqs. 2-5 and Table 3 (verified 2026-11-25)"
 anchor_claims:
   - "data/adversary_claims/hip_1692.yaml"

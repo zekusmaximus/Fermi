@@ -66,6 +66,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   │   ├── expansion.py            # 2D thin-disk & 3D thick-disk spatial correlation kernel
 │   │   ├── radio.py                # Breakthrough Listen 692-star forward model (flat & per-target EIRP)
 │   │   ├── infrared.py             # Mid-IR waste-heat & calibration-reversal forward model
+│   │   ├── hephaistos.py           # WISE centroid vs. image-level blend-recovery grid (M2)
 │   │   └── solar_system.py         # Local Solar System / ISO null-bound forward model
 │   ├── inference/
 │   │   ├── engine.py               # Joint likelihood engine + separate Earth-unreached conditioning
@@ -89,6 +90,16 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 ## 4. Core Data Contracts
 
 ### 4.1 Parameter Registry (`data/parameters.yaml`)
+**Unit rules (planning ruling, Milestone 2).** Every `unit` string must parse with
+`astropy.units.Unit(...)`, with one canonical alias: `"dimensionless"` maps to
+`astropy.units.dimensionless_unscaled` (astropy itself does not parse that word).
+No other aliases are permitted.
+
+**Prior-floor rule (planning ruling, Milestone 2).** A `log_uniform` prior whose
+lower bound is `0.0` is undefined on its own and MUST declare an explicit positive
+`log_floor` (strictly below the upper bound). Grids and marginalisations use
+`max(lower_bound, log_floor)` as the effective lower edge.
+
 ```yaml
 parameters:
   - id: origin_rate_per_kpc2_gyr
@@ -118,6 +129,7 @@ parameters:
     unit: "dimensionless"
     prior_type: log_uniform
     bounds: [0.0, 1.0]
+    log_floor: 1.0e-8                 # required: log-uniform with zero lower bound
     description: "Probability a settled system emits a detectable narrowband radio signature during observation."
 
   - id: ir_covering_fraction
@@ -125,6 +137,7 @@ parameters:
     unit: "dimensionless"
     prior_type: log_uniform
     bounds: [0.0, 1.0]
+    log_floor: 1.0e-8
     description: "Fraction of host stellar bolometric luminosity reprocessed into mid-IR waste heat."
 
   - id: ir_conspicuous_fraction
@@ -132,6 +145,7 @@ parameters:
     unit: "dimensionless"
     prior_type: log_uniform
     bounds: [0.0, 1.0]
+    log_floor: 1.0e-8
     description: "Fraction of settled systems maintaining a detectable mid-IR waste-heat signature."
 ```
 
@@ -153,6 +167,15 @@ citations:
   - "Hanson et al. 2021 (arXiv:2102.01522)"
 ```
 
+**Infrared macro-to-micro coupling (planning ruling, Milestone 2).** `models/infrared.py`
+never imports expansion physics. When a hypothesis with expansion parameters
+activates `infrared`, `inference/engine.py` derives the per-star signature fraction
+`f_ir_host = P(star reached) * f_ir_loud`, where `P(star reached)` is evaluated over
+the IR survey footprint under the run's Earth-unreached setting, and passes it to
+`models/infrared.py`. Such hypotheses must not also declare `ir_host_fraction`;
+hypotheses without expansion parameters declare `ir_host_fraction` explicitly.
+`f_ir_loud = 0` therefore always yields an IR likelihood ratio of exactly 1.0.
+
 For `tier: 3` hypotheses (e.g., `zoo_hypothesis.yaml`, `dark_forest.yaml`), the schema MUST require:
 ```yaml
 tier: 3
@@ -172,7 +195,8 @@ pointing_group_id: bl_gbt_lband_2017
 data_tier: published_catalog
 n_targets: 692
 frequency_ghz: [1.1, 1.9]
-nominal_flux_limit_jy: 10.0         # narrowband equivalent / paper reference
+minimum_flux_limit_jy: 17.0         # Enriquez et al. 2017 Sec. 5.1 S_min (1 Hz transmitter, S/N >= 25)
+sefd_jy: 10.0                       # optional: GBT L-band SEFD (Enriquez et al. 2017 Sec. 5.1)
 observed_detections: 0
 catalog_path: "data/catalogs/bl_692_targets.csv"
 catalog_sha256: "<sha256>"
@@ -180,6 +204,22 @@ citations:
   - "Enriquez et al. 2017, ApJ 849, 104 (arXiv:1709.03491)"
   - "Isaacson et al. 2017, PASP 129, 054501"
 ```
+
+**Likelihood normalisation (planning ruling, Milestone 2).** Receipts and CLI tables
+report two distinct quantities per component and never mix them:
+- `log10 P(data | H)`: the raw probability of the observed data under H.
+- `log10 LR vs null`: the same quantity divided by its hypothesis-independent null
+  (no settlement / zero emission / silent sky), which equals 1 by construction for
+  the zero-detection radio and Earth-unreached terms.
+Joint values are always labelled with the channel set they cover. Pairwise Bayes
+factors are computed only over the intersection of the two hypotheses' active
+channels (plus Earth-unreached conditioning when both carry it), and list the
+channels that entered.
+
+**HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
+parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
+Bailer-Jones DR2 distance (752.61 pc, ~1,071x) is the historical Wlodarczyk-Sroka
+et al. (2020) anchor in `data/adversary_claims/hip_1692.yaml`.
 
 ### 4.4 Action Queue & Run Receipt Schema (SQLite)
 Every queued or executed job records:
@@ -191,13 +231,13 @@ Every queued or executed job records:
 
 ## 5. Three-Vertical Roadmap & Launch Gate
 
-### Milestone 1: Factor Graph Core, Macro Engine & Scientific CI (Current)
+### Milestone 1: Factor Graph Core, Macro Engine & Scientific CI (Complete)
 - Canonical schemas (`parameters.yaml`, starter Tier 1/2/3 hypotheses, 3 benchmark surveys).
 - Executable 2D/3D spatial expansion & Earth-unreached conditioning kernel.
 - Radio (BL 692 primary targets: flat vs. per-target distance-scaled EIRP), Mid-IR (calibration reversal bracket), and Solar System channels with toggleable joint evaluation.
 - Full Scientific CI test suite (`pytest`) passing all 6 architectural invariants.
 
-### Milestone 2: Drill-Down Verticals, Adversary Runner & BOED Queue
+### Milestone 2: Drill-Down Verticals, Adversary Runner & BOED Queue (Current; brief: `docs/MILESTONE_2.md`)
 - **Infrared Drill-Down (`hephaistos`):** AllWISE centroid vs. image-level blend-recovery grid (angular separation vs. background flux fraction), anchored on Project Hephaistos Candidates D and E (Ren et al. 2026; Zackrisson et al. 2026).
 - **Adversary Runner:** Automated reproduction of real catalog/methodology failure modes—starting with **HIP 1692** (distance revision from ~23 pc to ~752.6 pc raising minimum detectable EIRP by >1,000x; Wlodarczyk-Sroka et al. 2020) and duplicate-pointing detection.
 - **SQLite Job Queue & EIG Scorer:** Computes exact expected bits gained per trial plus CPU/review cost; registers open jobs (including Wlodarczyk-Sroka 288,315-star background extension and independent WISE control fields).

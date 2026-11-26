@@ -1,0 +1,37 @@
+# Project Hephaistos candidates D and E: published blend anchors for the Milestone 2
+# IR drill-down. Every number below is quoted from the cited papers (verified
+# 2026-11-25 via arXiv full text); none are fitted here.
+id: hephaistos_candidates_d_e_blends
+data_tier: published_catalog
+pointing_group_id: wise_gaia_hephaistos
+wise_w3_psf_fwhm_arcsec: 6.5        # Ren et al. 2026 Table 2 (AllWISE W3)
+contamination_fractions:            # Zackrisson et al. 2026 Sec. 5.1 (from Suazo 2024 surface density ~15000 / sr)
+  within_3p25_arcsec: 1.2e-5
+  within_1p0_arcsec: 1.1e-6
+  suazo_2024_applied_sample: 200000 # Suazo et al. 2024 Sec. 4 applies the rate to the W3/W4 SNR>=3.5 subsample
+  zackrisson_2026_full_sample: 5000000  # Zackrisson et al. 2026 Sec. 5.1 critique: full Gaia-2MASS-WISE sample
+candidates:
+  - label: D
+    gaia_dr3_source_id: 2660349163149053824
+    ra_icrs: "23:27:51.3277"
+    dec_icrs: "+05:06:26.49"
+    background_separation_arcsec: 1.0   # Zackrisson et al. 2026: background galaxy "~1 arcsec" (z ~ 0.9, Hot-DOG-like)
+    background_redshift: 0.9
+    w3_centroid_offset_arcsec: 0.75     # Ren et al. 2026 Table 5
+    w3_centroid_offset_err_arcsec: 0.22
+    w3_flux_fraction_bounds: [0.85, 0.99]  # Zackrisson et al. 2026 Table 2: galaxy share of F1000W (0.85) .. F1500W (>0.99)
+    published_centroid_verdict: no_evidence   # Ren et al. 2026: D "still lack[s] obvious signs of contamination"
+  - label: E
+    gaia_dr3_source_id: 3190232820489766656
+    ra_icrs: "04:02:07.7601"
+    dec_icrs: "-10:54:41.21"
+    background_separation_arcsec: 1.0   # Zackrisson et al. 2026: extended clumpy galaxy ~1 arcsec (z ~ 0.4)
+    background_redshift: 0.4
+    w3_centroid_offset_arcsec: 1.50     # Ren et al. 2026 Table 5
+    w3_centroid_offset_err_arcsec: 0.24
+    w3_flux_fraction_bounds: [0.5, 0.99]   # Zackrisson et al. 2026: galaxy dominates F1000W/F1500W (not separable)
+    published_centroid_verdict: marginal      # Ren et al. 2026: "candidates E, F, H and J show some marginal evidence"
+citations:
+  - "Zackrisson et al. 2026, Project Hephaistos IV, MNRAS (arXiv:2607.09460)"
+  - "Ren et al. 2026, Archival Diagnostics for Potential Background Contaminants, MNRAS (arXiv:2607.03619)"
+  - "Suazo et al. 2024, MNRAS 531, 695 (arXiv:2405.02927)"

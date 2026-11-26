@@ -199,12 +199,23 @@ class ExpansionModel:
 
     # ----------------------------------------------------------- target geometry
     def _positions(self, xyz: u.Quantity) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(model-frame positions relative to Earth [kpc], distance used for delay, delay [Gyr])."""
+        """(model-frame positions relative to Earth [kpc], true distance, delay [Gyr]).
+
+        ``thin_disk_2d`` uses a distance-preserving projection: each target keeps its
+        Galactic azimuth and is placed in the plane at its TRUE distance, so geometry,
+        light-travel delay and EIRP all refer to the same Earth-target distance. (A
+        plain (x, y) projection would shrink high-latitude separations below v * tau
+        and make fast fronts spuriously unable to reach them; found by the M2 adversary.)
+        """
         arr = np.asarray(u.Quantity(xyz).to_value(u.kpc), float).reshape(-1, 3)
         d3 = np.linalg.norm(arr, axis=1)
         tau = d3 / C_KPC_PER_GYR if self.light_travel_delay else np.zeros_like(d3)
-        pos = arr if self.is_3d else arr[:, :2]
-        return pos, d3, tau
+        if self.is_3d:
+            return arr, d3, tau
+        rho = np.linalg.norm(arr[:, :2], axis=1)
+        safe = np.where(rho > 0, rho, 1.0)
+        unit = np.where(rho[:, None] > 0, arr[:, :2] / safe[:, None], np.array([1.0, 0.0]))
+        return unit * d3[:, None], d3, tau
 
     # ------------------------------------------------------- unconditional reach
     def _cone_lambda(self, z_mid: np.ndarray, t_eff: np.ndarray) -> np.ndarray:

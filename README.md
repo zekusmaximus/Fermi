@@ -56,6 +56,21 @@ uv run fermi-desk compare --geometry thick_disk_3d --radio-mode distance_scaled_
 
 Every `compare` run writes a deterministic JSON `RunReceipt` (including git SHA, RNG seed, active surveys, and data tiers used) to `runs/`.
 
+Milestone 2 drill-downs, adversary runner and BOED queue (all offline; see `docs/MILESTONE_2.md`):
+
+```bash
+uv run fermi-desk ir-drilldown --seed 42          # WISE centroid vs image-level blend recovery (Hephaistos D/E anchors)
+uv run fermi-desk adversary run --seed 42         # HIP 1692 dual-distance audit, duplicate pointings, D/E, symmetry, validity
+uv run fermi-desk queue seed                      # register jobs with exact EIG (bits) and cost
+uv run fermi-desk queue list
+uv run fermi-desk queue claim lookback_window_t_sweep --by you
+uv run fermi-desk queue run lookback_window_t_sweep --seed 42
+uv run fermi-desk queue replay lookback_window_t_sweep   # must reproduce output_sha256 exactly
+
+# Opt-in LIVE archive experiment (never run by pytest): WISE W3 centroid floor on control stars
+uv run python scripts/run_wise_control_experiment.py --n-controls 30 --seed 42
+```
+
 ---
 
 ## Repository Structure

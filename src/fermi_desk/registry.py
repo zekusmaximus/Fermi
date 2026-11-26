@@ -10,7 +10,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -164,6 +164,8 @@ class TargetTable:
     pointing_group_id: str
     data_tier: str
     catalog_sha256: str
+    ra_deg: np.ndarray | None = None
+    dec_deg: np.ndarray | None = None
 
     def __len__(self) -> int:
         return len(self.names)
@@ -187,6 +189,20 @@ class TargetTable:
             data_tier=data_tier,
             catalog_sha256="",
         )
+
+    def with_distance(self, index: int, distance: u.Quantity, source: str) -> TargetTable:
+        """Copy with one target moved along its line of sight to ``distance`` (adversary toggles)."""
+        d_old = float(self.distance[index].to_value(u.pc))
+        d_new = float(u.Quantity(distance).to_value(u.pc))
+        if d_old <= 0 or d_new <= 0:
+            raise ValueError("distances must be positive")
+        xyz = self.xyz.to_value(u.pc).copy()
+        xyz[index] *= d_new / d_old
+        dist = self.distance.to_value(u.pc).copy()
+        dist[index] = d_new
+        src = self.dist_source.copy()
+        src[index] = source
+        return replace(self, xyz=xyz * u.pc, distance=dist * u.pc, dist_source=src)
 
     @classmethod
     def empty(cls) -> TargetTable:
@@ -244,6 +260,8 @@ def load_targets(survey: Survey, root: Path) -> TargetTable:
         pointing_group_id=survey.pointing_group_id,
         data_tier=survey.data_tier,
         catalog_sha256=survey.catalog_sha256 or "",
+        ra_deg=df["ra_deg"].to_numpy(dtype=float),
+        dec_deg=df["dec_deg"].to_numpy(dtype=float),
     )
 
 
@@ -266,6 +284,25 @@ def _check_provenance_json(survey: Survey, root: Path) -> str:
     if prov.get("row_count") != survey.n_targets:
         raise ProvenanceError(f"{survey.id}: provenance row_count != n_targets")
     return f"sources={sorted((prov.get('sources') or {}).values(), key=str)}"
+
+
+def _check_flux_limit(survey: Survey) -> str:
+    """minimum_flux_limit_jy must equal the radiometer-equation S_min for a 1 Hz transmitter."""
+    rs = survey.radio_sensitivity
+    s_min = (
+        rs.snr_threshold
+        * rs.sefd
+        * np.sqrt(rs.channel_bandwidth / (rs.n_pol * rs.integration_time))
+        / (1 * u.Hz)
+    ).to(u.Jy)
+    if not math.isclose(s_min.value, survey.minimum_flux_limit_jy, rel_tol=0.05):
+        raise ProvenanceError(
+            f"{survey.id}: minimum_flux_limit_jy={survey.minimum_flux_limit_jy} but radiometer "
+            f"equation gives {s_min:.3f} (1 Hz transmitter)"
+        )
+    return (
+        f"declared {survey.minimum_flux_limit_jy} Jy; radiometer equation {s_min:.3f} (within 5%)"
+    )
 
 
 def _check_anchor_claim(survey: Survey, root: Path, claim_path: str) -> str:
@@ -344,6 +381,8 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
                 lambda s=s: f"{len(load_targets(s, graph.root))} targets, tier {s.data_tier}",
             )
             record(f"provenance:{s.id}", lambda s=s: _check_provenance_json(s, graph.root))
+            if s.radio_sensitivity is not None and s.minimum_flux_limit_jy is not None:
+                record(f"flux_limit:{s.id}", lambda s=s: _check_flux_limit(s))
             for cp in s.anchor_claims:
                 record(
                     f"anchor_claim:{cp}", lambda s=s, cp=cp: _check_anchor_claim(s, graph.root, cp)

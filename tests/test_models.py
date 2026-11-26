@@ -234,7 +234,13 @@ def test_no_hypothesis_specific_branches_in_kernels():
         "HIP 1692",
         "hip_1692",
     )
-    for path in [*(src / "models").glob("*.py"), src / "inference" / "engine.py"]:
+    # queue/store.py and cli.py hold job / CLI *configuration* (default pairs), not physics.
+    scanned = [
+        *(src / "models").glob("*.py"),
+        *(src / "inference").glob("*.py"),
+        src / "queue" / "runners.py",
+    ]
+    for path in scanned:
         text = path.read_text(encoding="utf-8")
         assert not any(f in text for f in forbidden), path
 
@@ -248,5 +254,9 @@ def test_unconditioned_run_includes_solar_system_jointly(graph):
         condition_on_earth_unreached=False,
     )
     rec = run_comparison(graph, cfg, ["frequent_slow_expanders"])
-    comps = rec["results"]["hypotheses"]["frequent_slow_expanders"]["log_likelihood_components"]
-    assert set(comps) == {"radio+solar_system"}
+    h = rec["results"]["hypotheses"]["frequent_slow_expanders"]
+    # Joint radio+SS term is used for the hypothesis's own joint; marginals are kept for
+    # channel-intersection Bayes factors but never double-entered.
+    assert h["own_joint"]["terms"] == ["radio+solar_system", "infrared"]
+    assert {"radio", "solar_system", "radio+solar_system", "infrared"} == set(h["components"])
+    assert "earth_unreached" not in h["components"]

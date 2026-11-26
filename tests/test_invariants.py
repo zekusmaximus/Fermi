@@ -65,10 +65,17 @@ def test_zero_emission_hypothesis_scores_exactly_one_in_engine(graph):
     ]:
         ctx = build_context(graph, RunConfig(geometry=geometry, radio_mode=mode, seed=3, n_mc=50))
         out = evaluate_hypothesis(graph.hypotheses["quiet_expanders"], ctx)
-        comps = out["log_likelihood_components"]
-        assert abs(comps["radio"]) <= 1e-12
-        assert abs(comps["infrared"]) <= 1e-12
-        assert comps["solar_system"] == 0.0
+        comps = out["components"]
+        assert abs(comps["radio"]["log10_lr_vs_null"]) <= 1e-12
+        assert abs(comps["infrared"]["log10_lr_vs_null"]) <= 1e-12
+        assert comps["solar_system"]["log10_lr_vs_null"] == 0.0
+        # Normalisation: the IR raw likelihood is NOT 1 (k=7 flags have nonzero probability
+        # under the silent null), and LR = raw - null exactly.
+        ir = comps["infrared"]
+        assert ir["log10_p_data_given_h"] == ir["log10_null"] < 0
+        # Derived IR host fraction is P(star reached) * f_ir_loud = 0 when f_ir_loud = 0.
+        assert out["infrared"]["signature_fraction_max"] == 0.0
+        assert out["infrared"]["p_star_reached"] > 0
 
 
 @pytest.mark.parametrize("host", [1e-8, 1e-5, 1e-2, 1.0])
@@ -205,5 +212,6 @@ def test_conditioned_run_never_reapplies_earth_factor_via_solar_system(graph):
     )
     out = evaluate_hypothesis(graph.hypotheses["frequent_slow_expanders"], ctx)
     assert out["solar_system"]["subsumed_by_earth_unreached_conditioning"] is True
-    assert out["log_likelihood_components"]["solar_system"] == 0.0
-    assert "earth_unreached" in out["log_likelihood_components"]
+    assert out["components"]["solar_system"]["log10_p_data_given_h"] == 0.0
+    assert "earth_unreached" in out["components"]
+    assert "radio+solar_system" not in out["components"]

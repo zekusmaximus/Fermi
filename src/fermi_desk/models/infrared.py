@@ -58,15 +58,23 @@ def log_lr_vs_silent(k: int, n: int, signature_grid: np.ndarray, cal: IRCalibrat
     return log_marginal_likelihood(k, n, signature_grid, cal) - ref
 
 
+def log_marginal_likelihood_calibration_mixture(
+    k: int, n: int, signature_grid: np.ndarray, cals: Sequence[IRCalibration]
+) -> float:
+    """Raw log P(k | H) with calibrations marginalised as an equal-weight mixture."""
+    if n == 0:
+        return 0.0
+    vals = [log_marginal_likelihood(k, n, signature_grid, c) for c in cals]
+    return float(logsumexp(vals) - np.log(len(vals)))
+
+
 def log_lr_vs_silent_calibration_mixture(
     k: int, n: int, signature_grid: np.ndarray, cals: Sequence[IRCalibration]
 ) -> float:
     """Likelihood ratio vs. silence with calibrations marginalised as an equal-weight mixture."""
-    if n == 0:
-        return 0.0
-    num = [log_marginal_likelihood(k, n, signature_grid, c) for c in cals]
-    den = [float(log_likelihood(k, n, np.array([0.0]), c)[0]) for c in cals]
-    return float(logsumexp(num) - logsumexp(den))
+    raw = log_marginal_likelihood_calibration_mixture(k, n, signature_grid, cals)
+    null = log_marginal_likelihood_calibration_mixture(k, n, np.array([0.0]), cals)
+    return raw - null
 
 
 @dataclass(frozen=True)

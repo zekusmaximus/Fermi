@@ -42,3 +42,11 @@ class GeometryError(FermiDeskError):
 
 class ComputationalBudgetError(FermiDeskError):
     """A Monte Carlo request exceeds the configured point budget (would be silently truncated otherwise)."""
+
+
+class QueueStateError(FermiDeskError):
+    """An illegal job-queue transition (e.g. running an unclaimed or archival job)."""
+
+
+class ReplayMismatchError(FermiDeskError):
+    """A deterministic replay did not reproduce the recorded output_sha256."""

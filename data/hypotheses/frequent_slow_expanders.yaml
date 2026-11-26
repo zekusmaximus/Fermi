@@ -6,12 +6,14 @@ parameter_constraints:
   origin_rate_per_kpc2_gyr: { mode: fixed, value: 4.0 }
   expansion_speed_c: { mode: fixed, value: 0.005 }
   radio_detect_prob: { mode: fixed, value: 0.0021 }
-channels_activated: ["radio", "solar_system"]
+  ir_conspicuous_fraction: { mode: range, min: 0.01, max: 0.5 }
+channels_activated: ["radio", "infrared", "solar_system"]
 falsification_condition: "Joint multi-channel null detections + spatial clustering bounds push likelihood ratio below 1e-3."
 benchmark_notes: >-
-  Parameter values are the SPEC.md Section 4.2 benchmark. The infrared channel is
-  not activated: this hypothesis does not declare an ir_host_fraction, and the
-  macro expansion kernel is deliberately not used to derive one (AGENTS.md law 6).
+  Parameter values are the SPEC.md Section 4.2 benchmark (including the
+  ir_conspicuous_fraction range). Per the Milestone 2 coupling ruling, the IR
+  per-star signature fraction is derived in engine.py as P(star reached) * f_ir_loud
+  over the Hephaistos footprint; ir_host_fraction is therefore NOT declared here.
 citations:
   - "Enriquez et al. 2017 (arXiv:1709.03491)"
   - "Hanson et al. 2021 (arXiv:2102.01522)"

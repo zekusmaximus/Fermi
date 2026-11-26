@@ -1,19 +1,23 @@
 """Joint likelihood engine with separate Earth-unreached conditioning.
 
-Every hypothesis likelihood is reported as natural-log components:
+Likelihood normalisation (SPEC.md Sec. 4.3 ruling): every component reports
 
-* ``earth_unreached``: log P(Earth unreached | H)   (only if conditioning is on)
-* ``radio`` (+ ``solar_system`` when evaluated jointly): log P(0 detections | H, ...)
-* ``infrared``: log [P(k | H) / P(k | silent sky)]
+* ``log10_p_data_given_h``  - raw log10 P(observed data | H);
+* ``log10_null``            - the same quantity under the component's
+  hypothesis-independent null model (no settlement / zero emission / silent sky);
+* ``log10_lr_vs_null``      - their difference.
 
-All non-Earth components are ratios against a hypothesis-independent silent-sky
-reference, so differences between hypotheses are log Bayes factors over the
-channels they share.
+For the zero-detection radio, Solar System and Earth-unreached terms the null
+probability is exactly 1, so raw and LR coincide; for the mid-IR candidate count
+they do not. Joint values are always labelled with their channel set, and
+pairwise Bayes factors are computed only over the intersection of the two
+hypotheses' active channels.
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import subprocess
@@ -25,20 +29,24 @@ from pathlib import Path
 import astropy.units as u
 import numpy as np
 
-from fermi_desk.errors import SchemaValidationError, Tier3ScoringError
+from fermi_desk.errors import GeometryError, SchemaValidationError, Tier3ScoringError
 from fermi_desk.models import infrared, radio, solar_system
 from fermi_desk.models.expansion import GEOMETRY_MODES, ExpansionModel
-from fermi_desk.registry import (
-    FactorGraph,
-    TargetTable,
-    check_pointing_groups,
-    load_targets,
-)
+from fermi_desk.registry import FactorGraph, TargetTable, check_pointing_groups, load_targets
 from fermi_desk.schemas import Hypothesis, Survey
 
 LN10 = math.log(10.0)
 CHANNELS = ("radio", "infrared", "solar_system")
 EXPANSION_PARAMS = ("origin_rate_per_kpc2_gyr", "expansion_speed_c")
+EARTH = "earth_unreached"
+RADIO_SS = "radio+solar_system"
+NULL_MODELS = {
+    EARTH: "no settlement (Gamma_2d = 0): P(Earth unreached) = 1",
+    "radio": "zero radio emission (p_radio = 0): P(0 detections) = 1",
+    "solar_system": "zero Solar System evidence (p_ss = 0): P(null) = 1",
+    RADIO_SS: "zero radio emission and zero Solar System evidence: P = 1",
+    "infrared": "silent sky (signature fraction q = 0): k flags are all false positives",
+}
 
 
 # ---------------------------------------------------------------------- config
@@ -55,10 +63,11 @@ class RunConfig:
     headline_pair: tuple[str, str] | None = None
     ir_pair: tuple[str, str] | None = None
     merge_policies: dict[str, str] = field(default_factory=dict)
+    # Overrides of registry DEFAULTS only (e.g. lookback sweeps); never of a value
+    # a hypothesis constrains itself.
+    parameter_overrides: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self) -> None:
-        from fermi_desk.errors import GeometryError
-
         if self.geometry not in GEOMETRY_MODES:
             raise GeometryError(f"geometry must be explicit, one of {GEOMETRY_MODES}")
         if self.radio_mode not in radio.RADIO_MODES:
@@ -99,14 +108,30 @@ class ResolvedParameters:
         return pid in self.fixed or pid in self.ranges
 
 
-def resolve_parameters(graph: FactorGraph, hyp: Hypothesis, n_grid: int) -> ResolvedParameters:
-    """Fixed constraints, then registry defaults; ranges become prior-midpoint grids."""
+def resolve_parameters(
+    graph: FactorGraph,
+    hyp: Hypothesis,
+    n_grid: int,
+    overrides: Sequence[tuple[str, float]] = (),
+) -> ResolvedParameters:
+    """Fixed constraints, then overrides of registry defaults, then registry defaults."""
+    over = dict(overrides)
+    for pid, val in over.items():
+        if pid in hyp.parameter_constraints:
+            raise SchemaValidationError(
+                f"{hyp.id}: override of {pid} conflicts with the hypothesis's own constraint"
+            )
+        lo, hi = graph.registry.get(pid).bounds
+        if not lo <= val <= hi:
+            raise SchemaValidationError(f"override {pid}={val} outside registry bounds")
     fixed: dict[str, float] = {}
     ranges: dict[str, np.ndarray] = {}
     for p in graph.registry.parameters:
         c = hyp.parameter_constraints.get(p.id)
         if c is None:
-            if p.default is not None:
+            if p.id in over:
+                fixed[p.id] = float(over[p.id])
+            elif p.default is not None:
                 fixed[p.id] = float(p.default)
             continue
         if c.mode == "fixed":
@@ -122,7 +147,7 @@ def resolve_parameters(graph: FactorGraph, hyp: Hypothesis, n_grid: int) -> Reso
     return ResolvedParameters(hyp.id, fixed, ranges, graph)
 
 
-def _expansion_model(params: ResolvedParameters, cfg: RunConfig) -> ExpansionModel:
+def expansion_model(params: ResolvedParameters, cfg: RunConfig) -> ExpansionModel:
     return ExpansionModel(
         geometry=cfg.geometry,
         origin_rate=params.quantity("origin_rate_per_kpc2_gyr"),
@@ -134,26 +159,69 @@ def _expansion_model(params: ResolvedParameters, cfg: RunConfig) -> ExpansionMod
     )
 
 
-def _radiometer(sv: Survey) -> radio.Radiometer:
+def radiometer(sv: Survey) -> radio.Radiometer:
     rs = sv.radio_sensitivity
-    assert rs is not None
+    if rs is None:
+        raise SchemaValidationError(f"{sv.id} has no radio_sensitivity")
     return radio.Radiometer(
         rs.sefd, rs.snr_threshold, rs.channel_bandwidth, rs.integration_time, rs.n_pol
     )
 
 
-def _ir_calibrations(sv: Survey) -> list[infrared.IRCalibration]:
-    assert sv.infrared is not None
+def ir_calibrations(sv: Survey) -> list[infrared.IRCalibration]:
+    if sv.infrared is None:
+        raise SchemaValidationError(f"{sv.id} has no infrared block")
     return [
         infrared.IRCalibration(c.id, c.completeness, c.false_positive_rate)
         for c in sv.infrared.calibrations
     ]
 
 
-def ir_signature_grid(params: ResolvedParameters) -> np.ndarray:
-    host = params.grid("ir_host_fraction")
+def footprint_lattice(radius: u.Quantity, n_radial: int = 8, n_dir: int = 32) -> u.Quantity:
+    """Deterministic volume-uniform lattice filling a ball (radial quantiles x Fibonacci sphere)."""
+    r = radius.to_value(u.pc) * ((np.arange(n_radial) + 0.5) / n_radial) ** (1.0 / 3.0)
+    k = np.arange(n_dir) + 0.5
+    cos_t = 1.0 - 2.0 * k / n_dir
+    phi = np.pi * (1.0 + 5.0**0.5) * k
+    sin_t = np.sqrt(1.0 - cos_t**2)
+    dirs = np.column_stack([sin_t * np.cos(phi), sin_t * np.sin(phi), cos_t])
+    return (r[:, None, None] * dirs[None, :, :]).reshape(-1, 3) * u.pc
+
+
+def ir_signature_grid(
+    params: ResolvedParameters, model: ExpansionModel | None, ctx: RunContext
+) -> tuple[np.ndarray, dict]:
+    """Per-star IR signature fraction q, plus provenance of the host fraction.
+
+    Expansion hypotheses: q = P(star reached) * f_ir_loud (planning ruling); the
+    reach probability is averaged over the IR footprint lattice. Others: q =
+    f_ir_host * f_ir_loud with an explicitly declared host fraction.
+    """
     loud = params.grid("ir_conspicuous_fraction")
-    return np.outer(host, loud).ravel()
+    hyp = ctx.graph.hypotheses[params.hypothesis_id]
+    if model is not None:
+        if "ir_host_fraction" in hyp.parameter_constraints:
+            raise SchemaValidationError(
+                f"{hyp.id}: expansion hypotheses must not declare ir_host_fraction; "
+                "it is derived as P(star reached) (SPEC.md Sec. 4.2 coupling ruling)"
+            )
+        assert ctx.ir_footprint is not None
+        p_reach = float(
+            np.mean(
+                model.reach_probabilities(ctx.ir_footprint, ctx.config.condition_on_earth_unreached)
+            )
+        )
+        return p_reach * loud, {
+            "host_fraction_source": "derived: mean P(star reached) over IR footprint lattice",
+            "p_star_reached": p_reach,
+            "footprint_points": len(ctx.ir_footprint),
+        }
+    host = params.grid("ir_host_fraction")
+    return np.outer(host, loud).ravel(), {
+        "host_fraction_source": "declared ir_host_fraction",
+        "ir_host_fraction_min": float(host.min()),
+        "ir_host_fraction_max": float(host.max()),
+    }
 
 
 # -------------------------------------------------------------- run context
@@ -163,6 +231,8 @@ class RunContext:
     config: RunConfig
     surveys: dict[str, Survey]  # channel -> survey
     targets: TargetTable | None
+    ir_footprint: u.Quantity | None
+    catalog_column_tiers: tuple[str, ...]
 
 
 def build_context(graph: FactorGraph, cfg: RunConfig) -> RunContext:
@@ -175,11 +245,32 @@ def build_context(graph: FactorGraph, cfg: RunConfig) -> RunContext:
         if sv.channel in by_channel:
             raise SchemaValidationError(
                 f"Multiple {sv.channel} surveys selected ({by_channel[sv.channel].id}, {sv.id}); "
-                "M1 joint runs take one survey per channel"
+                "joint runs take one survey per channel"
             )
         by_channel[sv.channel] = sv
     targets = load_targets(by_channel["radio"], graph.root) if "radio" in by_channel else None
-    return RunContext(graph, cfg, by_channel, targets)
+    footprint = None
+    if "infrared" in by_channel and by_channel["infrared"].infrared is not None:
+        footprint = footprint_lattice(
+            by_channel["infrared"].infrared.footprint_max_distance_pc * u.pc
+        )
+    col_tiers: set[str] = set()
+    for sv in by_channel.values():
+        if sv.catalog_provenance_path:
+            prov = json.loads((graph.root / sv.catalog_provenance_path).read_text("utf-8"))
+            col_tiers |= {t for t in prov.get("column_data_tiers", {}) if t != "derived"}
+    return RunContext(graph, cfg, by_channel, targets, footprint, tuple(sorted(col_tiers)))
+
+
+def _component(raw_ln: float, null_ln: float, name: str, channels: list[str], tiers) -> dict:
+    return {
+        "channels": channels,
+        "log10_p_data_given_h": raw_ln / LN10,
+        "log10_null": null_ln / LN10,
+        "log10_lr_vs_null": (raw_ln - null_ln) / LN10,
+        "null_model": NULL_MODELS[name],
+        "data_tiers": sorted(set(tiers)),
+    }
 
 
 # ------------------------------------------------------------- per hypothesis
@@ -190,11 +281,12 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             f"{hyp.id!r} is Tier-3 (quarantined): it cannot receive empirical exclusion scores"
         )
     cfg = ctx.config
-    params = resolve_parameters(ctx.graph, hyp, cfg.range_grid_points)
+    params = resolve_parameters(ctx.graph, hyp, cfg.range_grid_points, cfg.parameter_overrides)
     active = [c for c in cfg.channels if c in hyp.channels_activated and c in ctx.surveys]
     has_expansion = all(params.has(p) for p in EXPANSION_PARAMS)
     if ("radio" in active or "solar_system" in active) and not has_expansion:
         raise SchemaValidationError(f"{hyp.id}: radio/solar_system channels need expansion params")
+    cond = cfg.condition_on_earth_unreached
 
     out: dict = {
         "hypothesis_id": hyp.id,
@@ -208,69 +300,70 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             k: {"min": float(g.min()), "max": float(g.max()), "grid_points": int(g.size)}
             for k, g in sorted(params.ranges.items())
         },
-        "log_likelihood_components": {},
     }
-    comps: dict[str, float] = out["log_likelihood_components"]
+    comps: dict[str, dict] = {}
 
-    model = _expansion_model(params, cfg) if has_expansion else None
+    model = expansion_model(params, cfg) if has_expansion else None
     if model is not None:
-        p_e = model.earth_reach_probability()
         out["expansion"] = {
             "geometry_mode": cfg.geometry,
             "earth_lambda": model.earth_lambda(),
-            "p_earth_reached": p_e,
+            "p_earth_reached": model.earth_reach_probability(),
             "log10_p_earth_unreached": model.log_p_earth_unreached() / LN10,
             "max_bubble_radius_kpc": float(model.max_bubble_radius.to_value(u.kpc)),
             "local_approximation_valid": model.local_approximation_valid,
         }
-        if cfg.condition_on_earth_unreached:
-            comps["earth_unreached"] = model.log_p_earth_unreached()
+        if cond:
+            comps[EARTH] = _component(model.log_p_earth_unreached(), 0.0, EARTH, [], [])
     else:
         out["expansion"] = None
 
     ss_active = "solar_system" in active
     p_ss = params.value("solar_system_artifact_detect_prob") if ss_active else 0.0
+    ss_tiers = [ctx.surveys["solar_system"].data_tier] if ss_active else []
 
     if "radio" in active:
         assert model is not None and ctx.targets is not None
         sv = ctx.surveys["radio"]
+        if sv.observed_detections != 0:
+            raise NotImplementedError("radio likelihood implements the zero-detection case only")
         lf = None
         if cfg.radio_mode == "distance_scaled_eirp":
             lf = radio.LogNormalEIRP(
                 params.quantity("transmitter_eirp_median_w"),
                 params.value("transmitter_eirp_sigma_dex"),
             )
+        rad = radiometer(sv)
         p_det = radio.detection_probabilities(
-            cfg.radio_mode,
-            params.value("radio_detect_prob"),
-            ctx.targets.distance,
-            _radiometer(sv),
-            lf,
+            cfg.radio_mode, params.value("radio_detect_prob"), ctx.targets.distance, rad, lf
         )
-        cond = cfg.condition_on_earth_unreached
         q = model.reach_probabilities(ctx.targets.xyz, cond)
         q_unc = q if not cond else model.reach_probabilities(ctx.targets.xyz, False)
         joint_ss = ss_active and not cond
-        rng = np.random.default_rng(np.random.SeedSequence(cfg.seed))
         mc = model.zero_detection_probability(
             ctx.targets.xyz,
             p_det,
-            rng=rng,
+            rng=np.random.default_rng(np.random.SeedSequence(cfg.seed)),
             condition_on_earth_unreached=cond,
             n_mc=cfg.n_mc,
             p_earth=p_ss if joint_ss else 0.0,
         )
         bounds = radio.zero_detection_bounds(p_det, q)
         eirp_min = radio.min_detectable_eirp(
-            ctx.targets.distance, radio.min_detectable_flux(_radiometer(sv))
+            ctx.targets.distance, radio.min_detectable_flux(rad)
         ).to_value(u.W)
         i_max = int(np.argmax(eirp_min))
+        radio_tiers = [sv.data_tier, *ctx.catalog_column_tiers]
+        if sv.radio_sensitivity:
+            radio_tiers.append(sv.radio_sensitivity.data_tier)
+        if lf is not None:
+            radio_tiers.append("illustrative_calibration")  # transmitter luminosity function
         out["radio"] = {
             "survey_id": sv.id,
             "radio_mode": cfg.radio_mode,
             "n_targets": len(ctx.targets),
             "observed_detections": sv.observed_detections,
-            "f_min_w_m2": float(radio.min_detectable_flux(_radiometer(sv)).to_value(u.W / u.m**2)),
+            "f_min_w_m2": float(radio.min_detectable_flux(rad).to_value(u.W / u.m**2)),
             "mean_p_detect_given_reached": float(p_det.mean()) if p_det.size else 0.0,
             "expected_reached_unconditional": float(q_unc.sum()),
             "expected_reached": float(q.sum()),
@@ -294,78 +387,150 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
                 "p_detect_given_reached": float(p_det[i_max]),
             },
         }
-        if sv.observed_detections != 0:
-            raise NotImplementedError("M1 radio likelihood implements the zero-detection case only")
+        comps["radio"] = _component(
+            math.log(mc.p_zero_targets_only), 0.0, "radio", ["radio"], radio_tiers
+        )
         if joint_ss:
-            comps["radio+solar_system"] = math.log(mc.p_zero)
-        else:
-            comps["radio"] = math.log(mc.p_zero_targets_only)
+            comps[RADIO_SS] = _component(
+                math.log(mc.p_zero),
+                0.0,
+                RADIO_SS,
+                ["radio", "solar_system"],
+                radio_tiers + ss_tiers,
+            )
 
     if ss_active:
         assert model is not None
         factor = solar_system.null_likelihood(
-            model.earth_reach_probability(),
-            p_ss,
-            conditioned_on_earth_unreached=cfg.condition_on_earth_unreached,
+            model.earth_reach_probability(), p_ss, conditioned_on_earth_unreached=cond
         )
         out["solar_system"] = {
             "survey_id": ctx.surveys["solar_system"].id,
             "p_artifact_detect": p_ss,
             "marginal_null_likelihood": factor,
-            "subsumed_by_earth_unreached_conditioning": cfg.condition_on_earth_unreached,
-            "evaluated_jointly_with_radio": "radio" in active
-            and not cfg.condition_on_earth_unreached,
+            "subsumed_by_earth_unreached_conditioning": cond,
+            "evaluated_jointly_with_radio": "radio" in active and not cond,
         }
-        if "radio" not in active or cfg.condition_on_earth_unreached:
-            comps["solar_system"] = math.log(factor) if factor > 0 else -math.inf
+        comps["solar_system"] = _component(
+            math.log(factor) if factor > 0 else -math.inf,
+            0.0,
+            "solar_system",
+            ["solar_system"],
+            ss_tiers,
+        )
 
     if "infrared" in active:
         sv = ctx.surveys["infrared"]
-        grid = ir_signature_grid(params)
-        cals = _ir_calibrations(sv)
-        log_lr = infrared.log_lr_vs_silent_calibration_mixture(
-            sv.observed_detections, sv.n_targets, grid, cals
-        )
+        grid, host_info = ir_signature_grid(params, model, ctx)
+        cals = ir_calibrations(sv)
+        k, n = sv.observed_detections, sv.n_targets
+        raw = infrared.log_marginal_likelihood_calibration_mixture(k, n, grid, cals)
+        null = infrared.log_marginal_likelihood_calibration_mixture(k, n, np.array([0.0]), cals)
+        assert sv.infrared is not None
         out["infrared"] = {
             "survey_id": sv.id,
-            "n_targets": sv.n_targets,
-            "observed_candidates": sv.observed_detections,
+            "n_targets": n,
+            "observed_candidates": k,
             "signature_fraction_min": float(grid.min()),
             "signature_fraction_max": float(grid.max()),
+            **host_info,
             "calibration_marginalisation": "equal-weight mixture over all declared calibrations",
-            "calibration_data_tier": sv.infrared.calibration_data_tier if sv.infrared else None,
-            "log10_lr_vs_silent": log_lr / LN10,
+            "calibration_data_tier": sv.infrared.calibration_data_tier,
         }
-        comps["infrared"] = log_lr
+        comps["infrared"] = _component(
+            raw,
+            null,
+            "infrared",
+            ["infrared"],
+            [sv.data_tier, sv.infrared.counts_data_tier, sv.infrared.calibration_data_tier],
+        )
 
-    total = sum(comps.values())
-    out["joint_log10_likelihood"] = total / LN10
-    out["log10_likelihood_components"] = {k: v / LN10 for k, v in comps.items()}
+    out["components"] = comps
+    terms = select_terms(comps, set(active), include_earth=EARTH in comps)
+    out["own_joint"] = _joint(comps, terms, active)
     return out
+
+
+def select_terms(comps: dict, channels: set[str], include_earth: bool) -> list[str]:
+    """Non-overlapping components covering ``channels`` exactly once each."""
+    terms = [EARTH] if include_earth and EARTH in comps else []
+    if {"radio", "solar_system"} <= channels and RADIO_SS in comps:
+        terms.append(RADIO_SS)
+    else:
+        terms += [c for c in ("radio", "solar_system") if c in channels and c in comps]
+    if "infrared" in channels and "infrared" in comps:
+        terms.append("infrared")
+    return terms
+
+
+def _joint(comps: dict, terms: list[str], channels: Sequence[str]) -> dict:
+    return {
+        "channels": sorted(channels),
+        "includes_earth_unreached": EARTH in terms,
+        "terms": terms,
+        "log10_p_data_given_h": float(sum(comps[t]["log10_p_data_given_h"] for t in terms)),
+        "log10_lr_vs_null": float(sum(comps[t]["log10_lr_vs_null"] for t in terms)),
+    }
 
 
 # ----------------------------------------------------------------- comparisons
 def compare_pair(a: dict, b: dict) -> dict:
-    ca, cb = a["log10_likelihood_components"], b["log10_likelihood_components"]
-    shared = [k for k in ca if k in cb]
-    per = {k: ca[k] - cb[k] for k in shared}
+    """log10 Bayes factor of a over b, strictly over their shared active channels."""
+    shared = sorted(set(a["channels_evaluated"]) & set(b["channels_evaluated"]))
+    earth = EARTH in a["components"] and EARTH in b["components"]
+    ta = select_terms(a["components"], set(shared), earth)
+    tb = select_terms(b["components"], set(shared), earth)
+    if ta != tb:
+        raise SchemaValidationError(f"Incompatible component decomposition: {ta} vs {tb}")
+    per = {
+        t: a["components"][t]["log10_p_data_given_h"] - b["components"][t]["log10_p_data_given_h"]
+        for t in ta
+    }
+    tiers = sorted({x for t in ta for h in (a, b) for x in h["components"][t]["data_tiers"]})
+    illustrative = [
+        t
+        for t in ta
+        if any(
+            "illustrative" in x or "synthetic" in x
+            for h in (a, b)
+            for x in h["components"][t]["data_tiers"]
+        )
+    ]
     return {
         "numerator": a["hypothesis_id"],
         "denominator": b["hypothesis_id"],
-        "shared_components": shared,
-        "log10_bayes_factor_by_component": per,
-        "log10_bayes_factor_joint": float(sum(per.values())),
-        "unshared_components": sorted(set(ca) ^ set(cb)),
+        "channels_in_bf": shared,
+        "earth_unreached_in_bf": earth,
+        "terms": ta,
+        "log10_bf_by_term": per,
+        "log10_bf": float(sum(per.values())) if ta else None,
+        "illustrative_terms": illustrative,
+        "log10_bf_excluding_illustrative": float(
+            sum(v for t, v in per.items() if t not in illustrative)
+        )
+        if ta
+        else None,
+        "data_tiers_in_bf": tiers,
+        "excluded_channels": {
+            "numerator_only": sorted(set(a["channels_evaluated"]) - set(shared)),
+            "denominator_only": sorted(set(b["channels_evaluated"]) - set(shared)),
+        },
     }
 
 
 def ir_reversal_sweep(ctx: RunContext, quiet_id: str, loud_id: str) -> dict:
     sv = ctx.surveys["infrared"]
-    graph, n = ctx.graph, ctx.config.range_grid_points
-    ga = ir_signature_grid(resolve_parameters(graph, graph.hypotheses[quiet_id], n))
-    gb = ir_signature_grid(resolve_parameters(graph, graph.hypotheses[loud_id], n))
+    graph, cfg = ctx.graph, ctx.config
+    grids = []
+    for hid in (quiet_id, loud_id):
+        params = resolve_parameters(
+            graph, graph.hypotheses[hid], cfg.range_grid_points, cfg.parameter_overrides
+        )
+        has_exp = all(params.has(p) for p in EXPANSION_PARAMS)
+        model = expansion_model(params, cfg) if has_exp else None
+        grids.append(ir_signature_grid(params, model, ctx)[0])
     sw = infrared.sweep_calibrations(
-        sv.observed_detections, sv.n_targets, ga, gb, _ir_calibrations(sv)
+        sv.observed_detections, sv.n_targets, grids[0], grids[1], ir_calibrations(sv)
     )
     return {
         "numerator": quiet_id,
@@ -383,7 +548,7 @@ def ir_reversal_sweep(ctx: RunContext, quiet_id: str, loud_id: str) -> dict:
 
 
 # --------------------------------------------------------------------- receipts
-def _git_state(root: Path) -> tuple[str, str]:
+def git_state(root: Path) -> tuple[str, str]:
     try:
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
@@ -397,25 +562,22 @@ def _git_state(root: Path) -> tuple[str, str]:
 
 
 def _data_tiers(ctx: RunContext) -> list[str]:
-    tiers = set()
+    tiers = set(ctx.catalog_column_tiers)
     for sv in ctx.surveys.values():
         tiers.add(sv.data_tier)
         if sv.radio_sensitivity:
             tiers.add(sv.radio_sensitivity.data_tier)
         if sv.infrared:
             tiers |= {sv.infrared.counts_data_tier, sv.infrared.calibration_data_tier}
-        if sv.catalog_provenance_path:
-            prov = json.loads((ctx.graph.root / sv.catalog_provenance_path).read_text("utf-8"))
-            tiers |= {t for t in prov.get("column_data_tiers", {}) if t != "derived"}
     if "radio" in ctx.surveys and ctx.config.radio_mode == "distance_scaled_eirp":
         tiers.add("illustrative_calibration")  # transmitter luminosity function
     return sorted(tiers)
 
 
-def run_comparison(
+def score_hypotheses(
     graph: FactorGraph, cfg: RunConfig, hypothesis_ids: Sequence[str] | None = None
-) -> dict:
-    """Score all requested hypotheses and assemble a RunReceipt (dict, JSON-ready)."""
+) -> tuple[RunContext, dict]:
+    """Score requested hypotheses; returns the context and the ``results`` block."""
     ctx = build_context(graph, cfg)
     ids = list(hypothesis_ids) if hypothesis_ids is not None else sorted(graph.hypotheses)
     scored: dict[str, dict] = {}
@@ -434,20 +596,38 @@ def run_comparison(
             )
             continue
         scored[hid] = evaluate_hypothesis(hyp, ctx)
-
-    results: dict = {"hypotheses": scored, "tier3_quarantine": quarantine}
+    results: dict = {
+        "likelihood_conventions": {
+            "log10_p_data_given_h": "raw log10 probability of the observed data under H",
+            "log10_lr_vs_null": "log10 [P(data|H) / P(data|component null)]; nulls in NULL_MODELS",
+            "null_models": NULL_MODELS,
+            "bayes_factors": "over the intersection of shared active channels only",
+        },
+        "hypotheses": scored,
+        "tier3_quarantine": quarantine,
+        "pairwise_bayes_factors": [
+            compare_pair(scored[a], scored[b]) for a, b in itertools.combinations(sorted(scored), 2)
+        ],
+    }
     if cfg.headline_pair:
         a, b = cfg.headline_pair
         results["headline"] = compare_pair(scored[a], scored[b])
     if cfg.ir_pair and "infrared" in ctx.surveys:
         results["ir_calibration_sweep"] = ir_reversal_sweep(ctx, *cfg.ir_pair)
+    return ctx, results
 
-    git_sha, git_head = _git_state(graph.root)
+
+def run_comparison(
+    graph: FactorGraph, cfg: RunConfig, hypothesis_ids: Sequence[str] | None = None
+) -> dict:
+    """Score hypotheses and assemble a RunReceipt (dict, JSON-ready)."""
+    ctx, results = score_hypotheses(graph, cfg, hypothesis_ids)
+    git_sha, git_head = git_state(graph.root)
     cfg_dict = asdict(cfg)
     created = datetime.now(UTC)
     digest = hashlib.sha256(json.dumps(cfg_dict, sort_keys=True).encode()).hexdigest()[:10]
     return {
-        "receipt_schema_version": 1,
+        "receipt_schema_version": 2,
         "run_id": f"{created.strftime('%Y%m%dT%H%M%S%fZ')}-{digest}",
         "created_at_utc": created.isoformat(),
         "git_sha": git_sha,
@@ -472,11 +652,13 @@ def run_comparison(
     }
 
 
+def canonical_sha256(obj: object) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, allow_nan=True).encode()).hexdigest()
+
+
 def results_digest(receipt: dict) -> str:
     """SHA-256 of the canonical numeric results block (deterministic-replay fingerprint)."""
-    return hashlib.sha256(
-        json.dumps(receipt["results"], sort_keys=True, allow_nan=True).encode()
-    ).hexdigest()
+    return canonical_sha256(receipt["results"])
 
 
 def write_receipt(receipt: dict, out_dir: Path) -> Path:

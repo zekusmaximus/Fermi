@@ -1,7 +1,17 @@
 import { useState } from "react";
-import { get, type FalseAlarm, type IrDrill } from "../api";
+import { get, type FalseAlarm, type Gate2, type IrDrill } from "../api";
 import { ErrorBox, Hash, Loading, Panel, TierBadge, useApi } from "../components/ui";
 import { cellColor, fmtNum, fmtPct } from "../lib/format";
+import {
+  SCREEN_LABEL,
+  SCREEN_ORDER,
+  SOURCE_LABEL,
+  SOURCE_TIER,
+  defaultSource,
+  kOverN,
+  matchedControl,
+  type HeatSource,
+} from "../lib/gate2";
 
 const LEGACY = "legacy_baseline";
 const MEASURED = "measured_reproduced_archive";
@@ -22,6 +32,7 @@ export function InfraredDrilldown({ seed }: { seed: number }) {
       </p>
       <CalibrationCard d={data} />
       <HeatmapPanel d={data} />
+      <MatchedControlCard d={data} />
       <AnchorCard d={data} />
       <FlipPanel d={data} />
     </div>
@@ -140,8 +151,132 @@ type FloorView = "measured" | "legacy" | "delta";
 
 function HeatmapPanel({ d }: { d: IrDrill }) {
   const r = d.results;
+  const gate = r.real_fits_gate2;
+  const [source, setSource] = useState<HeatSource>(defaultSource(gate));
   const [screen, setScreen] = useState<Screen>("centroid");
   const [floor, setFloor] = useState<FloorView>(r.floor_shift ? "measured" : "legacy");
+  const real = source === "real" && gate !== null;
+  const src: HeatSource = real ? "real" : "synthetic";
+  return (
+    <Panel
+      title="Blend-recovery heatmap — P(blend flagged)"
+      aside={<TierBadge tier={SOURCE_TIER[src]} label={SOURCE_LABEL[src]} />}
+      className={real ? "panel-archive" : "panel-illustrative"}
+    >
+      <div className="controls controls-inline">
+        <div className="seg" role="group" aria-label="grid source">
+          <button className={real ? "on" : ""} disabled={!gate} onClick={() => setSource("real")}>
+            {SOURCE_LABEL.real}
+          </button>
+          <button className={!real ? "on" : ""} onClick={() => setSource("synthetic")}>
+            {SOURCE_LABEL.synthetic}
+          </button>
+        </div>
+        <div className="seg">
+          <button className={screen === "centroid" ? "on" : ""} onClick={() => setScreen("centroid")}>
+            Centroid
+          </button>
+          <button className={screen === "image" ? "on" : ""} onClick={() => setScreen("image")}>
+            Image-level (Δχ²)
+          </button>
+        </div>
+        {!real ? (
+          <div className="seg">
+            <button disabled={!r.floor_shift} className={floor === "measured" ? "on" : ""} onClick={() => setFloor("measured")}>
+              {fmtNum(r.by_floor[MEASURED]?.registration_floor.sigma_sys_arcsec, 3)}″ (Measured)
+            </button>
+            <button className={floor === "legacy" ? "on" : ""} onClick={() => setFloor("legacy")}>
+              {r.by_floor[LEGACY]!.registration_floor.sigma_sys_arcsec.toFixed(3)}″ (Legacy Suazo)
+            </button>
+            <button disabled={!r.floor_shift} className={floor === "delta" ? "on" : ""} onClick={() => setFloor("delta")}>
+              Delta (+gain)
+            </button>
+          </div>
+        ) : null}
+      </div>
+      {real && gate ? <RealGrid g={gate} screen={screen} /> : <SyntheticGrid d={d} screen={screen} floor={floor} />}
+    </Panel>
+  );
+}
+
+function HeatTable({
+  seps,
+  fracs,
+  values,
+  mode,
+  title,
+}: {
+  seps: number[];
+  fracs: number[];
+  values: number[][];
+  mode: "prob" | "delta";
+  title: (i: number, j: number) => string;
+}) {
+  return (
+    <div className="scroll-x">
+      <table className="heat">
+        <thead>
+          <tr>
+            <th>θ \ f_bg</th>
+            {fracs.map((f) => (
+              <th key={f} className="num">
+                {f.toFixed(1)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {seps.map((th, i) => (
+            <tr key={th}>
+              <th className="num">{th.toFixed(1)}″</th>
+              {(values[i] ?? []).map((v, j) => (
+                <td key={j} className="num" style={{ background: cellColor(v, mode) }} title={title(i, j)}>
+                  {mode === "delta" ? (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(3) : v.toFixed(3)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RealGrid({ g, screen }: { g: Gate2; screen: Screen }) {
+  const s = g.screens[screen];
+  const fz = g.frozen_screens;
+  const cal = fz.calibration_false_alarm_in_sample[screen];
+  return (
+    <>
+      <HeatTable
+        seps={g.separations_arcsec}
+        fracs={g.flux_fractions}
+        values={s.arm_a_blend_recovery}
+        mode="prob"
+        title={(i, j) => {
+          const cp = s.arm_a_clopper_pearson_95[i]?.[j];
+          const cpText = cp ? ` (95% CP ${fmtPct(cp[0])}–${fmtPct(cp[1])})` : "";
+          return `θ=${g.separations_arcsec[i]}″ f_bg=${g.flux_fractions[j]}: ${kOverN(s.arm_a_k[i]?.[j], s.n_stars)} flagged${cpText}`;
+        }}
+      />
+      <p className="muted small num">
+        Arm A off-center injections into {s.n_stars} withheld real cutouts (one seeded azimuth per star and cell; exact 95%
+        intervals on hover) · empirical Atlas PSF FWHM {g.empirical_psf.fwhm_gaussian_arcsec.toFixed(2)}″ (nominal{" "}
+        {g.empirical_psf.nominal_fwhm_arcsec}″) · frozen on {g.n_calibration} calibration stars:{" "}
+        {screen === "centroid"
+          ? `offset > ${fz.centroid_multiplier.toFixed(2)} × hypot(σ_stat, ${g.locked_sigma_sys_arcsec.toFixed(4)}″)`
+          : `Δχ² > ${fz.delta_chi2_threshold.toFixed(2)} (scale ${fz.delta_chi2_scale.toFixed(2)} × χ²₃ tail)`}{" "}
+        · calibration in-sample false alarm {cal ? `${cal.k}/${cal.n}` : "—"} · withheld null false alarm{" "}
+        {s.null_false_alarm.k}/{s.null_false_alarm.n} (95% CP ≤ {fmtPct(s.null_false_alarm.clopper_pearson_95[1])}) · blend
+        survival within 3.25″ <b>{s.blend_survival_within_3p25_arcsec.toFixed(3)}</b> · file <Hash sha={g.file_sha256} /> · code{" "}
+        <Hash sha={g.code_git_sha} />
+      </p>
+    </>
+  );
+}
+
+function SyntheticGrid({ d, screen, floor }: { d: IrDrill; screen: Screen; floor: FloorView }) {
+  const r = d.results;
   const base = r.by_floor[LEGACY]!;
   const grid = (floor === "measured" ? r.by_floor[MEASURED] ?? base : base).grid;
   const key = screen === "centroid" ? "centroid_recovery" : "image_recovery";
@@ -154,58 +289,14 @@ function HeatmapPanel({ d }: { d: IrDrill }) {
   const mode = floor === "delta" ? "delta" : "prob";
   const fa = screen === "centroid" ? grid.centroid_false_alarm_empirical : grid.image_false_alarm_empirical;
   return (
-    <Panel
-      title="Blend-recovery heatmap — P(blend flagged)"
-      aside={<TierBadge tier="illustrative_calibration" label="illustrative_calibration · synthetic injection-recovery" />}
-      className="panel-illustrative"
-    >
-      <div className="controls controls-inline">
-        <div className="seg">
-          <button className={screen === "centroid" ? "on" : ""} onClick={() => setScreen("centroid")}>
-            Centroid
-          </button>
-          <button className={screen === "image" ? "on" : ""} onClick={() => setScreen("image")}>
-            Image-level (Δχ²)
-          </button>
-        </div>
-        <div className="seg">
-          <button disabled={!r.floor_shift} className={floor === "measured" ? "on" : ""} onClick={() => setFloor("measured")}>
-            {fmtNum(r.by_floor[MEASURED]?.registration_floor.sigma_sys_arcsec, 3)}″ (Measured)
-          </button>
-          <button className={floor === "legacy" ? "on" : ""} onClick={() => setFloor("legacy")}>
-            {base.registration_floor.sigma_sys_arcsec.toFixed(3)}″ (Legacy Suazo)
-          </button>
-          <button disabled={!r.floor_shift} className={floor === "delta" ? "on" : ""} onClick={() => setFloor("delta")}>
-            Delta (+gain)
-          </button>
-        </div>
-      </div>
-      <div className="scroll-x">
-        <table className="heat">
-          <thead>
-            <tr>
-              <th>θ \ f_bg</th>
-              {grid.flux_fractions.map((f) => (
-                <th key={f} className="num">
-                  {f.toFixed(1)}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {grid.separations_arcsec.map((th, i) => (
-              <tr key={th}>
-                <th className="num">{th.toFixed(1)}″</th>
-                {(values[i] ?? []).map((v, j) => (
-                  <td key={j} className="num" style={{ background: cellColor(v, mode) }} title={`θ=${th}″ f_bg=${grid.flux_fractions[j]}`}>
-                    {mode === "delta" ? (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(3) : v.toFixed(3)}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+    <>
+      <HeatTable
+        seps={grid.separations_arcsec}
+        fracs={grid.flux_fractions}
+        values={values}
+        mode={mode}
+        title={(i, j) => `θ=${grid.separations_arcsec[i]}″ f_bg=${grid.flux_fractions[j]}`}
+      />
       <p className="muted small num">
         {grid.n_trials_per_cell} injections/cell (MC error ≈ ±{(Math.sqrt(0.25 / grid.n_trials_per_cell)).toFixed(2)} at p = 0.5) · W3 SNR{" "}
         {grid.spec.snr} · simulated blend-free false-alarm rate {fmtNum(fa, 3)} (nominal {grid.spec.false_alarm_nominal}) · both floors use
@@ -214,6 +305,128 @@ function HeatmapPanel({ d }: { d: IrDrill }) {
           ? ` · mean shift ${screen}: ${fmtNum(screen === "centroid" ? r.floor_shift.centroid_recovery_mean_delta : r.floor_shift.image_recovery_mean_delta, 3)}`
           : ""}
       </p>
+    </>
+  );
+}
+
+function MatchedControlCard({ d }: { d: IrDrill }) {
+  const g = d.results.real_fits_gate2;
+  const side = d.results.blend_survival_side_by_side;
+  if (!g) {
+    return (
+      <Panel title="Matched Centered-Excess Adversarial Control">
+        <p className="muted">No real-FITS Gate #2 result is pinned in the IR survey.</p>
+      </Panel>
+    );
+  }
+  return (
+    <Panel
+      title="Matched Centered-Excess Adversarial Control — Arm A blends vs Arm B centered excess"
+      aside={<TierBadge tier={g.data_tier} />}
+      className="panel-archive"
+    >
+      <p className="small">
+        The same excess flux is injected into the same {g.n_withheld} withheld real cutouts either off-center (Arm A, a background
+        blend) or at θ = 0″ on the star itself (Arm B, what a genuine circumstellar excess looks like). A screen earns its blend
+        recall only if it does not also reject the matched centered excess. Arm A here is area-weighted over θ ≤ 3.25″.
+      </p>
+      <div className="scroll-x">
+        <table className="tbl tbl-compact">
+          <thead>
+            <tr>
+              <th>screen</th>
+              <th>row</th>
+              {g.flux_fractions.map((f) => (
+                <th key={f} className="r num">
+                  f_bg {f.toFixed(1)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {SCREEN_ORDER.flatMap((name) => {
+              const cells = matchedControl(g, name);
+              return [
+                <tr key={`${name}-a`}>
+                  <td rowSpan={3}>
+                    {SCREEN_LABEL[name]}
+                    {name === "naive_flux_excess" ? <span className="muted small"> — not a proposed screen</span> : null}
+                  </td>
+                  <td className="small">Arm A blend recovery</td>
+                  {cells.map((c) => (
+                    <td key={c.fBg} className="r num">
+                      {c.armA.toFixed(3)}
+                    </td>
+                  ))}
+                </tr>,
+                <tr key={`${name}-b`}>
+                  <td className="small">Arm B centered-excess false rejection</td>
+                  {cells.map((c) => (
+                    <td key={c.fBg} className="r num" title={`95% CP ${fmtPct(c.armBcp[0])}–${fmtPct(c.armBcp[1])}`}>
+                      {c.armB.toFixed(3)}{" "}
+                      <span className="muted small">
+                        ({c.armBk}/{c.n})
+                      </span>
+                    </td>
+                  ))}
+                </tr>,
+                <tr key={`${name}-n`}>
+                  <td className="small">net (A − B)</td>
+                  {cells.map((c) => (
+                    <td key={c.fBg} className={`r num ${c.net > 0 ? "ok" : "bad"}`}>
+                      {(c.net >= 0 ? "+" : "−") + Math.abs(c.net).toFixed(3)}
+                    </td>
+                  ))}
+                </tr>,
+              ];
+            })}
+          </tbody>
+        </table>
+      </div>
+      {side ? (
+        <>
+          <p className="eyebrow">Blend survival within 3.25″ — real FITS vs synthetic Gaussian</p>
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>screen</th>
+                <th className="r">
+                  real FITS withheld <TierBadge tier={side.real_fits.data_tier} />
+                </th>
+                <th className="r">
+                  synthetic Gaussian <TierBadge tier={side.synthetic.data_tier} />
+                </th>
+                <th className="r">real Arm B rejected (pooled)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {side.rows.map((row) => (
+                <tr key={row.screen}>
+                  <td>{row.screen}</td>
+                  <td className="r num">{row.real_fits_survival.toFixed(3)}</td>
+                  <td className="r num">{row.synthetic_survival.toFixed(3)}</td>
+                  <td className="r num">
+                    {row.real_fits_centered_excess_false_rejection.k}/{row.real_fits_centered_excess_false_rejection.n} ={" "}
+                    {row.real_fits_centered_excess_false_rejection.rate.toFixed(3)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="muted small num">
+            PSF FWHM {side.real_fits.psf_fwhm_arcsec.toFixed(2)}″ (empirical Atlas) vs {side.synthetic.psf_fwhm_arcsec.toFixed(2)}″
+            (synthetic, SNR {side.synthetic.snr}, σ_sys {side.synthetic.sigma_sys_arcsec.toFixed(3)}″). {side.note}
+          </p>
+        </>
+      ) : null}
+      <details>
+        <summary>Caveats ({g.caveats.length})</summary>
+        <ul className="small">
+          {g.caveats.map((c) => (
+            <li key={c}>{c}</li>
+          ))}
+        </ul>
+      </details>
     </Panel>
   );
 }

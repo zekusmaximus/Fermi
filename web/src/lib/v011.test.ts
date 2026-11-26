@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Adversary, Queue, Tier1Job } from "../api";
 import { READ_ONLY_NOTICE, bfReading, fmtMultiplier, longRunLabel, tier0Gate } from "./format";
-import { adversaryFacts, topArchivalJob, wiseControlCount } from "./overview";
+import { adversaryFacts, topArchivalJob } from "./overview";
 
 describe("long-running Tier-0 job label (>= 120 s)", () => {
   it("labels jobs at or above the threshold with their estimated minutes", () => {
@@ -97,7 +97,7 @@ describe("Overview extractors read live payloads, never constants", () => {
     const f = adversaryFacts(null);
     expect([f.hipMultiplier, f.beamPairs, f.tValidKyr]).toEqual([null, null, null]);
   });
-  it("picks the top Tier-1 job by utility and counts WISE controls from linked evidence", () => {
+  it("picks the top Tier-1 job by utility", () => {
     const j = (id: string, u: number, bits: number, ev: unknown = null) =>
       ({ job_id: id, utility_score: u, expected_eig_bits: bits, linked_evidence: ev }) as unknown as Tier1Job;
     const q = {
@@ -113,7 +113,6 @@ describe("Overview extractors read live payloads, never constants", () => {
     } as unknown as Queue;
     expect(topArchivalJob(q)?.job_id).toBe("wise_independent_control_fields");
     expect(topArchivalJob(q)?.expected_eig_bits.toFixed(3)).toBe("1.058");
-    expect(wiseControlCount(q)).toBe(154);
     expect(topArchivalJob(null)).toBeNull();
   });
 });

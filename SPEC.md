@@ -306,6 +306,14 @@ Every queued or executed job records:
    unWISE coadds (native, unblurred PSF) and report both floors side by side; never
    overwrite the locked Atlas artifact.
 
+### v0.1.2: Public-Launch Gate #2 (brief: `docs/V0_1_2_GATE_2.md`)
+- Frozen-method real AllWISE W3 FITS blend screens on the 154 locked controls: empirical
+  PSF and thresholds frozen on the 77 calibration stars, withheld two-arm injection
+  (off-center blends vs matched centered excess), promoted to
+  `data/calibrations/wise_fits_gate2_withheld.json` (`reproduced_archive`, SHA-256 pinned)
+  and shown beside the synthetic Gaussian grid. Result: centroid screen transfers; the
+  image-level Delta chi^2 screen fails out of sample (reported as a negative result).
+
 ### Public-Launch Scientific Exit Gate (Mandatory Before Promotion)
 1. One previously unrun experiment executed on real archival images/catalogs (with query receipt).
 2. One frozen-method adversarial test on withheld sky fields containing matched centered stellar excesses and off-center background blends.

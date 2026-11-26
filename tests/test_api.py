@@ -80,6 +80,10 @@ def test_health_reports_provenance(client):
     assert h["catalog_sha256"].startswith("c299d61d")
     assert h["wise_calibration_sha256"].startswith("2da2a234")
     assert h["receipt_schema_version"] == 4 and h["git_sha"]
+    # v0.1.2: live control-sample provenance, read from the verified calibration files.
+    assert (h["n_controls"], h["n_calibration"], h["n_withheld"]) == (154, 77, 77)
+    assert h["calibration_data_tier"] == "reproduced_archive"
+    assert h["fits_gate2_data_tier"] == "reproduced_archive" and len(h["fits_gate2_sha256"]) == 64
 
 
 def test_registry_groups_tiers_with_monoculture_audits(client):
@@ -132,6 +136,13 @@ def test_infrared_drilldown_payload(client):
     assert res["control_experiment"]["n_controls"] == 154
     assert "smoothing" in res["atlas_smoothing_caveat"]
     assert {a["candidate"] for a in res["anchor_benchmarks"]} == {"D", "E"}
+    gate = res["real_fits_gate2"]
+    assert gate["data_tier"] == "reproduced_archive" and gate["n_withheld"] == 77
+    assert set(gate["screens"]) == {"centroid", "image", "naive_flux_excess"}
+    side = res["blend_survival_side_by_side"]
+    assert side["real_fits"]["data_tier"] == "reproduced_archive"
+    assert side["synthetic"]["data_tier"] == "illustrative_calibration"
+    assert res["data_tier"] == "illustrative_calibration"  # synthetic grid keeps its tier
     assert r["rng_seed"] == 42
     assert client.get("/api/infrared/drilldown?seed=-3").status_code == 422
 

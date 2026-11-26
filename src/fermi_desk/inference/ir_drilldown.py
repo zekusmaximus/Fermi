@@ -5,6 +5,11 @@ Macro/micro decoupling (AGENTS.md law 6): the image-level kernel
 this module only composes them with the survey counts and hypothesis signature
 grids through ``models/infrared.py``.
 
+v0.1.2 (Launch Gate #2): when the survey pins the promoted real-FITS withheld result
+(``reproduced_archive``), it is reported next to the synthetic Gaussian grid
+(``illustrative_calibration``) together with the matched centered-excess control
+(Arm B). The real-FITS block is read, never recomputed from images, here.
+
 Milestone 2.5: the drill-down is evaluated under every available W3 centroid
 registration floor side by side - the legacy 0.50 arcsec baseline and, when the
 survey pins one, the measured ``reproduced_archive`` floor from the live control
@@ -33,7 +38,7 @@ from fermi_desk.inference.engine import (
     resolve_parameters,
 )
 from fermi_desk.models import hephaistos, infrared
-from fermi_desk.registry import FactorGraph, load_sigma_sys_calibration
+from fermi_desk.registry import FactorGraph, load_fits_gate2, load_sigma_sys_calibration
 
 SEPARATIONS_ARCSEC = (0.5, 1.0, 2.0, 3.0, 4.0, 6.0)
 FLUX_FRACTIONS = (0.1, 0.3, 0.5, 0.7, 0.9)
@@ -195,6 +200,54 @@ def contamination_flip(by_floor: dict, scenarios: dict) -> dict:
     }
 
 
+def real_fits_gate2(graph: FactorGraph, by_floor: dict) -> tuple[dict | None, dict | None]:
+    """Promoted real-FITS Gate #2 block plus a real-vs-synthetic survival comparison."""
+    sv = next(s for s in graph.surveys.values() if s.channel == "infrared")
+    g = load_fits_gate2(sv, graph.root)
+    if g is None:
+        return None, None
+    gate = g.summary()
+    syn = by_floor.get(MEASURED, by_floor[LEGACY])
+    side = {
+        "max_separation_arcsec": 3.25,
+        "weighting": gate["survival_weighting"],
+        "real_fits": {
+            "label": "Real AllWISE W3 FITS - withheld",
+            "data_tier": gate["data_tier"],
+            "psf_fwhm_arcsec": gate["empirical_psf"]["fwhm_gaussian_arcsec"],
+            "sigma_sys_arcsec": gate["locked_sigma_sys_arcsec"],
+            "n_stars": gate["n_withheld"],
+        },
+        "synthetic": {
+            "label": "Synthetic Gaussian PSF",
+            "data_tier": "illustrative_calibration",
+            "psf_fwhm_arcsec": syn["grid"]["spec"]["psf_fwhm_arcsec"],
+            "sigma_sys_arcsec": syn["registration_floor"]["sigma_sys_arcsec"],
+            "registration_floor": syn["registration_floor"]["label"],
+            "snr": syn["grid"]["spec"]["snr"],
+        },
+        "rows": [
+            {
+                "screen": m,
+                "real_fits_survival": gate["screens"][m]["blend_survival_within_3p25_arcsec"],
+                "synthetic_survival": syn["screens_within_3p25_arcsec"][m]["survival"],
+                "real_fits_null_false_alarm": gate["screens"][m]["null_false_alarm"],
+                "synthetic_null_false_alarm": syn["screens_within_3p25_arcsec"][m]["false_alarm"],
+                "real_fits_centered_excess_false_rejection": gate["screens"][m][
+                    "arm_b_false_rejection_pooled"
+                ],
+            }
+            for m in ("centroid", "image")
+        ],
+        "note": (
+            "Different inputs on purpose: the real grid uses the empirical Atlas PSF, real "
+            "noise and each star's W3 SNR; the synthetic grid a 6.5 arcsec Gaussian at one SNR. "
+            "Neither replaces the other; the synthetic grid alone feeds the illustrative LR rows."
+        ),
+    }
+    return gate, side
+
+
 def _evaluate_floor(graph, floor, seed, n_trials, snr, scenarios, grids, k, n) -> tuple:
     spec = hephaistos.CutoutSpec(snr=snr, sigma_sys=floor.sigma_sys)
     grid = hephaistos.blend_recovery_grid(
@@ -329,7 +382,10 @@ def run_ir_drilldown(
         }
 
     meas = floor_info["measured_calibration"]
+    gate2, gate2_side = real_fits_gate2(graph, by_floor)
     results = {
+        "real_fits_gate2": gate2,
+        "blend_survival_side_by_side": gate2_side,
         "registration_floors": [f.as_dict() for f in floors],
         "small_sample_false_alarm_bounds": small_sample_bounds(meas),
         "control_experiment": control_experiment(meas),

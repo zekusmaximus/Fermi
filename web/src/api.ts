@@ -39,6 +39,13 @@ export interface Health {
   validation_failures: string[];
   catalog_sha256: string | null;
   wise_calibration_sha256: string | null;
+  /** v0.1.2: live control-sample provenance, read from the verified calibration files. */
+  n_controls: number | null;
+  n_calibration: number | null;
+  n_withheld: number | null;
+  calibration_data_tier: string | null;
+  fits_gate2_sha256: string | null;
+  fits_gate2_data_tier: string | null;
   receipt_schema_version: number;
   read_only: boolean;
 }
@@ -212,7 +219,7 @@ export interface Grid {
   image_false_alarm_empirical: number;
   n_null_trials: number;
   n_trials_per_cell: number;
-  spec: { sigma_sys_arcsec: number; snr: number; false_alarm_nominal: number };
+  spec: { sigma_sys_arcsec: number; snr: number; false_alarm_nominal: number; psf_fwhm_arcsec: number };
 }
 
 export interface FalseAlarm {
@@ -270,6 +277,92 @@ export interface AnchorBenchmark {
   >;
 }
 
+export interface Rate {
+  k: number;
+  n: number;
+  rate: number;
+  clopper_pearson_95: [number, number];
+}
+
+export type Gate2ScreenName = "centroid" | "image" | "naive_flux_excess";
+
+export interface Gate2Screen {
+  n_stars: number;
+  null_false_alarm: Rate;
+  arm_a_blend_recovery: number[][];
+  arm_a_k: number[][];
+  arm_a_clopper_pearson_95: [number, number][][];
+  arm_b_false_rejection: number[];
+  arm_b_k: number[];
+  arm_b_clopper_pearson_95: [number, number][];
+  arm_b_false_rejection_pooled: Rate;
+  blend_survival_within_3p25_arcsec: number;
+  centered_excess_retained_pooled: number;
+}
+
+/** Promoted Launch Gate #2 result (real AllWISE W3 FITS, reproduced_archive). */
+export interface Gate2 {
+  id: string;
+  path: string;
+  file_sha256: string;
+  content_sha256: string;
+  data_tier: string;
+  code_git_sha: string;
+  rng_seed: number;
+  query_window_utc: string[];
+  frozen_at_utc: string;
+  n_requested: number;
+  n_fetched_ok: number;
+  n_calibration: number;
+  n_withheld: number;
+  locked_sigma_sys_arcsec: number;
+  empirical_psf: {
+    fwhm_gaussian_arcsec: number;
+    fwhm_halfmax_arcsec: number;
+    nominal_fwhm_arcsec: number;
+    n_stars: number;
+    pixel_scale_arcsec: number;
+  };
+  frozen_screens: {
+    rule_version: string;
+    target_false_alarm: number;
+    centroid_multiplier: number;
+    centroid_threshold_arcsec_at_calibration_median_snr: number;
+    delta_chi2_scale: number;
+    delta_chi2_threshold: number;
+    calibration_false_alarm_in_sample: Record<string, Rate>;
+    snr_eff_rule: string | null;
+  };
+  separations_arcsec: number[];
+  flux_fractions: number[];
+  screens: Record<Gate2ScreenName, Gate2Screen>;
+  survival_weighting: string;
+  caveats: string[];
+}
+
+export interface SurvivalSideBySide {
+  max_separation_arcsec: number;
+  weighting: string;
+  real_fits: { label: string; data_tier: string; psf_fwhm_arcsec: number; sigma_sys_arcsec: number; n_stars: number };
+  synthetic: {
+    label: string;
+    data_tier: string;
+    psf_fwhm_arcsec: number;
+    sigma_sys_arcsec: number;
+    registration_floor: string;
+    snr: number;
+  };
+  rows: {
+    screen: string;
+    real_fits_survival: number;
+    synthetic_survival: number;
+    real_fits_null_false_alarm: Rate;
+    synthetic_null_false_alarm: number;
+    real_fits_centered_excess_false_rejection: Rate;
+  }[];
+  note: string;
+}
+
 export interface IrDrill {
   git_sha: string;
   rng_seed: number;
@@ -277,6 +370,8 @@ export interface IrDrill {
   config: { n_trials: number; snr: number };
   results: {
     data_tier: string;
+    real_fits_gate2: Gate2 | null;
+    blend_survival_side_by_side: SurvivalSideBySide | null;
     registration_floors: RegistrationFloor[];
     small_sample_false_alarm_bounds: SmallSampleBounds | null;
     control_experiment: {

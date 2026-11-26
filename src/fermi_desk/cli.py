@@ -455,6 +455,57 @@ def ir_drilldown(
             f"centroid {s['centroid']['survival']:.3f}, image {s['image']['survival']:.3f}"
         )
 
+    gate = r.get("real_fits_gate2")
+    if gate is None:
+        console.print("  [yellow]No real-FITS Gate #2 result pinned in the IR survey.[/]")
+    else:
+        psf = gate["empirical_psf"]
+        console.print(
+            escape(
+                f"  Gate #2 real AllWISE W3 FITS (reproduced_archive): {gate['path']} "
+                f"sha256={gate['file_sha256'][:16]}... git={gate['code_git_sha'][:12]} "
+                f"seed={gate['rng_seed']} | {gate['n_fetched_ok']}/{gate['n_requested']} cutouts, "
+                f"{gate['n_calibration']} calibration / {gate['n_withheld']} withheld | empirical "
+                f"PSF FWHM {psf['fwhm_gaussian_arcsec']:.3f} arcsec (nominal "
+                f"{psf['nominal_fwhm_arcsec']}) | frozen Delta chi^2 threshold "
+                f"{gate['frozen_screens']['delta_chi2_threshold']:.2f}"
+            )
+        )
+        for m, sc in gate["screens"].items():
+            t = _table(
+                f"Real-FITS withheld {m} screen: Arm A P(blend flagged) [rows: separation, cols: "
+                f"f_bg] | last row: Arm B matched centered-excess false rejection",
+                ("theta", *[f"f_bg={x:.1f}" for x in gate["flux_fractions"]]),
+            )
+            for th, vals in zip(
+                gate["separations_arcsec"], sc["arm_a_blend_recovery"], strict=True
+            ):
+                t.add_row(f"{th:.1f} arcsec", *[f"{v:.3f}" for v in vals])
+            t.add_row("Arm B (theta=0)", *[f"{v:.3f}" for v in sc["arm_b_false_rejection"]])
+            console.print(t)
+            nf, pb = sc["null_false_alarm"], sc["arm_b_false_rejection_pooled"]
+            console.print(
+                f"  [{m}] withheld null false alarm {nf['k']}/{nf['n']} (95% CP "
+                f"{nf['clopper_pearson_95'][1]:.3f} upper); blend survival within 3.25 arcsec "
+                f"{sc['blend_survival_within_3p25_arcsec']:.3f}; centered excess rejected "
+                f"{pb['k']}/{pb['n']} pooled = {pb['rate']:.3f}"
+            )
+        side = r["blend_survival_side_by_side"]
+        t = _table(
+            "Blend survival within 3.25 arcsec: real FITS (reproduced_archive) vs synthetic "
+            f"Gaussian ({side['synthetic']['registration_floor']}, illustrative_calibration)",
+            ("screen", "real FITS withheld", "synthetic Gaussian", "real Arm B rejected"),
+        )
+        for row in side["rows"]:
+            b = row["real_fits_centered_excess_false_rejection"]
+            t.add_row(
+                row["screen"],
+                f"{row['real_fits_survival']:.3f}",
+                f"{row['synthetic_survival']:.3f}",
+                f"{b['k']}/{b['n']} = {b['rate']:.3f}",
+            )
+        console.print(t)
+
     t = _table(
         "Published anchors: Hephaistos candidates D and E (W3 centroid screen) under each floor",
         (

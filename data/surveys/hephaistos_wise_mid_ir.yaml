@@ -25,6 +25,12 @@ infrared:
   # completeness / false-positive bracket below, which stays illustrative.
   sigma_sys_calibration_path: "data/calibrations/wise_sigma_sys_control.json"
   sigma_sys_calibration_sha256: "2da2a234ee0ccb07fb571431f5f178e362ff4d9d4f96d4ee878b921916127b7a"
+  # v0.1.2 / Launch Gate #2: frozen-method real AllWISE W3 FITS withheld blend-recovery +
+  # matched centered-excess control (reproduced_archive, seed 42, code 51a73ca). Reported
+  # beside the synthetic grid; it does NOT re-tier the completeness / false-positive
+  # bracket below, which stays illustrative.
+  fits_gate2_path: "data/calibrations/wise_fits_gate2_withheld.json"
+  fits_gate2_sha256: "d4818c100b02cea98d5beafcdea66e679c072e5d47e28fe8d3a960f78c64da99"
   calibration_data_tier: illustrative_calibration
   calibration_construction: >-
     3 completeness values x 5 false-positive rates spanning 0.1x to 5x the published

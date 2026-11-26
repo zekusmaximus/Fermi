@@ -57,18 +57,5 @@ export function topArchivalJob(q: Queue | null | undefined): Tier1Job | null {
   return jobs.reduce<Tier1Job | null>((best, j) => (best === null || j.utility_score > best.utility_score ? j : best), null);
 }
 
-/**
- * Number of AllWISE multi-patch controls behind the measured sigma_sys floor, read from the
- * WISE job's linked small-sample evidence: calibration half + withheld half.
- */
-export function wiseControlCount(q: Queue | null | undefined): number | null {
-  for (const j of q?.tier1_archival ?? []) {
-    const ev = j.linked_evidence;
-    if (ev) {
-      const cal = num(ev.calibration_in_sample_tail?.n_stars);
-      const held = num(ev.withheld_at_measured_floor?.n_stars);
-      if (cal !== null && held !== null) return cal + held;
-    }
-  }
-  return null;
-}
+// v0.1.2: the AllWISE control count is read from /api/health (n_controls), which the server
+// takes from the verified calibration file, instead of summing the queue's linked evidence.

@@ -47,3 +47,38 @@ containing matched centered stellar excesses and off-center background blends.
    within 3.25". Null / weak results are reported as-is.
 8. **Promotion.** Refused for a dirty `git_sha` or an incomplete split (every locked
    calibration and withheld star must be fetched and evaluated).
+
+## Results — Launch Gate #2 (live run, 2026-11-26; appended in v0.1.2b)
+Receipt `runs/wise_fits_gate2/wise_fits_gate2-seed42-20261126T210600Z.json` (sha256
+`1420cbca…`, code `51a73ca` = v0.1.2a, seed 42, window 20:59:59–21:06:00 UTC, frozen at
+21:01:58 UTC before the first withheld cutout) promoted to
+`data/calibrations/wise_fits_gate2_withheld.json` (file sha256 `d4818c10…`, pinned in
+`data/surveys/hephaistos_wise_mid_ir.yaml`). Locked inputs unchanged.
+
+- **Fetch:** 154/154 int + unc cutout pairs (308 files, 0 failures, 0 from cache);
+  Gate #1 centroid offsets reproduced to max |diff| = 0.00019".
+- **Empirical W3 Atlas PSF** (77 calibration stamps): FWHM 13.69" (Gaussian fit),
+  11.71" (half-max area) vs 6.5" nominal — Atlas coadd smoothing roughly doubles the width.
+- **Frozen thresholds:** centroid 3.439 x hypot(sigma_stat, 0.4356") (1.71" at the
+  calibration median SNR); Delta chi^2 scale 40.2 -> threshold 569.3. Calibration in-sample
+  false alarms: centroid 2/77 (same 2 as Gate #1), image 3/77.
+
+| screen (withheld, n = 77) | null false alarm | blend survival <= 3.25" | Arm B false rejection (pooled) |
+|---|---|---|---|
+| centroid (frozen) | 0/77 (95% CP <= 0.047) | **0.671** (synthetic Gaussian: 0.699) | 1/385 = 0.003 (CP 0.000–0.014) |
+| image Delta chi^2 (frozen) | **5/77 = 0.065** (CP 0.021–0.145) | **0.934** (synthetic Gaussian: 0.760) | 24/385 = 0.062 (CP 0.040–0.091) |
+| naive flux excess (reference) | 0/77 | 0.200 | 308/385 = 0.800 (1.000 for every f_bg >= 0.3) |
+
+Readings (no winner tuned in):
+1. **The centroid screen transfers to real Atlas data** at the locked floor: out-of-sample
+   null 0/77, Arm B 1/385, survival 0.671 vs 0.699 synthetic.
+2. **The image-level screen fails on real Atlas cutouts.** Its frozen threshold is not
+   calibrated out of sample (5/77 vs the 0.27% target; withheld null median Delta chi^2 124
+   vs 95 on calibration), and Arm A recovery stays at that null rate except at theta = 6"
+   with f_bg >= 0.5. Its 24 Arm B "rejections" are exactly the 5 stars it already flags
+   without injection — false alarms, not a response to the excess. The synthetic Gaussian
+   grid (survival 0.760) overstates real image-level performance; the median-matched
+   chi^2(3) tail assumption does not hold for correlated Atlas noise plus PSF mismatch.
+   This is a first-class negative result; any replacement statistic needs a new frozen run.
+3. **The matched negative control works:** the naive bright-excess rule recovers 100% of
+   blends for f_bg >= 0.3 and also rejects 100% of matched centered excesses (net 0).

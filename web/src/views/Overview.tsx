@@ -1,7 +1,7 @@
 import { get, post, type Adversary, type CompareRequest, type CompareResponse, type Health, type Queue, type Registry } from "../api";
 import { ErrorBox, TierBadge, TierSetBadge, useApi } from "../components/ui";
 import { bfReading, fmtLog10, fmtMultiplier, fmtNum } from "../lib/format";
-import { adversaryFacts, topArchivalJob, wiseControlCount } from "../lib/overview";
+import { adversaryFacts, topArchivalJob } from "../lib/overview";
 import type { View } from "./MacroDesk";
 
 // The Overview's fixed reference run: the Macro Desk defaults at seed 42 (the same request
@@ -25,7 +25,8 @@ export function Overview({ health, go }: { health: Health | null; go: (v: View) 
   const reg = useApi(() => get<Registry>("/api/registry"), []);
 
   const radioSurvey = reg.data?.surveys.find((s) => s.channel === "radio");
-  const nControls = wiseControlCount(queue.data);
+  // Live provenance straight from /api/health (read from the verified calibration file).
+  const nControls = health?.n_controls ?? null;
   const facts = adversaryFacts(adv.data);
   const top = topArchivalJob(queue.data);
   const nOpen = queue.data ? [...queue.data.tier1_archival, ...queue.data.tier0_compute].filter((j) => j.status === "open").length : null;
@@ -67,7 +68,8 @@ export function Overview({ health, go }: { health: Health | null; go: (v: View) 
             + <span className="num">{nControls ?? dash}</span> <span className="muted">AllWISE multi-patch controls</span>
           </p>
           <p className="tele-foot">
-            {radioSurvey ? <TierBadge tier={radioSurvey.data_tier} /> : null} <TierBadge tier="reproduced_archive" />{" "}
+            {radioSurvey ? <TierBadge tier={radioSurvey.data_tier} /> : null}{" "}
+            {health?.calibration_data_tier ? <TierBadge tier={health.calibration_data_tier} /> : null}{" "}
             <span className={health ? (health.validation_passed ? "valid-ok" : "valid-bad") : "muted"}>
               {health
                 ? `${health.validation_checks_passed}/${health.validation_checks_total} ${health.validation_passed ? "OK" : "FAIL"}`

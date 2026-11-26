@@ -50,6 +50,7 @@ from fermi_desk.queue.store import JOB_DEFINITIONS, JobDefinition, JobStore
 from fermi_desk.registry import (
     FactorGraph,
     load_factor_graph,
+    load_fits_gate2,
     load_sigma_sys_calibration,
     run_validation,
 )
@@ -140,6 +141,13 @@ class HealthOut(_Out):
     validation_failures: list[str]
     catalog_sha256: str | None
     wise_calibration_sha256: str | None
+    # v0.1.2: live provenance of the AllWISE control sample (read from the verified files)
+    n_controls: int | None
+    n_calibration: int | None
+    n_withheld: int | None
+    calibration_data_tier: str | None
+    fits_gate2_sha256: str | None
+    fits_gate2_data_tier: str | None
     receipt_schema_version: int
     read_only: bool
 
@@ -266,6 +274,38 @@ def create_app(
             "failures": [f"{r.name}: {r.detail}" for r in res if not r.ok],
         }
 
+    @lru_cache(maxsize=4)
+    def provenance(sha: str) -> dict:
+        """Control-sample provenance from the verified files (None fields if unavailable)."""
+        out: dict = dict.fromkeys(
+            (
+                "n_controls",
+                "n_calibration",
+                "n_withheld",
+                "calibration_data_tier",
+                "fits_gate2_sha256",
+                "fits_gate2_data_tier",
+            )
+        )
+        try:
+            cal = load_sigma_sys_calibration(ir_survey, root)
+            gate = load_fits_gate2(ir_survey, root)
+        except (FermiDeskError, FileNotFoundError, KeyError, ValueError):
+            return out  # validation (health.validation_failures) reports the reason
+        if cal is not None:
+            ctl = cal.record.controls
+            out.update(
+                n_controls=cal.record.n_controls,
+                n_calibration=sum(c.split == "calibration" for c in ctl),
+                n_withheld=sum(c.split == "withheld" for c in ctl),
+                calibration_data_tier=cal.record.data_tier,
+            )
+        if gate is not None:
+            out.update(
+                fits_gate2_sha256=gate.file_sha256, fits_gate2_data_tier=gate.record.data_tier
+            )
+        return out
+
     @lru_cache(maxsize=128)
     def compare_cached(sha: str, key: str) -> dict:
         req = CompareRequest.model_validate_json(key)
@@ -375,6 +415,7 @@ def create_app(
             "validation_failures": v["failures"],
             "catalog_sha256": radio_survey.catalog_sha256,
             "wise_calibration_sha256": cal_sha,
+            **provenance(git_sha),
             "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
             "read_only": read_only,
         }

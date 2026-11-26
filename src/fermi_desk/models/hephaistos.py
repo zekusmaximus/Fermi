@@ -30,12 +30,15 @@ from functools import lru_cache
 
 import astropy.units as u
 import numpy as np
-from scipy.stats import chi2
+from scipy.optimize import brentq, minimize_scalar
+from scipy.stats import beta, binom, chi2, kstest
 
 from fermi_desk.errors import UnitValidationError
 from fermi_desk.models.infrared import IRCalibration
 
 FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))  # 2.355
+# Rayleigh tail probability of a 3-sigma (two-sided Gaussian equivalent) excursion.
+RAYLEIGH_3SIGMA_FALSE_ALARM = 0.0027
 
 
 def _arcsec(q: object, name: str) -> float:
@@ -305,3 +308,153 @@ def centroid_p_value(offset: u.Quantity, offset_err: u.Quantity, spec: CutoutSpe
     """Rayleigh-null tail probability of a measured offset given its error and sigma_sys."""
     sigma = np.hypot(_arcsec(offset_err, "offset_err"), _arcsec(spec.sigma_sys, "sigma_sys"))
     return float(np.exp(-(_arcsec(offset, "offset") ** 2) / (2 * sigma**2)))
+
+
+# ------------------------------------------- empirical registration floor (sigma_sys)
+# Pure estimators shared by scripts/run_wise_control_experiment.py (live archive run),
+# `fermi-desk validate` (offline recomputation from the stored controls) and the IR
+# drill-down. Model per control star i: the 2-D W3-centroid offset from the Gaia
+# position is Rayleigh with per-axis scale s_i = sqrt(sigma_stat_i^2 + sigma_sys^2),
+# sigma_stat_i = FWHM / (2.355 SNR_i) (Ren et al. 2026 eq. 1).
+def _arcsec_array(q: object, name: str) -> np.ndarray:
+    if not isinstance(q, u.Quantity) or not q.unit.is_equivalent(u.arcsec):
+        raise UnitValidationError(f"{name} must be an angle Quantity")
+    return np.atleast_1d(q.to_value(u.arcsec)).astype(float)
+
+
+def _check_offsets(offsets: u.Quantity, sigma_stat: u.Quantity) -> tuple[np.ndarray, np.ndarray]:
+    r = _arcsec_array(offsets, "offsets")
+    s = _arcsec_array(sigma_stat, "sigma_stat")
+    if r.shape != s.shape or r.size == 0:
+        raise ValueError("offsets and sigma_stat must be non-empty and the same shape")
+    if np.any(r < 0) or np.any(s <= 0) or not np.all(np.isfinite(r) & np.isfinite(s)):
+        raise ValueError("offsets must be >= 0 and sigma_stat > 0 (finite)")
+    return r, s
+
+
+def rayleigh_log_likelihood(
+    offsets: u.Quantity, sigma_stat: u.Quantity, sigma_sys: u.Quantity
+) -> float:
+    r, s = _check_offsets(offsets, sigma_stat)
+    var = s**2 + _arcsec(sigma_sys, "sigma_sys") ** 2
+    return float(np.sum(np.log(np.maximum(r, 1e-300) / var) - r**2 / (2.0 * var)))
+
+
+def sigma_sys_mle(
+    offsets: u.Quantity, sigma_stat: u.Quantity, upper: u.Quantity = 5.0 * u.arcsec
+) -> u.Quantity:
+    """Heteroscedastic-Rayleigh maximum-likelihood registration floor (bounded at 0)."""
+    r, s = _check_offsets(offsets, sigma_stat)
+    hi = _arcsec(upper, "upper")
+
+    def nll(x: float) -> float:
+        var = s**2 + x * x
+        return float(-np.sum(np.log(np.maximum(r, 1e-300) / var) - r**2 / (2.0 * var)))
+
+    res = minimize_scalar(nll, bounds=(0.0, hi), method="bounded", options={"xatol": 1e-7})
+    x = float(res.x)
+    if nll(0.0) <= nll(x):  # boundary optimum: statistical noise alone explains the scatter
+        x = 0.0
+    return x * u.arcsec
+
+
+RAYLEIGH_MEDIAN = float(np.sqrt(2.0 * np.log(2.0)))  # median of the unit Rayleigh law
+
+
+def sigma_sys_robust(
+    offsets: u.Quantity, sigma_stat: u.Quantity, upper: u.Quantity = 10.0 * u.arcsec
+) -> u.Quantity:
+    """Median-matched registration floor (robust to unseen-blend outliers).
+
+    Solves median_i[r_i / sqrt(sigma_stat_i^2 + x^2)] = sqrt(2 ln 2) for x >= 0 (the
+    unit-Rayleigh median); 0 when statistical noise alone already explains the median.
+    Breakdown point 50%, so a few contaminated "controls" (background W3 sources absent
+    from Gaia) cannot inflate the floor and thereby blind the centroid screen.
+    """
+    r, s = _check_offsets(offsets, sigma_stat)
+    hi = _arcsec(upper, "upper")
+
+    def g(x: float) -> float:
+        return float(np.median(r / np.sqrt(s**2 + x * x))) - RAYLEIGH_MEDIAN
+
+    if g(0.0) <= 0.0:
+        return 0.0 * u.arcsec
+    if g(hi) > 0.0:
+        raise ValueError(f"robust sigma_sys exceeds {hi} arcsec")
+    return float(brentq(g, 0.0, hi, xtol=1e-9)) * u.arcsec
+
+
+def sigma_sys_moment(offsets: u.Quantity, sigma_stat: u.Quantity) -> u.Quantity:
+    """Moment estimator: sqrt(max(0, <r^2>/2 - <sigma_stat^2>))."""
+    r, s = _check_offsets(offsets, sigma_stat)
+    return float(np.sqrt(max(0.0, np.mean(r**2) / 2.0 - np.mean(s**2)))) * u.arcsec
+
+
+SIGMA_SYS_ESTIMATORS = {
+    "robust_median": sigma_sys_robust,
+    "rayleigh_mle": sigma_sys_mle,
+    "moment": sigma_sys_moment,
+}
+
+
+def sigma_sys_bootstrap(
+    offsets: u.Quantity,
+    sigma_stat: u.Quantity,
+    rng: np.random.Generator,
+    n_boot: int = 2000,
+    estimator: str = "robust_median",
+) -> np.ndarray:
+    """Seeded nonparametric bootstrap of a sigma_sys estimator (arcsec, length n_boot)."""
+    if not isinstance(rng, np.random.Generator):
+        raise TypeError("rng must be an explicit numpy.random.Generator")
+    fn = SIGMA_SYS_ESTIMATORS[estimator]
+    r, s = _check_offsets(offsets, sigma_stat)
+    out = np.empty(n_boot)
+    for b in range(n_boot):
+        i = rng.integers(0, r.size, r.size)
+        out[b] = fn(r[i] * u.arcsec, s[i] * u.arcsec).to_value(u.arcsec)
+    return out
+
+
+def clopper_pearson(k: int, n: int, cl: float = 0.95) -> tuple[float, float]:
+    """Exact binomial confidence interval for k successes in n trials."""
+    if n <= 0 or not 0 <= k <= n:
+        raise ValueError("need n > 0 and 0 <= k <= n")
+    a = (1.0 - cl) / 2.0
+    lo = 0.0 if k == 0 else float(beta.ppf(a, k, n - k + 1))
+    hi = 1.0 if k == n else float(beta.ppf(1.0 - a, k + 1, n - k))
+    return lo, hi
+
+
+def centroid_screen_false_alarms(
+    offsets: u.Quantity,
+    sigma_stat: u.Quantity,
+    sigma_sys: u.Quantity,
+    false_alarm: float = RAYLEIGH_3SIGMA_FALSE_ALARM,
+) -> dict:
+    """Empirical false-alarm rate of the centroid screen on blend-free control stars.
+
+    A star is flagged when its offset exceeds s_i * sqrt(-2 ln false_alarm). Reports the
+    flag count, exact 95% interval, the binomial tail P(K >= k | nominal) and a KS test
+    of the normalised offsets r_i / s_i against the unit Rayleigh law.
+    """
+    r, s = _check_offsets(offsets, sigma_stat)
+    if not 0 < false_alarm < 1:
+        raise ValueError("false_alarm must be in (0, 1)")
+    scale = np.sqrt(s**2 + _arcsec(sigma_sys, "sigma_sys") ** 2)
+    flags = r > scale * np.sqrt(-2.0 * np.log(false_alarm))
+    k, n = int(flags.sum()), int(r.size)
+    lo, hi = clopper_pearson(k, n)
+    ks = kstest(r / scale, lambda x: 1.0 - np.exp(-(np.asarray(x) ** 2) / 2.0))
+    return {
+        "sigma_sys_arcsec": _arcsec(sigma_sys, "sigma_sys"),
+        "nominal_false_alarm": false_alarm,
+        "n_stars": n,
+        "n_flagged": k,
+        "empirical_false_alarm": k / n,
+        "clopper_pearson_95": [lo, hi],
+        "binomial_p_at_least_k_given_nominal": float(binom.sf(k - 1, n, false_alarm)),
+        "ks_rayleigh_statistic": float(ks.statistic),
+        "ks_rayleigh_p_value": float(ks.pvalue),
+        "flagged_index": np.flatnonzero(flags).tolist(),
+    }

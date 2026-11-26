@@ -1,3 +1,4 @@
 # Checksummed catalogs: never let git rewrite line endings (SHA-256 is pinned in data/surveys/).
 data/catalogs/*.csv -text
 data/catalogs/*.json -text
+data/calibrations/*.json -text

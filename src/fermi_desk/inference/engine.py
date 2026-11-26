@@ -37,6 +37,12 @@ from fermi_desk.schemas import Hypothesis, Survey
 
 LN10 = math.log(10.0)
 CHANNELS = ("radio", "infrared", "solar_system")
+# Data tiers that are NOT verified observational inputs (SPEC.md Sec. 2 invariant 6).
+ILLUSTRATIVE_TIERS = frozenset(
+    {"illustrative_calibration", "synthetic_proxy", "synthetic_proxy_692"}
+)
+HEADLINE_VERIFIED = "verified_channels_only"
+HEADLINE_WITH_ILLUSTRATIVE = "including_illustrative_channels"
 EXPANSION_PARAMS = ("origin_rate_per_kpc2_gyr", "expansion_speed_c")
 EARTH = "earth_unreached"
 RADIO_SS = "radio+solar_system"
@@ -66,6 +72,9 @@ class RunConfig:
     # Overrides of registry DEFAULTS only (e.g. lookback sweeps); never of a value
     # a hypothesis constrains itself.
     parameter_overrides: tuple[tuple[str, float], ...] = ()
+    # Milestone 2.5 policy ruling: the headline Bayes factor covers verified channels
+    # only unless the caller deliberately folds illustrative channels in.
+    include_illustrative_in_headline: bool = False
 
     def __post_init__(self) -> None:
         if self.geometry not in GEOMETRY_MODES:
@@ -474,28 +483,62 @@ def _joint(comps: dict, terms: list[str], channels: Sequence[str]) -> dict:
 
 
 # ----------------------------------------------------------------- comparisons
-def compare_pair(a: dict, b: dict) -> dict:
-    """log10 Bayes factor of a over b, strictly over their shared active channels."""
-    shared = sorted(set(a["channels_evaluated"]) & set(b["channels_evaluated"]))
-    earth = EARTH in a["components"] and EARTH in b["components"]
-    ta = select_terms(a["components"], set(shared), earth)
-    tb = select_terms(b["components"], set(shared), earth)
+def _is_illustrative(tiers: Sequence[str]) -> bool:
+    return any(t in ILLUSTRATIVE_TIERS for t in tiers)
+
+
+def _pair_terms(a: dict, b: dict, channels: set[str], earth: bool) -> list[str]:
+    ta = select_terms(a["components"], channels, earth)
+    tb = select_terms(b["components"], channels, earth)
     if ta != tb:
         raise SchemaValidationError(f"Incompatible component decomposition: {ta} vs {tb}")
-    per = {
-        t: a["components"][t]["log10_p_data_given_h"] - b["components"][t]["log10_p_data_given_h"]
-        for t in ta
-    }
-    tiers = sorted({x for t in ta for h in (a, b) for x in h["components"][t]["data_tiers"]})
-    illustrative = [
-        t
-        for t in ta
-        if any(
-            "illustrative" in x or "synthetic" in x
-            for h in (a, b)
-            for x in h["components"][t]["data_tiers"]
+    return ta
+
+
+def compare_pair(a: dict, b: dict) -> dict:
+    """log10 Bayes factor of a over b, strictly over their shared active channels.
+
+    Two sums are reported. ``log10_bf`` covers every shared channel. The
+    ``verified`` block covers only the shared channels whose component carries no
+    illustrative / synthetic data tier in either hypothesis (Milestone 2.5 ruling).
+    Channel exclusion happens *before* term selection, so a joint term such as
+    ``radio+solar_system`` is never dropped wholesale: the verified radio marginal
+    is used in its place.
+    """
+    shared = sorted(set(a["channels_evaluated"]) & set(b["channels_evaluated"]))
+    earth = EARTH in a["components"] and EARTH in b["components"]
+    ta = _pair_terms(a, b, set(shared), earth)
+
+    def tiers_of(t: str) -> list[str]:
+        return sorted({x for h in (a, b) for x in h["components"][t]["data_tiers"]})
+
+    def bf(t: str) -> float:
+        return (
+            a["components"][t]["log10_p_data_given_h"] - b["components"][t]["log10_p_data_given_h"]
         )
-    ]
+
+    per = {t: bf(t) for t in ta}
+    tiers = sorted({x for t in ta for x in tiers_of(t)})
+    illustrative = [t for t in ta if _is_illustrative(tiers_of(t))]
+    illustrative_channels = sorted(
+        c
+        for c in shared
+        if _is_illustrative(
+            [x for h in (a, b) for x in h["components"].get(c, {}).get("data_tiers", [])]
+        )
+    )
+    verified_channels = sorted(set(shared) - set(illustrative_channels))
+    tv = _pair_terms(a, b, set(verified_channels), earth)
+    per_v = {t: bf(t) for t in tv}
+    verified = {
+        "policy": HEADLINE_VERIFIED,
+        "channels": verified_channels,
+        "terms": tv,
+        "log10_bf_by_term": per_v,
+        "log10_bf": float(sum(per_v.values())) if tv else None,
+        "excluded_illustrative_channels": illustrative_channels,
+        "data_tiers": sorted({x for t in tv for x in tiers_of(t)}),
+    }
     return {
         "numerator": a["hypothesis_id"],
         "denominator": b["hypothesis_id"],
@@ -503,18 +546,48 @@ def compare_pair(a: dict, b: dict) -> dict:
         "earth_unreached_in_bf": earth,
         "terms": ta,
         "log10_bf_by_term": per,
+        "term_data_tiers": {t: tiers_of(t) for t in ta},
         "log10_bf": float(sum(per.values())) if ta else None,
         "illustrative_terms": illustrative,
-        "log10_bf_excluding_illustrative": float(
-            sum(v for t, v in per.items() if t not in illustrative)
-        )
-        if ta
-        else None,
+        "illustrative_channels": illustrative_channels,
+        "log10_bf_excluding_illustrative": verified["log10_bf"],
+        "verified": verified,
         "data_tiers_in_bf": tiers,
         "excluded_channels": {
             "numerator_only": sorted(set(a["channels_evaluated"]) - set(shared)),
             "denominator_only": sorted(set(b["channels_evaluated"]) - set(shared)),
         },
+    }
+
+
+def headline_summary(bf: dict, include_illustrative: bool) -> dict:
+    """The single headline number of a run, with its policy stated explicitly."""
+    if include_illustrative:
+        return {
+            "policy": HEADLINE_WITH_ILLUSTRATIVE,
+            "log10_bf": bf["log10_bf"],
+            "terms": bf["terms"],
+            "channels": bf["channels_in_bf"],
+            "includes_illustrative_channels": bf["illustrative_channels"],
+            "data_tiers": bf["data_tiers_in_bf"],
+            "warning": (
+                "ILLUSTRATIVE CHANNELS INCLUDED: this headline folds illustrative_calibration "
+                "terms into the joint Bayes factor; it is a sensitivity statement, NOT an "
+                "observational bound"
+            )
+            if bf["illustrative_channels"]
+            else None,
+        }
+    v = bf["verified"]
+    return {
+        "policy": HEADLINE_VERIFIED,
+        "log10_bf": v["log10_bf"],
+        "terms": v["terms"],
+        "channels": v["channels"],
+        "includes_illustrative_channels": [],
+        "excluded_illustrative_channels": v["excluded_illustrative_channels"],
+        "data_tiers": v["data_tiers"],
+        "warning": None,
     }
 
 
@@ -611,7 +684,9 @@ def score_hypotheses(
     }
     if cfg.headline_pair:
         a, b = cfg.headline_pair
-        results["headline"] = compare_pair(scored[a], scored[b])
+        hl = compare_pair(scored[a], scored[b])
+        hl["headline"] = headline_summary(hl, cfg.include_illustrative_in_headline)
+        results["headline"] = hl
     if cfg.ir_pair and "infrared" in ctx.surveys:
         results["ir_calibration_sweep"] = ir_reversal_sweep(ctx, *cfg.ir_pair)
     return ctx, results
@@ -627,7 +702,7 @@ def run_comparison(
     created = datetime.now(UTC)
     digest = hashlib.sha256(json.dumps(cfg_dict, sort_keys=True).encode()).hexdigest()[:10]
     return {
-        "receipt_schema_version": 2,
+        "receipt_schema_version": 3,
         "run_id": f"{created.strftime('%Y%m%dT%H%M%S%fZ')}-{digest}",
         "created_at_utc": created.isoformat(),
         "git_sha": git_sha,
@@ -648,6 +723,12 @@ def run_comparison(
             for s in ctx.surveys.values()
         ],
         "data_tiers_used": _data_tiers(ctx),
+        "headline_policy": HEADLINE_WITH_ILLUSTRATIVE
+        if cfg.include_illustrative_in_headline
+        else HEADLINE_VERIFIED,
+        "headline_log10_bf": results["headline"]["headline"]["log10_bf"]
+        if "headline" in results
+        else None,
         "results": results,
     }
 

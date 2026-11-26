@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import astropy.units as u
 import numpy as np
 import pytest
@@ -132,3 +134,17 @@ def test_build_context_targets_carry_coordinates(graph):
         graph, RunConfig(geometry="thin_disk_2d", radio_mode="flat_probability", seed=0)
     )
     assert ctx.targets.ra_deg is not None and len(ctx.targets.ra_deg) == 692
+
+
+def test_beam_sharing_pairs_are_structured_receipt_records(graph):
+    """Milestone 3's UI reads these records straight from the adversary receipt."""
+    rec = run_adversary(graph, seed=9, pair=PAIR, n_mc=100)
+    dup = next(f for f in rec["results"]["findings"] if f["check"] == "duplicate_pointings")
+    pairs = json.loads(json.dumps(dup["details"]["beam_sharing_pairs"]))  # JSON round trip
+    assert dup["details"]["n_beam_sharing_pairs"] == len(pairs) == 16
+    keys = set(dup["details"]["beam_sharing_pair_schema"])
+    assert keys >= {"pair_id", "a", "b", "separation_arcmin", "ra_a_deg", "dec_b_deg"}
+    assert all(set(p) == keys for p in pairs)
+    assert len({p["pair_id"] for p in pairs}) == 16
+    assert ("GJ 702A", "GJ 702B") in {(p["a"], p["b"]) for p in pairs}
+    assert all(p["separation_over_beam_fwhm"] < 1.0 and p["counted_once_each"] for p in pairs)

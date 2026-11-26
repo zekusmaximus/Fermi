@@ -228,13 +228,22 @@ def audit_duplicate_pointings(graph: FactorGraph) -> Finding:
             "a": str(targets.names[a]),
             "b": str(targets.names[b]),
             "separation_arcmin": float(s.to_value(u.arcmin)),
+            "separation_over_beam_fwhm": float((s / fwhm).to_value(u.dimensionless_unscaled)),
             "dist_a_pc": float(targets.distance[a].to_value(u.pc)),
             "dist_b_pc": float(targets.distance[b].to_value(u.pc)),
+            "ra_a_deg": float(targets.ra_deg[a]),
+            "dec_a_deg": float(targets.dec_deg[a]),
+            "ra_b_deg": float(targets.ra_deg[b]),
+            "dec_b_deg": float(targets.dec_deg[b]),
+            "pointing_group_id": sv.pointing_group_id,
+            "counted_once_each": True,
         }
         for a, b, s in zip(i1, i2, sep, strict=True)
         if a < b
     ]
     pairs.sort(key=lambda p: (p["a"], p["b"]))
+    for i, p in enumerate(pairs, 1):
+        p["pair_id"] = f"beam_pair_{i:02d}"
     status = (
         "fail" if collisions or dup_names or not self_test else ("finding" if pairs else "pass")
     )
@@ -254,6 +263,8 @@ def audit_duplicate_pointings(graph: FactorGraph) -> Finding:
             "duplicate_target_names": dup_names,
             "beam_fwhm_arcmin": float(fwhm.to_value(u.arcmin)),
             "beam_sharing_pairs": pairs,
+            "n_beam_sharing_pairs": len(pairs),
+            "beam_sharing_pair_schema": sorted(pairs[0]) if pairs else [],
             "interpretation": (
                 "beam-sharing stars each enter the likelihood exactly once (no double counting); "
                 "the extra coverage each gets from its neighbour's pointing is ignored, which is "

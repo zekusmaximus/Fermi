@@ -50,13 +50,15 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 ├── pyproject.toml                  # Managed via uv; pinned scientific stack
 ├── docs/
 │   ├── MILESTONE_1.md              # Active milestone brief
-│   ├── MILESTONE_2.md              # WISE drill-down, Adversary runner, BOED queue
+│   ├── MILESTONE_2.md              # WISE drill-down, Adversary runner, BOED queue (final)
+│   ├── MILESTONE_2_5.md            # Audit closeout & live WISE control experiment
 │   └── MILESTONE_3.md              # Public interactive desk UI
 ├── data/
 │   ├── parameters.yaml             # Canonical physical Parameter Registry
 │   ├── hypotheses/                 # Tier 1, Tier 2, Tier 3 hypothesis definitions
 │   ├── surveys/                    # Calibrated survey metadata & sensitivity specs
 │   ├── catalogs/                   # Small verified target lists (e.g., BL 692 targets) + checksums
+│   ├── calibrations/               # reproduced_archive calibrations (e.g., WISE sigma_sys controls) + checksums
 │   └── adversary_claims/           # Reproducible audits (e.g., HIP 1692, Hephaistos D/E)
 ├── src/fermi_desk/
 │   ├── __init__.py
@@ -216,6 +218,20 @@ factors are computed only over the intersection of the two hypotheses' active
 channels (plus Earth-unreached conditioning when both carry it), and list the
 channels that entered.
 
+**Headline Bayes factor policy (planning ruling, Milestone 2.5).** The default
+headline Bayes factor in `fermi-desk compare` and in run receipts (`headline_policy`,
+`headline_log10_bf`) covers **verified channels only**: a shared channel enters only
+if no `illustrative_calibration` / `synthetic_proxy` tier appears in its component for
+either hypothesis (with Earth-unreached conditioning: `earth_unreached + radio` in
+`flat_probability` mode). Illustrative channels (currently `infrared`, `solar_system`,
+and `radio` under `distance_scaled_eirp`, whose transmitter luminosity function is
+illustrative) stay active in the engine and appear in the per-component tables tagged
+with their tier. Channels are excluded *before* term selection, so a joint
+`radio+solar_system` term falls back to the verified radio marginal. `--include-
+illustrative` (default off) folds them into the headline and is labelled loudly.
+Both IR contamination conventions (Suazo 2024 subsample, Zackrisson 2026 full
+sample) stay side-by-side in `ir-drilldown`; no winner is picked.
+
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
 Bailer-Jones DR2 distance (752.61 pc, ~1,071x) is the historical Wlodarczyk-Sroka
@@ -226,6 +242,11 @@ Every queued or executed job records:
 - `job_id`, `tier` (`0_compute` | `1_archival`), `title`, `target_module`, `parameters_json`
 - `expected_eig_bits` (with explicit prior specification), `est_cpu_seconds`, `est_reviewer_minutes`
 - `status` (`open` | `claimed` | `completed` | `rejected`), `code_git_sha`, `rng_seed`, `output_sha256`, `created_at`
+- `diagnostic_impact`, `diagnostic_priority` (Milestone 2.5 ruling): Tier-0 compute jobs keep
+  `expected_eig_bits = 0.0` exactly (simulations add no sky photons) and instead state the
+  model uncertainty or validity boundary they resolve (text computed from the job parameters)
+  plus a rank among compute jobs (1 = first). Tier-1 archival jobs leave both NULL and are ranked
+  by EIG bits/hr. `fermi-desk queue list` renders the two tiers as separate tables.
 
 ---
 
@@ -237,15 +258,45 @@ Every queued or executed job records:
 - Radio (BL 692 primary targets: flat vs. per-target distance-scaled EIRP), Mid-IR (calibration reversal bracket), and Solar System channels with toggleable joint evaluation.
 - Full Scientific CI test suite (`pytest`) passing all 6 architectural invariants.
 
-### Milestone 2: Drill-Down Verticals, Adversary Runner & BOED Queue (Current; brief: `docs/MILESTONE_2.md`)
+### Milestone 2: Drill-Down Verticals, Adversary Runner & BOED Queue (Complete; brief: `docs/MILESTONE_2.md`)
 - **Infrared Drill-Down (`hephaistos`):** AllWISE centroid vs. image-level blend-recovery grid (angular separation vs. background flux fraction), anchored on Project Hephaistos Candidates D and E (Ren et al. 2026; Zackrisson et al. 2026).
 - **Adversary Runner:** Automated reproduction of real catalog/methodology failure modes—starting with **HIP 1692** (distance revision from ~23 pc to ~752.6 pc raising minimum detectable EIRP by >1,000x; Wlodarczyk-Sroka et al. 2020) and duplicate-pointing detection.
 - **SQLite Job Queue & EIG Scorer:** Computes exact expected bits gained per trial plus CPU/review cost; registers open jobs (including Wlodarczyk-Sroka 288,315-star background extension and independent WISE control fields).
+
+### Milestone 2.5: Audit Closeout & Live WISE Control Experiment (Current; brief: `docs/MILESTONE_2_5.md`)
+- Close the ten Milestone 2 audit rulings (verified-only headline BF, Tier-0 diagnostic queue,
+  `slow` test marker, finalized Milestone 2 brief, structured beam-sharing records).
+- Public-Launch Gate #1: live multi-patch AllWISE/Gaia control experiment measuring the W3
+  centroid registration floor `sigma_sys` (calibration half) and its out-of-sample 3-sigma
+  false-alarm rate (withheld half), promoted to `data/calibrations/wise_sigma_sys_control.json`
+  (`reproduced_archive`) and reported side-by-side with the legacy 0.50 arcsec baseline.
 
 ### Milestone 3: Public Live Desk UI (FastAPI + React/Vite)
 - **Homepage (Macro Desk):** Live comparison of *Frequent/Slow* vs. *Rare/Fast* expansion regimes against toggleable Radio, Mid-IR, Solar System, and Earth-unreached conditioning.
 - **Drill-Down Views:** Radio 692-star spatial map & EIRP sensitivity toggle; Mid-IR calibration sensitivity & Hephaistos Candidate D failure card.
 - **Adversary Feed, Tier-3 Quarantine Shelf & Claimable Action Queue:** Live run feed with git SHA + seed replay commands.
+
+### v0.2 / Post-M3 Roadmap (deferred, documented at Milestone 2.5)
+1. **`union_targets_by_pointing` merge policy (required before ingesting the
+   Wlodarczyk-Sroka et al. 2020 background stars).** The 288,315 background stars lie in
+   the same GBT L-band pointings as the BL 692 primaries and therefore share
+   `pointing_group_id: bl_gbt_lband_2017`. Today the only merge policy is `keep_first`,
+   which resolves a pointing-group collision by keeping whichever survey loads first.
+   `keep_first` must **never** be used for this ingestion: (a) the result depends on file
+   load order; (b) it silently discards one catalog wholesale - either the background
+   constraint or the primary targets; (c) the two catalogs are complementary (different
+   stars in shared beams), not duplicates, so dropping one is data loss, not
+   de-duplication. `union_targets_by_pointing` must merge the target lists per pointing,
+   de-duplicate stars by Gaia DR3 `source_id` so each star enters the likelihood exactly
+   once, attach per-star sensitivity (off-axis beam attenuation for background stars), and
+   record the merge (input checksums, duplicate count) in the run receipt.
+2. **Finite-Galaxy disk geometry (`R_gal = 15 kpc`).** The expansion kernel is a local
+   infinite-disk approximation valid only while `v_exp * T <= 8 kpc`; for
+   `rare_fast_expanders` (`v_exp = 0.5 c`) this gives `T_valid = 52.2 kyr`, so receipts at
+   the default lookback flag `local_approximation_valid = false`. A finite disk with
+   `R_gal = 15 kpc` (edge truncation of origin sites and bubble intersection with the disk
+   boundary) replaces the local limit; until then the `lookback_window_t_sweep` Tier-0 job
+   records the cutoff and BF sensitivity across 50 kyr-10 Myr.
 
 ### Public-Launch Scientific Exit Gate (Mandatory Before Promotion)
 1. One previously unrun experiment executed on real archival images/catalogs (with query receipt).

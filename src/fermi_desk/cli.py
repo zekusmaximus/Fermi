@@ -12,7 +12,14 @@ from rich.markup import escape
 from rich.table import Table
 
 from fermi_desk.errors import FermiDeskError
-from fermi_desk.inference.engine import CHANNELS, RunConfig, run_comparison, write_receipt
+from fermi_desk.inference.engine import (
+    CHANNELS,
+    HEADLINE_VERIFIED,
+    ILLUSTRATIVE_TIERS,
+    RunConfig,
+    run_comparison,
+    write_receipt,
+)
 from fermi_desk.models.expansion import GEOMETRY_MODES
 from fermi_desk.models.radio import RADIO_MODES
 from fermi_desk.registry import load_factor_graph, run_validation
@@ -78,21 +85,58 @@ def validate(root: Root = None) -> None:
 
 
 # -------------------------------------------------------------------- compare
+def _tier_tag(tiers: list[str]) -> str:
+    bad = sorted(t for t in tiers if t in ILLUSTRATIVE_TIERS)
+    return ", ".join(bad) if bad else "verified (" + (", ".join(tiers) or "model term") + ")"
+
+
 def _print_bf(bf: dict, title: str) -> None:
-    t = _table(title, ("term entering the Bayes factor", "log10 BF"))
+    hl = bf.get("headline")
+    t = _table(title, ("term", "data tier", "log10 BF", "in HEADLINE BF"))
+    head_terms = set(hl["terms"]) if hl else set()
     for k, v in bf["log10_bf_by_term"].items():
-        mark = "  (illustrative tier)" if k in bf["illustrative_terms"] else ""
-        t.add_row(escape(k + mark), f"{v:+.6g}")
-    t.add_row("[bold]all shared terms[/]", f"[bold]{_fmt(bf['log10_bf'], '+.6g')}[/]")
-    t.add_row(
-        "shared terms excluding illustrative", _fmt(bf["log10_bf_excluding_illustrative"], "+.6g")
-    )
+        tiers = bf["term_data_tiers"].get(k, [])
+        t.add_row(
+            escape(k), escape(_tier_tag(tiers)), f"{v:+.6g}", "yes" if k in head_terms else "no"
+        )
+    if hl and hl["policy"] == HEADLINE_VERIFIED:
+        for k, v in bf["verified"]["log10_bf_by_term"].items():
+            if k not in bf["log10_bf_by_term"]:  # verified marginal replacing a joint term
+                tiers = bf["term_data_tiers"].get(k, [])
+                t.add_row(
+                    escape(k + " (verified marginal)"), escape(_tier_tag(tiers)), f"{v:+.6g}", "yes"
+                )
+    t.add_row("all shared terms (incl. illustrative)", "-", _fmt(bf["log10_bf"], "+.6g"), "-")
+    t.add_row("verified channels only", "-", _fmt(bf["verified"]["log10_bf"], "+.6g"), "-")
     console.print(t)
+    if hl:
+        if hl["policy"] == HEADLINE_VERIFIED:
+            console.print(
+                f"[bold green]HEADLINE log10 BF = {_fmt(hl['log10_bf'], '+.6g')}[/] "
+                + escape(
+                    f"(policy: {hl['policy']}; terms: {' + '.join(hl['terms']) or 'none'}; "
+                    f"illustrative channels excluded: "
+                    f"{hl['excluded_illustrative_channels'] or 'none'}; "
+                    "use --include-illustrative to fold them in)"
+                )
+            )
+        else:
+            console.print(
+                "[bold red]!!! --include-illustrative: ILLUSTRATIVE CHANNELS FOLDED INTO THE "
+                "HEADLINE BF — NOT AN OBSERVATIONAL BOUND !!![/]"
+            )
+            console.print(
+                escape(
+                    f"HEADLINE log10 BF = {_fmt(hl['log10_bf'], '+.6g')} (policy: {hl['policy']}; "
+                    f"terms: {' + '.join(hl['terms'])}; illustrative channels included: "
+                    f"{hl['includes_illustrative_channels'] or 'none'})"
+                )
+            )
     console.print(
         escape(
-            f"  channels entered: {bf['channels_in_bf']} | Earth-unreached term: "
+            f"  channels shared: {bf['channels_in_bf']} | Earth-unreached term: "
             f"{bf['earth_unreached_in_bf']} | excluded (not shared): {bf['excluded_channels']} | "
-            f"data tiers: {bf['data_tiers_in_bf']}"
+            f"data tiers (all shared terms): {bf['data_tiers_in_bf']}"
         )
     )
 
@@ -113,11 +157,22 @@ def compare(
     n_mc: Annotated[int, typer.Option(help="Monte Carlo realisations per hypothesis.")] = 20000,
     pair: Annotated[str, typer.Option(help="Headline comparison 'A,B'.")] = PAIR_DEFAULT,
     ir_pair: Annotated[str, typer.Option(help="IR calibration sweep 'A,B'.")] = IR_PAIR_DEFAULT,
+    include_illustrative: Annotated[
+        bool,
+        typer.Option(
+            "--include-illustrative",
+            help=(
+                "Fold illustrative_calibration channels into the headline Bayes factor "
+                "(default: verified channels only). Output is labelled loudly."
+            ),
+        ),
+    ] = False,
     out_dir: Annotated[Path | None, typer.Option(help="Receipt directory (default runs/).")] = None,
     root: Root = None,
 ) -> None:
     """Headline hypothesis comparison; writes a JSON RunReceipt to runs/."""
     cfg = RunConfig(
+        include_illustrative_in_headline=include_illustrative,
         geometry=geometry,
         radio_mode=radio_mode,
         seed=seed,
@@ -134,7 +189,8 @@ def compare(
 
     console.rule(
         f"fermi-desk compare | geometry={geometry} radio_mode={radio_mode} seed={seed} "
-        f"earth_unreached={'on' if condition_on_earth_unreached else 'off'}"
+        f"earth_unreached={'on' if condition_on_earth_unreached else 'off'} | "
+        f"headline={receipt['headline_policy']}"
     )
     t1 = _table(
         "Expansion & radio forward model (per scored hypothesis)",
@@ -172,6 +228,17 @@ def compare(
 
     names = ("earth_unreached", "radio", "solar_system", "radio+solar_system", "infrared")
     present = [c for c in names if any(c in h["components"] for _, h in rows)]
+    col_tiers = {
+        c: sorted(
+            {t for _, h in rows if c in h["components"] for t in h["components"][c]["data_tiers"]}
+        )
+        for c in present
+    }
+    headers = [
+        f"{c} [{'ILLUSTRATIVE: ' if any(t in ILLUSTRATIVE_TIERS for t in col_tiers[c]) else ''}"
+        f"{', '.join(col_tiers[c]) or 'model term'}]"
+        for c in present
+    ]
     for key, title, joint in (
         (
             "log10_lr_vs_null",
@@ -184,7 +251,7 @@ def compare(
             False,
         ),
     ):
-        cols = ("hypothesis", *present, *(("joint LR [own channels only]",) if joint else ()))
+        cols = ("hypothesis", *headers, *(("joint LR [own channels only]",) if joint else ()))
         t = _table(title, cols)
         for hid, h in rows:
             vals = [
@@ -248,7 +315,9 @@ def compare(
     console.print(
         escape(
             f"Receipt: {_rel(out, graph.root)} | rng_seed={receipt['rng_seed']} | "
-            f"git_sha={receipt['git_sha']} | data_tiers_used={receipt['data_tiers_used']}"
+            f"git_sha={receipt['git_sha']} | headline_policy={receipt['headline_policy']} | "
+            f"headline_log10_bf={_fmt(receipt['headline_log10_bf'], '+.6g')} | "
+            f"data_tiers_used={receipt['data_tiers_used']}"
         )
     )
 
@@ -490,38 +559,66 @@ def queue_seed(db: DbOpt = None, root: Root = None) -> None:
 
 @queue_app.command("list")
 def queue_list(db: DbOpt = None, root: Root = None) -> None:
-    """List jobs ranked by EIG per hour of compute + review."""
+    """List the Tier-1 archival queue (by EIG bits/hr) and Tier-0 compute queue (by priority)."""
     _, store = _store(db, root)
-    rows = store.list()
+    archival, compute = store.list_archival(), store.list_compute()
     t = _table(
-        "BOED action queue (ranked by EIG bits / (cpu hours + reviewer hours))",
+        "Tier-1 Archival Queue (ranked by EIG bits / (cpu hours + reviewer hours))",
         (
+            "rank",
             "job_id",
-            "tier",
             "status",
             "EIG [bits]",
             "cpu [s]",
             "review [min]",
             "bits/hour",
-            "output_sha256",
+            "archival script",
             "source",
         ),
     )
-    for r in rows:
+    for i, r in enumerate(archival, 1):
         t.add_row(
+            str(i),
             r["job_id"],
-            r["tier"],
             r["status"],
             f"{r['expected_eig_bits']:.4g}",
             f"{r['est_cpu_seconds']:.0f}",
             f"{r['est_reviewer_minutes']:.0f}",
             f"{r['utility_bits_per_hour']:.4g}",
-            (r["output_sha256"] or "-")[:16],
+            escape(r["archival_script"] or "-"),
             escape(r["source"]),
         )
     console.print(t)
-    for r in rows:
+    for r in archival:
         console.print(escape(f"  {r['job_id']}: prior={r['eig_prior_json']} | {r['eig_basis']}"))
+    t = _table(
+        "Tier-0 Compute Queue (ranked by diagnostic priority; EIG = 0 bits by construction)",
+        (
+            "priority",
+            "job_id",
+            "status",
+            "EIG [bits]",
+            "cpu [s]",
+            "review [min]",
+            "diagnostic impact",
+            "output_sha256",
+        ),
+        first_no_wrap=True,
+    )
+    for r in compute:
+        t.add_row(
+            "-" if r["diagnostic_priority"] is None else str(r["diagnostic_priority"]),
+            r["job_id"],
+            r["status"],
+            f"{r['expected_eig_bits']:.4g}",
+            f"{r['est_cpu_seconds']:.0f}",
+            f"{r['est_reviewer_minutes']:.0f}",
+            escape(r["diagnostic_impact"] or "-"),
+            (r["output_sha256"] or "-")[:16],
+        )
+    console.print(t)
+    for r in compute:
+        console.print(escape(f"  {r['job_id']}: source={r['source']}"))
     store.close()
 
 
@@ -619,8 +716,8 @@ def _summarise_job(job_id: str, res: dict) -> None:
                 "E[N|E unr] A",
                 "E[N|E unr] B",
                 "log10 BF radio",
-                "log10 BF joint",
-                "joint excl. illustr.",
+                "log10 BF joint (incl. illustr.)",
+                "HEADLINE (verified)",
                 "local A",
                 "local B",
             ),
@@ -636,7 +733,7 @@ def _summarise_job(job_id: str, res: dict) -> None:
                 f"{hb['expected_reached_given_earth_unreached']:.4g}",
                 _fmt(r["log10_bf_radio"], "+.4g"),
                 _fmt(r["log10_bf_joint"], "+.4g"),
-                _fmt(r["log10_bf_joint_excluding_illustrative"], "+.4g"),
+                _fmt(r["log10_bf_headline_verified"], "+.4g"),
                 ha["local_approx"],
                 hb["local_approx"],
             )

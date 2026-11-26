@@ -39,6 +39,7 @@ def test_cutout_spec_requires_angle_quantities():
         hephaistos.CutoutSpec(sigma_sys=0.5 * u.pc)
 
 
+@pytest.mark.slow
 def test_recovery_grows_with_separation_and_flux_fraction(grid):
     for rec in (grid.centroid_recovery, grid.image_recovery):
         by_sep = rec.mean(axis=1)
@@ -48,12 +49,14 @@ def test_recovery_grows_with_separation_and_flux_fraction(grid):
         assert np.all(rec[:, 1] >= rec[:, 0] - 0.1)
 
 
+@pytest.mark.slow
 def test_blend_free_false_alarm_rates_are_calibrated(grid, spec):
     # Empirical false-alarm rate (n = 400) stays near the nominal 0.27%.
     for fa in (grid.centroid_false_alarm, grid.image_false_alarm):
         assert fa <= 5 * spec.false_alarm + 3 * np.sqrt(spec.false_alarm / 400)
 
 
+@pytest.mark.slow
 def test_grid_is_seed_deterministic(spec):
     a = hephaistos.blend_recovery_grid(spec, SEPS, FRACS, 8, np.random.default_rng(11))
     b = hephaistos.blend_recovery_grid(spec, SEPS, FRACS, 8, np.random.default_rng(11))
@@ -62,6 +65,7 @@ def test_grid_is_seed_deterministic(spec):
         hephaistos.blend_recovery_grid(spec, SEPS, FRACS, 8, 11)
 
 
+@pytest.mark.slow
 def test_zero_blend_survival_and_screened_calibration(grid):
     s = hephaistos.blend_survival(grid, "centroid", 3.25 * u.arcsec)
     assert 0.0 <= s <= 1.0
@@ -89,6 +93,7 @@ def test_published_d_e_centroid_verdicts_reproduce(graph, spec):
     assert rows["E"]["shift_tension_sigma"] > 2.0  # extended galaxy (E) is a reported tension
 
 
+@pytest.mark.slow
 def test_drilldown_contamination_scenarios_bracket_the_preference(graph):
     rec = run_ir_drilldown(
         graph, seed=3, pair=("quiet_expanders", "partial_dyson_conspicuous"), n_trials=6
@@ -105,3 +110,49 @@ def test_drilldown_contamination_scenarios_bracket_the_preference(graph):
         graph, seed=3, pair=("quiet_expanders", "partial_dyson_conspicuous"), n_trials=6
     )
     assert again["results_sha256"] == rec["results_sha256"]
+
+
+# ------------------------------------------- empirical registration-floor estimators
+def _controls(n, sys_arcsec, seed=11):
+    rng = np.random.default_rng(seed)
+    s = rng.uniform(0.15, 0.4, n)
+    scale = np.hypot(s, sys_arcsec)
+    r = np.hypot(rng.normal(0, scale), rng.normal(0, scale))
+    return r, s
+
+
+def test_sigma_sys_estimators_recover_injected_floor():
+    r, s = _controls(3000, 0.3)
+    for name, fn in hephaistos.SIGMA_SYS_ESTIMATORS.items():
+        est = fn(r * u.arcsec, s * u.arcsec).to_value(u.arcsec)
+        assert est == pytest.approx(0.3, abs=0.03), name
+    r0, s0 = _controls(3000, 0.0)
+    assert hephaistos.sigma_sys_robust(r0 * u.arcsec, s0 * u.arcsec).to_value(u.arcsec) < 0.05
+
+
+def test_robust_floor_resists_unseen_blend_outliers():
+    r, s = _controls(1000, 0.3)
+    r[:20] = 6.4  # 2% background-source "controls" like the seed-7 smoke-test star
+    robust = hephaistos.sigma_sys_robust(r * u.arcsec, s * u.arcsec).to_value(u.arcsec)
+    mle = hephaistos.sigma_sys_mle(r * u.arcsec, s * u.arcsec).to_value(u.arcsec)
+    assert robust == pytest.approx(0.3, abs=0.04)
+    assert mle > 0.5  # the non-robust estimator is inflated, which would blind the screen
+
+
+def test_centroid_false_alarm_is_calibrated_and_unit_safe():
+    r, s = _controls(4000, 0.3)
+    out = hephaistos.centroid_screen_false_alarms(r * u.arcsec, s * u.arcsec, 0.3 * u.arcsec)
+    lo, hi = out["clopper_pearson_95"]
+    assert lo <= hephaistos.RAYLEIGH_3SIGMA_FALSE_ALARM <= hi
+    assert out["ks_rayleigh_p_value"] > 1e-3
+    loose = hephaistos.centroid_screen_false_alarms(r * u.arcsec, s * u.arcsec, 0.0 * u.arcsec)
+    assert loose["n_flagged"] > out["n_flagged"]  # ignoring the floor inflates false alarms
+    with pytest.raises(UnitValidationError):
+        hephaistos.sigma_sys_robust(r, s * u.arcsec)
+    boot = hephaistos.sigma_sys_bootstrap(
+        r[:200] * u.arcsec, s[:200] * u.arcsec, np.random.default_rng(3), 50
+    )
+    again = hephaistos.sigma_sys_bootstrap(
+        r[:200] * u.arcsec, s[:200] * u.arcsec, np.random.default_rng(3), 50
+    )
+    assert np.array_equal(boot, again)

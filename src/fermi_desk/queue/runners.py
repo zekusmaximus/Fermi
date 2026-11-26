@@ -80,7 +80,9 @@ def run_lookback_window_t_sweep(graph: FactorGraph, p: Mapping, seed: int) -> di
                     "log10_bf_radio": hl["log10_bf_by_term"].get("radio"),
                     "log10_bf_joint": hl["log10_bf"],
                     "log10_bf_joint_excluding_illustrative": hl["log10_bf_excluding_illustrative"],
+                    "log10_bf_headline_verified": hl["verified"]["log10_bf"],
                     "bf_terms": hl["terms"],
+                    "headline_verified_terms": hl["verified"]["terms"],
                 }
             )
     return {"pair": [a, b], "t_grid_gyr": t_grid.tolist(), "thresholds": thresholds, "rows": rows}
@@ -108,6 +110,7 @@ def run_disk_scale_height_sweep(graph: FactorGraph, p: Mapping, seed: int) -> di
                 },
                 "log10_bf_by_term": res["headline"]["log10_bf_by_term"],
                 "log10_bf_joint": res["headline"]["log10_bf"],
+                "log10_bf_headline_verified": res["headline"]["verified"]["log10_bf"],
             }
         )
     return {"pair": [a, b], "rows": rows}
@@ -175,6 +178,68 @@ TIER0_RUNNERS: dict[str, Callable[[FactorGraph, Mapping, int], dict]] = {
     "disk_scale_height_sweep": run_disk_scale_height_sweep,
     "eirp_luminosity_function_sweep": run_eirp_luminosity_function_sweep,
     "hephaistos_blend_recovery_grid": run_hephaistos_blend_recovery_grid,
+}
+
+
+# ------------------------------------------- Tier-0 diagnostic-impact statements
+# Each statement is COMPUTED from the job parameters and the registry, so it cannot
+# drift from what the job actually sweeps. Tier-0 EIG stays exactly 0 bits.
+def _span(values, fmt: str = ".3g") -> str:
+    lo, hi = min(values), max(values)
+    return f"{lo:{fmt}}-{hi:{fmt}}"
+
+
+def _duration(t_gyr: float) -> str:
+    return f"{t_gyr * 1e6:.3g} kyr" if t_gyr < 1e-3 else f"{t_gyr * 1e3:.3g} Myr"
+
+
+def diagnose_lookback_window_t_sweep(graph: FactorGraph, p: Mapping) -> str:
+    cut = []
+    for hid in p["pair"]:
+        v = resolve_parameters(graph, graph.hypotheses[hid], 33).value("expansion_speed_c")
+        cut.append(f"{_duration(LOCAL_VALIDITY_KPC / (v * C_KPC_PER_GYR))} ({hid}, v_exp={v:g} c)")
+    return (
+        f"Exposes the local infinite-disk validity cutoff T_valid = {LOCAL_VALIDITY_KPC:g} kpc / "
+        f"v_exp: {'; '.join(cut)}; and the headline BF sensitivity across T = "
+        f"{_duration(float(p['t_min_gyr']))}-{_duration(float(p['t_max_gyr']))} in "
+        f"{' and '.join(p['geometries'])}"
+    )
+
+
+def diagnose_hephaistos_blend_recovery_grid(graph: FactorGraph, p: Mapping) -> str:
+    return (
+        f"Maps centroid vs. image-level blend recovery over theta = "
+        f"{_span(p['separations_arcsec'])} arcsec x f_bg = {_span(p['flux_fractions'])} at W3 "
+        f"SNR {p['snr']:g}, sigma_sys {p['sigma_sys_arcsec']:g} arcsec; fixes the blend-survival "
+        "and false-alarm rates that turn the illustrative IR false-positive bracket into "
+        "screened calibrations"
+    )
+
+
+def diagnose_disk_scale_height_sweep(graph: FactorGraph, p: Mapping) -> str:
+    h0 = graph.registry.get("disk_scale_height_pc").default
+    return (
+        f"Measures thick_disk_3d headline BF sensitivity to the scale height h_z = "
+        f"{_span(p['scale_heights_pc'], '.0f')} pc (registry default {h0:g} pc), the scale at "
+        "which the 2D Gamma*v^2 degeneracy of the benchmark pair breaks"
+    )
+
+
+def diagnose_eirp_luminosity_function_sweep(graph: FactorGraph, p: Mapping) -> str:
+    m0 = graph.registry.get("transmitter_eirp_median_w").default
+    s0 = graph.registry.get("transmitter_eirp_sigma_dex").default
+    return (
+        f"Bounds how far the illustrative log-normal transmitter EIRP luminosity function "
+        f"(median {_span(p['medians_w'], '.0e')} W, sigma {_span(p['sigmas_dex'], 'g')} dex; "
+        f"registry default {m0:.0e} W, {s0:g} dex) moves the distance_scaled_eirp radio BF"
+    )
+
+
+TIER0_DIAGNOSTICS: dict[str, Callable[[FactorGraph, Mapping], str]] = {
+    "lookback_window_t_sweep": diagnose_lookback_window_t_sweep,
+    "disk_scale_height_sweep": diagnose_disk_scale_height_sweep,
+    "eirp_luminosity_function_sweep": diagnose_eirp_luminosity_function_sweep,
+    "hephaistos_blend_recovery_grid": diagnose_hephaistos_blend_recovery_grid,
 }
 
 
@@ -286,7 +351,8 @@ def tier0_eig() -> eig.EIGResult:
         prior={"type": "none"},
         basis=(
             "Tier-0 compute job: no new observational data enter, so I(H; output) = 0 exactly; "
-            "value is diagnostic (model sensitivity), not information about hypotheses"
+            "value is diagnostic (see diagnostic_impact / diagnostic_priority), not information "
+            "about hypotheses"
         ),
         details={},
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sqlite3
 from dataclasses import replace
 
 import numpy as np
@@ -11,7 +12,13 @@ import pytest
 from fermi_desk.errors import QueueStateError
 from fermi_desk.inference import eig
 from fermi_desk.models.expansion import C_KPC_PER_GYR
-from fermi_desk.queue.store import JOB_DEFINITIONS, JobStore, compute_job_eig, execute_job
+from fermi_desk.queue.store import (
+    JOB_DEFINITIONS,
+    JobStore,
+    compute_job_diagnostic,
+    compute_job_eig,
+    execute_job,
+)
 
 SMALL = {
     "lookback_window_t_sweep": {
@@ -132,7 +139,13 @@ def test_state_machine_guards(store, graph, tmp_path):
         store.replay(graph, "disk_scale_height_sweep", tmp_path)  # never run
 
 
-@pytest.mark.parametrize("job_id", sorted(SMALL))
+SLOW_REPLAYS = {"lookback_window_t_sweep", "disk_scale_height_sweep"}
+
+
+@pytest.mark.parametrize(
+    "job_id",
+    [pytest.param(j, marks=pytest.mark.slow) if j in SLOW_REPLAYS else j for j in sorted(SMALL)],
+)
 def test_every_tier0_job_replays_with_identical_hash(store, graph, tmp_path, job_id):
     store.claim(job_id, "tester")
     out = store.run(graph, job_id, 42, tmp_path)
@@ -171,3 +184,62 @@ def test_seed_changes_monte_carlo_job_output(graph):
     a = execute_job(graph, job.job_id, job.parameters, 1)
     b = execute_job(graph, job.job_id, job.parameters, 2)
     assert a["output_sha256"] != b["output_sha256"]
+
+
+# ------------------------------------------- Tier-0 diagnostics vs. Tier-1 EIG
+def test_tier0_jobs_carry_diagnostic_impact_but_zero_eig(store, graph):
+    compute, archival = store.list_compute(), store.list_archival()
+    assert {r["tier"] for r in compute} == {"0_compute"} and len(compute) == 4
+    assert {r["tier"] for r in archival} == {"1_archival"} and len(archival) == 2
+    for r in compute:
+        assert r["expected_eig_bits"] == 0.0  # never fabricate sky-photon bits
+        assert r["diagnostic_impact"] and r["diagnostic_priority"] >= 1
+        assert "INFERRED" not in r["source"]
+    priorities = [r["diagnostic_priority"] for r in compute]
+    assert priorities == sorted(priorities) and len(set(priorities)) == len(priorities)
+    for r in archival:
+        assert r["diagnostic_impact"] is None and r["diagnostic_priority"] is None
+    u = [r["utility_bits_per_hour"] for r in archival]
+    assert u == sorted(u, reverse=True)
+    # The lookback statement is computed from the hypotheses: T_valid = 8 kpc / v_exp.
+    lb = next(r for r in compute if r["job_id"] == "lookback_window_t_sweep")
+    t_fast = 8.0 / (0.5 * C_KPC_PER_GYR) * 1e6  # kyr
+    assert f"{t_fast:.3g} kyr" in lb["diagnostic_impact"]
+
+
+def test_tier0_job_without_priority_is_refused(graph):
+    job = next(j for j in JOB_DEFINITIONS if j.tier == "0_compute")
+    with pytest.raises(QueueStateError):
+        compute_job_diagnostic(graph, replace(job, diagnostic_priority=None))
+    arch = next(j for j in JOB_DEFINITIONS if j.tier == "1_archival")
+    with pytest.raises(QueueStateError):
+        compute_job_diagnostic(graph, replace(arch, diagnostic_priority=1))
+
+
+def test_pre_milestone_2p5_queue_is_migrated_in_place(tmp_path, graph):
+    path = tmp_path / "old.sqlite"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, tier TEXT, title TEXT, target_module TEXT, "
+        "parameters_json TEXT, expected_eig_bits REAL, eig_prior_json TEXT, eig_basis TEXT, "
+        "eig_details_json TEXT, est_cpu_seconds REAL, est_reviewer_minutes REAL, "
+        "utility_bits_per_hour REAL, status TEXT, source TEXT, archival_script TEXT, "
+        "claimed_by TEXT, claimed_at TEXT, code_git_sha TEXT, rng_seed INTEGER, "
+        "output_sha256 TEXT, output_path TEXT, rejection_reason TEXT, created_at TEXT, "
+        "completed_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO jobs (job_id, tier, title, target_module, parameters_json, "
+        "expected_eig_bits, eig_prior_json, eig_basis, eig_details_json, est_cpu_seconds, "
+        "est_reviewer_minutes, utility_bits_per_hour, status, source, created_at, output_sha256) "
+        "VALUES ('lookback_window_t_sweep', '0_compute', 't', 'm', '{}', 0, '{}', 'b', '{}', "
+        "1, 1, 0, 'completed', 'old', 'now', 'abc')"
+    )
+    con.commit()
+    con.close()
+    s = JobStore(path)
+    s.seed(graph, small_jobs())
+    row = s.get("lookback_window_t_sweep")
+    assert row["status"] == "completed" and row["output_sha256"] == "abc"  # untouched
+    assert row["diagnostic_priority"] == 1 and row["diagnostic_impact"]
+    s.close()

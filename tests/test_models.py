@@ -59,6 +59,7 @@ def test_light_travel_delay_hides_targets_beyond_ct():
     assert lam[0] > 0 and lam[1] == 0.0
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("geometry", ["thin_disk_2d", "thick_disk_3d"])
 @pytest.mark.parametrize(("gamma", "v"), [(4.0, 0.005), (4e-4, 0.5)])
 def test_quadrature_matches_correlated_monte_carlo(geometry, gamma, v, small_targets):
@@ -75,6 +76,7 @@ def test_quadrature_matches_correlated_monte_carlo(geometry, gamma, v, small_tar
     assert abs(mc.mc_expected_reached - quad) < 4 * mc.mc_expected_reached_se + 1e-3 * quad
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("geometry", ["thin_disk_2d", "thick_disk_3d"])
 @pytest.mark.parametrize("conditioned", [True, False])
 def test_exact_p0_respects_fkg_and_markov_bounds(geometry, conditioned, bl_targets):
@@ -207,6 +209,7 @@ def test_compare_replay_is_byte_identical(tmp_path):
     assert "published_catalog" in a["data_tiers_used"]
 
 
+@pytest.mark.slow
 def test_seed_actually_drives_monte_carlo(tmp_path):
     a = _run_cli(tmp_path, "s1", seed=1)
     b = _run_cli(tmp_path, "s2", seed=2)

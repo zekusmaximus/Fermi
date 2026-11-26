@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import itertools
+import json
 
 import astropy.units as u
 import numpy as np
 import pytest
+from typer.testing import CliRunner
 
-from conftest import frac, rate
+from conftest import ROOT, frac, rate
+from fermi_desk.cli import app
 from fermi_desk.errors import DoubleCountingError, GeometryError, UnitValidationError
-from fermi_desk.inference.engine import RunConfig, build_context, evaluate_hypothesis
+from fermi_desk.inference.engine import (
+    HEADLINE_VERIFIED,
+    HEADLINE_WITH_ILLUSTRATIVE,
+    ILLUSTRATIVE_TIERS,
+    RunConfig,
+    build_context,
+    evaluate_hypothesis,
+    run_comparison,
+)
 from fermi_desk.models import infrared, radio
 from fermi_desk.models.expansion import C_KPC_PER_GYR, ExpansionModel
 from fermi_desk.registry import FactorGraph, TargetTable, check_pointing_groups
@@ -96,7 +107,9 @@ def test_zero_ir_conspicuousness_gives_unit_likelihood_ratio(graph, host):
 
 
 # ------------------------------------------------------- analytical boundary limits
-@pytest.mark.parametrize("geometry", ["thin_disk_2d", "thick_disk_3d"])
+@pytest.mark.parametrize(
+    "geometry", ["thin_disk_2d", pytest.param("thick_disk_3d", marks=pytest.mark.slow)]
+)
 def test_expected_reached_vanishes_as_speed_goes_to_zero(geometry, bl_targets):
     vals = {c: [] for c in (True, False)}
     for v in (1e-2, 1e-4, 1e-6, 1e-8, 0.0):
@@ -215,3 +228,78 @@ def test_conditioned_run_never_reapplies_earth_factor_via_solar_system(graph):
     assert out["components"]["solar_system"]["log10_p_data_given_h"] == 0.0
     assert "earth_unreached" in out["components"]
     assert "radio+solar_system" not in out["components"]
+
+
+# ------------------------------------- illustrative channels vs. the headline BF
+def _compare(tmp_path, sub, *extra):
+    out = tmp_path / sub
+    args = ["compare", "--geometry", "thin_disk_2d", "--radio-mode", "flat_probability"]
+    args += ["--seed", "42", "--n-mc", "200", "--out-dir", str(out), "--root", str(ROOT), *extra]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    (path,) = list(out.glob("*.json"))
+    return json.loads(path.read_text()), result.output
+
+
+def test_default_headline_bf_excludes_illustrative_channels(tmp_path):
+    """Milestone 2.5 ruling: default headline = verified channels; opt-in folds the rest in."""
+    rec, text = _compare(tmp_path, "default")
+    bf = rec["results"]["headline"]
+    head = bf["headline"]
+    assert rec["headline_policy"] == head["policy"] == HEADLINE_VERIFIED
+    assert head["terms"] == ["earth_unreached", "radio"]
+    assert {"infrared", "solar_system"} <= set(head["excluded_illustrative_channels"])
+    assert not any(t in ILLUSTRATIVE_TIERS for t in head["data_tiers"])
+    assert rec["headline_log10_bf"] == head["log10_bf"]
+    assert head["log10_bf"] == pytest.approx(
+        sum(bf["log10_bf_by_term"][t] for t in ("earth_unreached", "radio")), abs=1e-15
+    )
+    # Infrared stays active in the engine, tagged with its tier in the per-component table.
+    ir = rec["results"]["hypotheses"]["frequent_slow_expanders"]["components"]["infrared"]
+    assert "illustrative_calibration" in ir["data_tiers"]
+    assert "infrared" in bf["terms"] and "infrared" in bf["illustrative_terms"]
+    assert "ILLUSTRATIVE CHANNELS FOLDED" not in text
+
+    inc, text_inc = _compare(tmp_path, "included", "--include-illustrative")
+    bf_i = inc["results"]["headline"]
+    head_i = bf_i["headline"]
+    assert inc["headline_policy"] == head_i["policy"] == HEADLINE_WITH_ILLUSTRATIVE
+    assert "infrared" in head_i["terms"] and "infrared" in head_i["includes_illustrative_channels"]
+    assert head_i["log10_bf"] == bf_i["log10_bf"] and head_i["warning"]
+    assert "ILLUSTRATIVE CHANNELS FOLDED" in text_inc
+    # Same seed, same components: the flag changes only which terms the headline sums.
+    assert inc["results"]["hypotheses"] == rec["results"]["hypotheses"]
+    extra = sum(bf_i["log10_bf_by_term"][t] for t in bf_i["illustrative_terms"])
+    assert head_i["log10_bf"] - head["log10_bf"] == pytest.approx(extra, abs=1e-12)
+
+
+def test_verified_headline_uses_radio_marginal_without_earth_conditioning(graph):
+    """Unconditioned runs evaluate radio+solar_system jointly; the verified headline must
+    fall back to the radio marginal rather than silently dropping radio."""
+    cfg = RunConfig(
+        geometry="thin_disk_2d",
+        radio_mode="flat_probability",
+        seed=5,
+        n_mc=200,
+        condition_on_earth_unreached=False,
+        headline_pair=("frequent_slow_expanders", "rare_fast_expanders"),
+    )
+    bf = run_comparison(graph, cfg, list(cfg.headline_pair))["results"]["headline"]
+    assert "radio+solar_system" in bf["terms"]
+    assert bf["headline"]["terms"] == ["radio"]
+    assert "radio+solar_system" in bf["illustrative_terms"]
+
+
+def test_distance_scaled_radio_is_illustrative_and_leaves_headline(graph):
+    """The transmitter luminosity function is illustrative, so distance_scaled_eirp radio
+    leaves the verified headline (only the Earth-unreached term remains)."""
+    cfg = RunConfig(
+        geometry="thin_disk_2d",
+        radio_mode="distance_scaled_eirp",
+        seed=5,
+        n_mc=200,
+        headline_pair=("frequent_slow_expanders", "rare_fast_expanders"),
+    )
+    head = run_comparison(graph, cfg, list(cfg.headline_pair))["results"]["headline"]["headline"]
+    assert "radio" in head["excluded_illustrative_channels"]
+    assert head["terms"] == ["earth_unreached"]

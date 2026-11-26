@@ -62,6 +62,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "network: marks tests requiring live external archive access (excluded from offline CI)",
+    "slow: multi-second Monte Carlo / blend-grid tests; skip with -m \"not slow\" for fast iteration (core-invariant tests are never marked slow)",
 ]
 
 [tool.ruff]

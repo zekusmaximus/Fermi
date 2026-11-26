@@ -4,6 +4,12 @@ Schema follows SPEC.md Sec. 4.4 (job_id, tier, title, target_module,
 parameters_json, expected_eig_bits + prior, est_cpu_seconds,
 est_reviewer_minutes, status, code_git_sha, rng_seed, output_sha256,
 created_at) plus claim / replay bookkeeping in an ``executions`` table.
+
+Milestone 2.5: Tier-0 compute jobs keep ``expected_eig_bits = 0`` exactly (they add
+no sky photons) and instead carry ``diagnostic_impact`` (what model uncertainty or
+validity boundary the job resolves, computed from its parameters) and
+``diagnostic_priority`` (rank among compute jobs, 1 = first). Tier-1 archival jobs
+are ranked by EIG bits per hour and carry neither diagnostic field.
 """
 
 from __future__ import annotations
@@ -34,10 +40,13 @@ class JobDefinition:
     parameters: dict
     est_cpu_seconds: float
     est_reviewer_minutes: float
-    source: str  # where the job comes from (SPEC / planning / INFERRED)
+    source: str  # where the job comes from (SPEC section / milestone brief)
     archival_script: str | None = None
     notes: str = ""
     tags: tuple[str, ...] = field(default_factory=tuple)
+    # Tier-0 only: rank among compute jobs (1 = resolve first). Tier-0 jobs carry no
+    # observational EIG, so they are ranked by what model-validity question they settle.
+    diagnostic_priority: int | None = None
 
 
 JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
@@ -87,7 +96,8 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         },
         est_cpu_seconds=10.0,
         est_reviewer_minutes=20.0,
-        source="INFERRED (docs/MILESTONE_2.md B3)",
+        source="docs/MILESTONE_2.md B3 (registered jobs table)",
+        diagnostic_priority=2,
     ),
     JobDefinition(
         job_id="disk_scale_height_sweep",
@@ -103,7 +113,8 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         },
         est_cpu_seconds=30.0,
         est_reviewer_minutes=15.0,
-        source="INFERRED (docs/MILESTONE_2.md B3)",
+        source="docs/MILESTONE_2.md B3 (registered jobs table)",
+        diagnostic_priority=3,
     ),
     JobDefinition(
         job_id="eirp_luminosity_function_sweep",
@@ -119,7 +130,8 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         },
         est_cpu_seconds=30.0,
         est_reviewer_minutes=15.0,
-        source="INFERRED (docs/MILESTONE_2.md B3)",
+        source="docs/MILESTONE_2.md B3 (registered jobs table)",
+        diagnostic_priority=4,
     ),
     JobDefinition(
         job_id="lookback_window_t_sweep",
@@ -138,7 +150,8 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         },
         est_cpu_seconds=120.0,
         est_reviewer_minutes=15.0,
-        source="planning agent Milestone 2 assignment (6th job)",
+        source="docs/MILESTONE_2.md B3 (planning-specified 6th job)",
+        diagnostic_priority=1,
     ),
 )
 
@@ -156,6 +169,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     est_cpu_seconds REAL NOT NULL,
     est_reviewer_minutes REAL NOT NULL,
     utility_bits_per_hour REAL NOT NULL,
+    diagnostic_impact TEXT,
+    diagnostic_priority INTEGER,
     status TEXT NOT NULL CHECK (status IN ('open', 'claimed', 'completed', 'rejected')),
     source TEXT NOT NULL,
     archival_script TEXT,
@@ -180,6 +195,9 @@ CREATE TABLE IF NOT EXISTS executions (
     created_at TEXT NOT NULL
 );
 """
+# Columns added after the first released schema: (name, SQL type). Old databases are
+# migrated in place with ALTER TABLE so existing rows keep their status and hashes.
+MIGRATED_COLUMNS = (("diagnostic_impact", "TEXT"), ("diagnostic_priority", "INTEGER"))
 
 
 def _now() -> str:
@@ -190,6 +208,19 @@ def compute_job_eig(graph: FactorGraph, job: JobDefinition):
     if job.tier == "0_compute":
         return runners.tier0_eig()
     return runners.ARCHIVAL_EIG[job.job_id](graph, job.parameters)
+
+
+def compute_job_diagnostic(graph: FactorGraph, job: JobDefinition) -> tuple[str | None, int | None]:
+    """(diagnostic_impact, diagnostic_priority); both None for Tier-1 archival jobs."""
+    if job.tier != "0_compute":
+        if job.diagnostic_priority is not None:
+            raise QueueStateError(f"{job.job_id}: Tier-1 jobs are ranked by EIG, not priority")
+        return None, None
+    if job.diagnostic_priority is None or job.diagnostic_priority < 1:
+        raise QueueStateError(f"{job.job_id}: Tier-0 job needs diagnostic_priority >= 1")
+    if job.job_id not in runners.TIER0_DIAGNOSTICS:
+        raise QueueStateError(f"{job.job_id}: Tier-0 job has no diagnostic_impact statement")
+    return runners.TIER0_DIAGNOSTICS[job.job_id](graph, job.parameters), job.diagnostic_priority
 
 
 def execute_job(graph: FactorGraph, job_id: str, parameters: Mapping, seed: int) -> dict:
@@ -213,6 +244,11 @@ class JobStore:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(jobs)")}
+        for name, sql_type in MIGRATED_COLUMNS:
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sql_type}")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -225,13 +261,23 @@ class JobStore:
         inserted = []
         for job in jobs:
             if self.get(job.job_id) is not None:
+                # Backfill registration metadata on rows created before Milestone 2.5;
+                # status, seeds and output hashes are never touched.
+                impact, priority = compute_job_diagnostic(graph, job)
+                self.conn.execute(
+                    "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, source=? "
+                    "WHERE job_id=?",
+                    (impact, priority, job.source, job.job_id),
+                )
                 continue
             res = compute_job_eig(graph, job)
+            impact, priority = compute_job_diagnostic(graph, job)
             self.conn.execute(
                 """INSERT INTO jobs (job_id, tier, title, target_module, parameters_json,
                 expected_eig_bits, eig_prior_json, eig_basis, eig_details_json, est_cpu_seconds,
-                est_reviewer_minutes, utility_bits_per_hour, status, source, archival_script,
-                created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)""",
+                est_reviewer_minutes, utility_bits_per_hour, diagnostic_impact,
+                diagnostic_priority, status, source, archival_script, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?)""",
                 (
                     job.job_id,
                     job.tier,
@@ -245,6 +291,8 @@ class JobStore:
                     job.est_cpu_seconds,
                     job.est_reviewer_minutes,
                     utility_bits_per_hour(res.bits, job.est_cpu_seconds, job.est_reviewer_minutes),
+                    impact,
+                    priority,
                     job.source,
                     job.archival_script,
                     _now(),
@@ -268,6 +316,22 @@ class JobStore:
     def list(self) -> list[dict]:
         rows = self.conn.execute(
             "SELECT * FROM jobs ORDER BY utility_bits_per_hour DESC, job_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_archival(self) -> list[dict]:
+        """Tier-1 archival queue, ranked by EIG bits per hour of compute + review."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE tier = '1_archival' "
+            "ORDER BY utility_bits_per_hour DESC, job_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_compute(self) -> list[dict]:
+        """Tier-0 compute queue, ranked by diagnostic priority (1 first)."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE tier = '0_compute' "
+            "ORDER BY diagnostic_priority IS NULL, diagnostic_priority ASC, job_id ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 

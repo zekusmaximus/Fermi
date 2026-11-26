@@ -3,9 +3,14 @@
 > **Provenance of this brief.** No `docs/MILESTONE_2.md` existed when Milestone 2
 > was assigned. This file was drafted on 2026-11-25 by the implementing agent, with
 > the user's approval, from (a) `SPEC.md` §4.4 and §5 and (b) the planning
-> agent's Milestone 2 assignment message. Every item not literally present in
-> one of those two sources is tagged **`INFERRED`** and needs planning-agent
-> approval before Milestone 3 relies on it.
+> agent's Milestone 2 assignment message. Items not literally present in those two
+> sources were originally tagged `INFERRED`.
+>
+> **Status (Milestone 2.5 audit closeout, 2026-11-26): FINAL.** The planning agent
+> approved every formerly-`INFERRED` item; the tags have been removed and this brief
+> is now an authoritative source (cited as `docs/MILESTONE_2.md` by
+> `src/fermi_desk/queue/store.py`). Later policy rulings are recorded in
+> `docs/MILESTONE_2_5.md` and `SPEC.md`.
 
 ## Objective
 Add the three Milestone 2 verticals of `SPEC.md` §5: an image-level mid-IR
@@ -34,12 +39,12 @@ Also land the approved Milestone 1 spec rulings (Part A).
    physics. When an expansion hypothesis activates `infrared`, `inference/engine.py`
    derives `f_ir_host = P(star reached) × f_ir_loud` and passes it into
    `models/infrared.py` (zero-emission invariance preserved at `f_ir_loud = 0`).
-   - `INFERRED` detail: `P(star reached)` is the mean reach probability (under
+   - Approved detail: `P(star reached)` is the mean reach probability (under
      the run's Earth-unreached setting) over a deterministic lattice filling the
      IR survey footprint (Hephaistos: stars within 300 pc, Suazo et al. 2024 §2.1).
      Expansion hypotheses must not also declare `ir_host_fraction`; hypotheses
      without expansion parameters (e.g. `partial_dyson_conspicuous`) still declare it.
-   - `INFERRED`: `frequent_slow_expanders` / `rare_fast_expanders` activate
+   - Approved: `frequent_slow_expanders` / `rare_fast_expanders` activate
      `infrared` with `ir_conspicuous_fraction` range [0.01, 0.5], taken from the
      `SPEC.md` §4.2 example.
 5. HIP 1692: Gaia DR3 (788.71 pc, ~1,176× EIRP_min) stays canonical in
@@ -62,7 +67,7 @@ vs. background flux fraction), anchored on Project Hephaistos Candidates D and E
 - Seeded injection–recovery on simulated WISE W3 cutouts with Gaussian PSFs.
   Each trial injects star + background point source (separation θ, W3 flux
   fraction f_bg), Gaussian pixel noise at a stated W3 SNR, and an astrometric
-  registration error with dispersion `sigma_sys`. `INFERRED`: Gaussian PSF
+  registration error with dispersion `sigma_sys`. Approved: Gaussian PSF
   (FWHM 6.5″ for W3) and 1.375″ pixels, from Ren et al. 2026 Table 2 and the AllWISE
   Atlas pixel scale.
 - Two screens, each with a stated false-alarm rate:
@@ -87,7 +92,7 @@ vs. background flux fraction), anchored on Project Hephaistos Candidates D and E
   The drill-down reports whether the centroid screen is predicted to catch each
   anchor and compares that with the published outcome (D: no centroid evidence;
   E: marginal).
-- `INFERRED`: the drill-down recomputes LR[quiet_expanders : partial_dyson_conspicuous]
+- Approved: the drill-down recomputes LR[quiet_expanders : partial_dyson_conspicuous]
   under unscreened / centroid-screened / image-screened false-positive rates for
   two published contamination scenarios (the Suazo 2024 2×10⁵-subsample
   convention and the Zackrisson 2026 full-sample critique).
@@ -101,9 +106,9 @@ vs. background flux fraction), anchored on Project Hephaistos Candidates D and E
   - report the change in the `distance_scaled_eirp` radio likelihood.
 - `audit_duplicate_pointings` (SPEC): cross-survey `pointing_group_id`
   collisions (with a detector self-test on an injected duplicate), duplicate
-  target names, and `INFERRED` beam-sharing target pairs closer than the GBT
+  target names, and beam-sharing target pairs closer than the GBT
   L-band FWHM.
-- `INFERRED` additional audits:
+- Approved additional audits:
   - Hephaistos D/E centroid-screen reproduction;
   - 2D-degeneracy / 3D-breaking check on the benchmark pair at current defaults;
   - local-approximation (v·T ≤ 8 kpc) violations;
@@ -121,17 +126,18 @@ vs. background flux fraction), anchored on Project Hephaistos Candidates D and E
   (or calibrations) and a job's discrete outcome. Count outcomes are evaluated
   exactly on a support truncated at tail mass < 1e-15, with the tail lumped into
   one outcome. Utility = bits / (cpu_hours + reviewer_hours).
-  - `INFERRED`: Tier-0 compute jobs add no observational data, so their EIG
-    about hypotheses is reported as exactly 0 bits; their value is diagnostic.
+  - Approved: Tier-0 compute jobs add no observational data, so their EIG
+    about hypotheses is reported as exactly 0 bits; their value is diagnostic
+    (Milestone 2.5: stated in the `diagnostic_impact` / `diagnostic_priority` columns).
 - Registered jobs:
 
 | job_id | tier | source |
 |---|---|---|
 | `wlodarczyk_sroka_288k_background_extension` | 1_archival | SPEC §5 |
 | `wise_independent_control_fields` | 1_archival | SPEC §5 |
-| `hephaistos_blend_recovery_grid` | 0_compute | **INFERRED** |
-| `disk_scale_height_sweep` | 0_compute | **INFERRED** |
-| `eirp_luminosity_function_sweep` | 0_compute | **INFERRED** |
+| `hephaistos_blend_recovery_grid` | 0_compute | this brief (approved) |
+| `disk_scale_height_sweep` | 0_compute | this brief (approved) |
+| `eirp_luminosity_function_sweep` | 0_compute | this brief (approved) |
 | `lookback_window_t_sweep` | 0_compute | planning-specified (6th job) |
 
 - `lookback_window_t_sweep`: log-spaced T from 5e-5 Gyr (50 kyr) to 1e-2 Gyr
@@ -147,7 +153,7 @@ vs. background flux fraction), anchored on Project Hephaistos Candidates D and E
 Fetches AllWISE W3 cutouts from NASA/IPAC IRSA for control positions and
 measures the empirical centroid-offset floor (`sigma_sys`). It is never imported
 or run by `pytest`, and writes a `reproduced_archive` receipt with query receipts.
-`INFERRED`: control positions are SNR-matched M dwarfs drawn from Gaia DR3 within
+Approved: control positions are SNR-matched M dwarfs drawn from Gaia DR3 within
 300 pc via the ARI TAP mirror.
 
 ## Mandatory CI additions
@@ -169,3 +175,27 @@ or run by `pytest`, and writes a `reproduced_archive` receipt with query receipt
 `ruff format --check`, `validate`, `compare` (thin_disk_2d / flat, seed 42),
 `ir-drilldown --seed 42`, `adversary run --seed 42`, and the queue lifecycle
 (seed, list, claim, run, replay with exact `output_sha256` match).
+
+---
+
+## Canonical baseline (locked at Milestone 2.5)
+The distance-preserving 2D projection fix (Milestone 2 adversary finding: fast fronts
+must reach high-latitude stars at their true distance) changed the thin-disk numbers.
+The post-fix values below are the **canonical baseline**; the pre-fix values are
+superseded. Command: `fermi-desk compare --geometry <g> --radio-mode flat_probability
+--seed 42` (n_mc = 20000, Earth-unreached conditioning on).
+
+| quantity | thin_disk_2d | thick_disk_3d |
+|---|---|---|
+| P(Earth reached), frequent_slow / rare_fast | 0.00979582 / 0.00979582 | 0.00945466 / 0.00979579 |
+| E[N reached \| Earth unreached] (BL 692), frequent_slow | 0.10073 | 0.0725544 |
+| E[N reached \| Earth unreached] (BL 692), rare_fast | 0.000348837 | 0.000179262 |
+| log10 BF term `earth_unreached` | -8.67e-19 (exact 2D degeneracy) | +1.49587e-04 |
+| log10 BF term `radio` | -8.04966e-05 | -5.3355e-05 |
+| log10 BF term `infrared` (illustrative, excluded from headline) | +0.128843 | +0.16936 |
+| **Headline log10 BF, verified channels only** (`earth_unreached + radio`) | **-8.04966e-05** | **+9.62322e-05** |
+| all shared terms incl. illustrative (`--include-illustrative`) | +0.128762 | +0.169457 |
+| `results_sha256` (seed 42) | `3bbdbc8e89f27fd4…` | `cd8743def6e73eed…` |
+
+Superseded pre-fix thin_disk_2d values (for audit only): radio term -5.62041e-05,
+E[N] frequent_slow 0.0760993 / rare_fast 0.000179312.

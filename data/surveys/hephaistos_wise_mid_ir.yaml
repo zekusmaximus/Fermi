@@ -19,6 +19,12 @@ infrared:
   anchor_false_positive_citation: >-
     Suazo et al. 2024 Sec. 4: background-galaxy contamination rate ~1.1e-5 per source
     (~2 expected contaminants among ~200,000). Covers ONE confounder class only.
+  # Milestone 2.5 / Launch Gate #1: measured W3 centroid registration floor
+  # (reproduced_archive, 154 controls / 12 patches, seed 42, code b02ec7d). Reported
+  # side-by-side with the legacy 0.5 arcsec baseline; it does NOT re-tier the
+  # completeness / false-positive bracket below, which stays illustrative.
+  sigma_sys_calibration_path: "data/calibrations/wise_sigma_sys_control.json"
+  sigma_sys_calibration_sha256: "2da2a234ee0ccb07fb571431f5f178e362ff4d9d4f96d4ee878b921916127b7a"
   calibration_data_tier: illustrative_calibration
   calibration_construction: >-
     3 completeness values x 5 false-positive rates spanning 0.1x to 5x the published

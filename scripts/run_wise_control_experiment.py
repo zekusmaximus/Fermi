@@ -67,7 +67,9 @@ W3_FWHM_ARCSEC = 6.5  # Ren et al. 2026 Table 2
 W3_PIXEL_ARCSEC = 1.375  # AllWISE Atlas pixel scale
 FWHM_PER_SIGMA = 2.0 * math.sqrt(2.0 * math.log(2.0))
 ALLWISE_MEAN_EPOCH_YR = 2010.5  # AllWISE combines WISE cryo + NEOWISE-post-cryo (2010)
-LEGACY_SIGMA_SYS_ARCSEC = 0.5  # Milestone 2 drill-down default (legacy baseline)
+LEGACY_SIGMA_SYS_ARCSEC = (
+    0.5  # legacy baseline: Suazo et al. 2024 Sec. 4 WISE astrometric precision
+)
 PRIMARY = "robust_median"
 PRIMARY_RATIONALE = (
     "Fixed BEFORE the seed-42 production run, after a seed-7 two-patch smoke test showed a "

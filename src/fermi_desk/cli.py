@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Annotated
 
@@ -123,7 +124,7 @@ def _print_bf(bf: dict, title: str) -> None:
         else:
             console.print(
                 "[bold red]!!! --include-illustrative: ILLUSTRATIVE CHANNELS FOLDED INTO THE "
-                "HEADLINE BF — NOT AN OBSERVATIONAL BOUND !!![/]"
+                "HEADLINE BF - NOT AN OBSERVATIONAL BOUND !!![/]"
             )
             console.print(
                 escape(
@@ -328,96 +329,174 @@ def ir_drilldown(
     seed: Annotated[int, typer.Option(help="RNG seed for the injection-recovery grid (required).")],
     n_trials: Annotated[int, typer.Option(help="Injections per grid cell.")] = 40,
     snr: Annotated[float, typer.Option(help="W3 SNR of the simulated sources.")] = 12.5,
-    sigma_sys: Annotated[float, typer.Option(help="Registration floor (arcsec).")] = 0.5,
+    sigma_sys: Annotated[
+        float, typer.Option(help="LEGACY baseline registration floor (arcsec).")
+    ] = 0.5,
     pair: Annotated[str, typer.Option(help="LR numerator,denominator.")] = IR_PAIR_DEFAULT,
     out_dir: Annotated[
         Path | None, typer.Option(help="Receipt dir (default runs/ir_drilldown).")
     ] = None,
     root: Root = None,
 ) -> None:
-    """Hephaistos blend-recovery drill-down (centroid vs. image-level screens)."""
-    from fermi_desk.inference.ir_drilldown import run_ir_drilldown
+    """Hephaistos blend-recovery drill-down under the legacy AND measured registration floors."""
+    from fermi_desk.inference.ir_drilldown import LEGACY, MEASURED, run_ir_drilldown
 
     graph = load_factor_graph(root)
     rec = run_ir_drilldown(
-        graph, seed=seed, pair=_pair(pair), n_trials=n_trials, snr=snr, sigma_sys_arcsec=sigma_sys
+        graph,
+        seed=seed,
+        pair=_pair(pair),
+        n_trials=n_trials,
+        snr=snr,
+        legacy_sigma_sys_arcsec=sigma_sys,
     )
     r = rec["results"]
-    g = r["grid"]
+    labels = list(r["by_floor"])
     console.rule(
-        f"fermi-desk ir-drilldown | seed={seed} | W3 SNR={snr} | sigma_sys={sigma_sys} arcsec | "
-        f"{n_trials} injections/cell | tier={r['data_tier']}"
+        f"fermi-desk ir-drilldown | seed={seed} | W3 SNR={snr} | {n_trials} injections/cell | "
+        f"floors={labels} | grid tier={r['data_tier']}"
     )
-    for key, title in (
-        ("centroid_recovery", "Centroid screen: P(blend flagged) [rows: separation, cols: f_bg]"),
-        ("image_recovery", "Image-level screen: P(blend flagged) [rows: separation, cols: f_bg]"),
-    ):
-        t = _table(title, ("theta", *[f"f_bg={f:.1f}" for f in g["flux_fractions"]]))
-        for th, vals in zip(g["separations_arcsec"], g[key], strict=True):
-            t.add_row(f"{th:.1f} arcsec", *[f"{v:.3f}" for v in vals])
+    t = _table(
+        "W3 centroid registration floors (side by side; same seed => common random numbers)",
+        (
+            "floor",
+            "sigma_sys [arcsec]",
+            "68% interval",
+            "data tier",
+            "withheld 3-sigma false alarms",
+            "source",
+        ),
+    )
+    meas = r["registration_floor_sources"]["measured_calibration"]
+    for f in r["registration_floors"]:
+        ci = f["interval_68_arcsec"]
+        fa = "-"
+        if meas:
+            key = (
+                "out_of_sample_false_alarm_at_calibrated_floor"
+                if f["label"] == MEASURED
+                else "false_alarm_at_legacy_baseline_floor"
+            )
+            w = meas["withheld_false_alarm"][key]
+            if math.isclose(w["sigma_sys_arcsec"], f["sigma_sys_arcsec"], abs_tol=1e-12):
+                lo, hi = w["clopper_pearson_95"]
+                fa = f"{w['n_flagged']}/{w['n_stars']} = {w['rate']:.4f} (95% {lo:.4f}-{hi:.4f})"
+        t.add_row(
+            f["label"],
+            f"{f['sigma_sys_arcsec']:.4f}",
+            "-" if ci is None else f"{ci[0]:.3f}-{ci[1]:.3f}",
+            f["data_tier"],
+            fa,
+            escape(f["source"]),
+        )
+    console.print(t)
+    if meas is None:
+        console.print(
+            "  [yellow]No measured sigma_sys calibration pinned in the IR survey: legacy "
+            "baseline only.[/]"
+        )
+    else:
+        est = ", ".join(f"{k}={v:.4f}" for k, v in meas["sigma_sys_by_estimator_arcsec"].items())
+        console.print(
+            escape(
+                f"  measured calibration: {meas['path']} sha256={meas['file_sha256'][:16]}... "
+                f"git={meas['code_git_sha'][:12]} seed={meas['rng_seed']} "
+                f"n_cal={meas['n_calibration']} n_withheld={meas['n_withheld']} | "
+                f"calibration-half estimators (arcsec): {est}"
+            )
+        )
+
+    g0 = r["by_floor"][labels[0]]["grid"]
+    for key, name in (("centroid_recovery", "Centroid"), ("image_recovery", "Image-level")):
+        for lb in labels:
+            g = r["by_floor"][lb]["grid"]
+            t = _table(
+                f"{name} screen P(blend flagged) | {lb} (sigma_sys="
+                f"{g['spec']['sigma_sys_arcsec']:.3f} arcsec) [rows: separation, cols: f_bg]",
+                ("theta", *[f"f_bg={x:.1f}" for x in g0["flux_fractions"]]),
+            )
+            for th, vals in zip(g["separations_arcsec"], g[key], strict=True):
+                t.add_row(f"{th:.1f} arcsec", *[f"{v:.3f}" for v in vals])
+            console.print(t)
+    sh = r["floor_shift"]
+    if sh:
+        t = _table(
+            f"Shift of the centroid grid: {MEASURED} - {LEGACY} "
+            f"(sigma_sys {sh['sigma_sys_arcsec'][0]:.3f} -> {sh['sigma_sys_arcsec'][1]:.3f} arcsec)",
+            ("theta", *[f"f_bg={x:.1f}" for x in g0["flux_fractions"]]),
+        )
+        for th, vals in zip(g0["separations_arcsec"], sh["centroid_recovery_delta"], strict=True):
+            t.add_row(f"{th:.1f} arcsec", *[f"{v:+.3f}" for v in vals])
         console.print(t)
-    console.print(
-        f"  empirical false-alarm rate (blend-free, n={g['n_null_trials']}): centroid "
-        f"{g['centroid_false_alarm_empirical']:.4f}, image {g['image_false_alarm_empirical']:.4f} "
-        f"(nominal {g['spec']['false_alarm_nominal']})"
-    )
-    s = r["screens_within_3p25_arcsec"]
-    console.print(
-        f"  blend survival within 3.25 arcsec (area-uniform theta, uniform f_bg): "
-        f"centroid {s['centroid']['survival']:.3f}, image {s['image']['survival']:.3f}"
-    )
+        console.print(
+            f"  mean recovery shift: centroid {sh['centroid_recovery_mean_delta']:+.4f}, image "
+            f"{sh['image_recovery_mean_delta']:+.4f}; simulated false-alarm shift: centroid "
+            f"{sh['centroid_false_alarm_delta']:+.4f}, image {sh['image_false_alarm_delta']:+.4f}; "
+            f"blend-survival shift (<=3.25 arcsec): centroid "
+            f"{sh['survival_delta']['centroid']:+.4f}, image {sh['survival_delta']['image']:+.4f}"
+        )
+    for lb in labels:
+        b = r["by_floor"][lb]
+        g = b["grid"]
+        s = b["screens_within_3p25_arcsec"]
+        console.print(
+            f"  [{lb}] simulated blend-free false-alarm rate (n={g['n_null_trials']}): centroid "
+            f"{g['centroid_false_alarm_empirical']:.4f}, image {g['image_false_alarm_empirical']:.4f} "
+            f"(nominal {g['spec']['false_alarm_nominal']}); blend survival within 3.25 arcsec: "
+            f"centroid {s['centroid']['survival']:.3f}, image {s['image']['survival']:.3f}"
+        )
 
     t = _table(
-        "Published anchors: Hephaistos candidates D and E (W3 centroid screen)",
+        "Published anchors: Hephaistos candidates D and E (W3 centroid screen) under each floor",
         (
             "cand.",
             "predicted shift",
             "measured offset",
             "tension",
-            "p (Rayleigh)",
-            "reproduced",
+            *[f"p / verdict [{lb}]" for lb in labels],
             "published",
         ),
     )
-    for c in r["anchors"]["candidates"]:
+    per = [{c["candidate"]: c for c in r["by_floor"][lb]["anchors"]["candidates"]} for lb in labels]
+    for cand, c in per[0].items():
         lo, hi = c["predicted_photocentre_shift_arcsec"]
         t.add_row(
-            c["candidate"],
+            cand,
             f"{lo:.2f}-{hi:.2f} arcsec",
             f"{c['measured_w3_offset_arcsec']:.2f} +/- {c['measured_err_arcsec']:.2f} arcsec",
             f"{c['shift_tension_sigma']:.2f} sigma",
-            f"{c['centroid_screen_p_value']:.3g}",
-            c["reproduced_verdict"],
+            *[
+                f"{p[cand]['centroid_screen_p_value']:.3g} / {p[cand]['reproduced_verdict']}"
+                for p in per
+            ],
             c["published_verdict"],
         )
     console.print(t)
-    console.print(escape(f"  anchor audit: {r['anchors']['status']} | {r['anchors']['summary']}"))
+    for lb in labels:
+        a = r["by_floor"][lb]["anchors"]
+        console.print(escape(f"  anchor audit [{lb}]: {a['status']} | {a['summary']}"))
 
     lr = r["likelihood_ratio"]
+    rows = {lb: r["by_floor"][lb]["likelihood_ratio_rows"] for lb in labels}
     t = _table(
         f"LR [{lr['numerator']} : {lr['denominator']}] (k={lr['observed_candidates']}, "
-        f"n={lr['n_targets']}, base completeness {lr['base_completeness_illustrative']} illustrative)",
+        f"n={lr['n_targets']}, base completeness {lr['base_completeness_illustrative']} "
+        "illustrative); both contamination conventions side by side",
         (
             "contamination scenario",
             "screen",
             "raw blend rate",
-            "survival",
-            "E[false pos.]",
-            "completeness",
-            "LR",
-            "log10 LR",
+            *[f"survival [{lb}]" for lb in labels],
+            *[f"log10 LR [{lb}]" for lb in labels],
         ),
     )
-    for row in lr["rows"]:
+    for i, row in enumerate(rows[labels[0]]):
         t.add_row(
             row["contamination_scenario"],
             row["screen"],
             f"{row['raw_blend_rate']:.3g}",
-            f"{row['blend_survival']:.3f}",
-            f"{row['expected_false_positives']:.3g}",
-            f"{row['completeness']:.3f}",
-            f"{row['lr']:.4g}",
-            f"{row['log10_lr']:+.4g}",
+            *[f"{rows[lb][i]['blend_survival']:.3f}" for lb in labels],
+            *[f"{rows[lb][i]['log10_lr']:+.4g}" for lb in labels],
         )
     console.print(t)
     out_dir = out_dir or graph.root / "runs" / "ir_drilldown"

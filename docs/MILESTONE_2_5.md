@@ -57,3 +57,19 @@ which report the legacy 0.50 arcsec baseline and the measured floor side-by-side
   symmetry-breaking scale), 4 `eirp_luminosity_function_sweep` (illustrative channel
   only, outside the verified headline).
 - The six core invariant tests are never marked `slow`.
+
+## Results — Launch Gate #1 (live run, 2026-11-26)
+Receipt `runs/wise_control/wise_control-seed42-20261126T125624Z.json` (sha256
+`2f1167da…`, code `b02ec7d`, seed 42, queries 12:40:43–12:56:24 UTC, 442 HTTP/TAP
+queries) promoted to `data/calibrations/wise_sigma_sys_control.json` (file sha256
+`2da2a234…`, pinned in `data/surveys/hephaistos_wise_mid_ir.yaml`).
+- 154 controls across 12 patches (11–13 per patch); 0 measurement failures; cuts:
+  2476 Gaia M dwarfs -> 2018 RUWE < 1.4 -> 542 W3-band matches -> 495 `cc_flags=0000`
+  -> 481 `ext_flg=0` -> 264 isolation-checked, 110 rejected (Gaia neighbour < 15 arcsec).
+- Calibration half (n = 77): `sigma_sys` = 0.436 arcsec (robust; 68% bootstrap
+  0.379–0.502, 95% 0.356–0.580); MLE 0.441, moment 0.457.
+- Withheld half (n = 77), out-of-sample 3-sigma centroid false alarms: 0/77 at the
+  measured floor (95% CP 0–0.047; KS vs Rayleigh p = 0.45); 0/77 at the legacy 0.5
+  arcsec floor (KS p = 0.014: legacy floor over-wide); 11/77 with no floor.
+- Drill-down shift (seed 42): centroid recovery +0.028 mean, blend survival within
+  3.25 arcsec 0.743 -> 0.699; D/E verdicts unchanged (E p 0.026 -> 0.011, marginal).

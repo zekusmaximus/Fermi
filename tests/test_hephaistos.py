@@ -98,14 +98,24 @@ def test_drilldown_contamination_scenarios_bracket_the_preference(graph):
     rec = run_ir_drilldown(
         graph, seed=3, pair=("quiet_expanders", "partial_dyson_conspicuous"), n_trials=6
     )
-    rows = rec["results"]["likelihood_ratio"]["rows"]
-    by = {(r["contamination_scenario"], r["screen"]): r for r in rows}
-    low = by[("suazo_2024_subsample_convention", "none")]
-    high = by[("zackrisson_2026_full_sample_critique", "none")]
-    assert high["expected_false_positives"] == pytest.approx(60.0)
-    assert low["expected_false_positives"] == pytest.approx(2.4)
-    assert low["lr"] < 1.0 < high["lr"]  # more false positives -> quiet favoured
-    assert rec["results"]["data_tier"] == "illustrative_calibration"
+    res = rec["results"]
+    assert res["by_floor"]["legacy_baseline"]["registration_floor"]["sigma_sys_arcsec"] == 0.5
+    for block in res["by_floor"].values():  # every floor reports both conventions
+        by = {(r["contamination_scenario"], r["screen"]): r for r in block["likelihood_ratio_rows"]}
+        low = by[("suazo_2024_subsample_convention", "none")]
+        high = by[("zackrisson_2026_full_sample_critique", "none")]
+        assert high["expected_false_positives"] == pytest.approx(60.0)
+        assert low["expected_false_positives"] == pytest.approx(2.4)
+        assert low["lr"] < 1.0 < high["lr"]  # more false positives -> quiet favoured
+    assert res["data_tier"] == "illustrative_calibration"
+    # Measured reproduced_archive floor sits beside the legacy baseline; neither is erased.
+    floors = {f["label"]: f for f in res["registration_floors"]}
+    assert floors["legacy_baseline"]["sigma_sys_arcsec"] == 0.5
+    meas = floors["measured_reproduced_archive"]
+    assert meas["data_tier"] == "reproduced_archive" and 0 < meas["sigma_sys_arcsec"] < 2
+    sh = res["floor_shift"]
+    assert sh["sigma_sys_arcsec"] == [0.5, meas["sigma_sys_arcsec"]]
+    assert set(sh["anchor_verdicts"]) == {"D", "E"}
     again = run_ir_drilldown(
         graph, seed=3, pair=("quiet_expanders", "partial_dyson_conspicuous"), n_trials=6
     )

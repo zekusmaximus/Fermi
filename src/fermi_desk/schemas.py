@@ -217,12 +217,22 @@ class InfraredSpec(_Frozen):
     calibration_data_tier: DataTier
     calibration_construction: str
     calibrations: list[IRCalibrationPoint] = Field(min_length=1)
+    # Milestone 2.5: measured W3 centroid registration floor (reproduced_archive),
+    # pinned by the SHA-256 of the file bytes like a catalog.
+    sigma_sys_calibration_path: str | None = None
+    sigma_sys_calibration_sha256: str | None = None
 
     @model_validator(mode="after")
     def _unique_ids(self) -> InfraredSpec:
         ids = [c.id for c in self.calibrations]
         if len(ids) != len(set(ids)):
             raise SchemaValidationError("Duplicate IR calibration ids")
+        if (self.sigma_sys_calibration_path is None) != (self.sigma_sys_calibration_sha256 is None):
+            raise ProvenanceError("sigma_sys_calibration_path and _sha256 must be given together")
+        if self.sigma_sys_calibration_sha256 is not None and not _SHA256_RE.match(
+            self.sigma_sys_calibration_sha256
+        ):
+            raise ProvenanceError("sigma_sys_calibration_sha256 must be a 64-hex SHA-256")
         return self
 
 
@@ -276,4 +286,96 @@ class Survey(_Frozen):
             )
         if self.data_tier == "published_catalog" and not self.citations:
             raise ProvenanceError(f"published_catalog survey {self.id!r} must carry citations")
+        return self
+
+
+# ------------------------------------------------- reproduced_archive calibrations
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class _Open(BaseModel):
+    """Calibration records: required fields are strict, extra provenance is kept."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+
+class ControlStar(_Open):
+    gaia_dr3_source_id: int
+    patch_id: str
+    b_deg: float
+    ruwe: float = Field(lt=1.4)
+    cc_flags: Literal["0000"]
+    ext_flg: Literal[0]
+    w3snr: float = Field(gt=0)
+    offset_arcsec: float = Field(ge=0)
+    sigma_stat_arcsec: float = Field(gt=0)
+    split: Literal["calibration", "withheld"]
+
+
+class ControlPatch(_Open):
+    patch_id: str
+    l_deg: float
+    b_deg: float
+    ra_deg: float
+    dec_deg: float
+    radius_deg: float = Field(gt=0)
+    gaia_adql: str
+    irsa_adql: str
+    cut_counts: dict[str, int]
+
+
+class SourceReceipt(_Frozen):
+    path: str
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not _SHA256_RE.match(v):
+            raise ProvenanceError("source_receipt.sha256 must be a 64-hex SHA-256")
+        return v
+
+
+class SigmaSysCalibrationFile(_Open):
+    """``data/calibrations/wise_sigma_sys_control.json`` (Milestone 2.5, Launch Gate #1)."""
+
+    id: str
+    schema_version: Literal[1]
+    data_tier: Literal["reproduced_archive"]
+    code_git_sha: str
+    rng_seed: int
+    query_window_utc: tuple[str, str]
+    legacy_baseline_sigma_sys_arcsec: float = Field(gt=0)
+    n_controls: int = Field(ge=100)
+    n_patches_with_controls: int = Field(ge=8)
+    patches: list[ControlPatch] = Field(min_length=8)
+    controls: list[ControlStar] = Field(min_length=100)
+    statistics: dict
+    source_receipt: SourceReceipt
+    content_sha256: str
+
+    @model_validator(mode="after")
+    def _contract(self) -> SigmaSysCalibrationFile:
+        if not _GIT_SHA_RE.match(self.code_git_sha):
+            raise ProvenanceError(
+                f"code_git_sha {self.code_git_sha!r} is not a clean 40-hex commit (dirty run?)"
+            )
+        if not _SHA256_RE.match(self.content_sha256):
+            raise ProvenanceError("content_sha256 must be a 64-hex SHA-256")
+        if len(self.controls) != self.n_controls:
+            raise SchemaValidationError("n_controls disagrees with the controls table")
+        min_b = float(self.model_extra.get("config", {}).get("min_abs_b", 20.0))
+        for p in self.patches:
+            if abs(p.b_deg) - p.radius_deg < min_b:
+                raise SchemaValidationError(f"patch {p.patch_id} cone reaches |b| < {min_b}")
+        ids = {p.patch_id for p in self.patches}
+        if any(c.patch_id not in ids or abs(c.b_deg) <= min_b for c in self.controls):
+            raise SchemaValidationError("control outside a declared high-latitude patch")
+        if len({c.gaia_dr3_source_id for c in self.controls}) != len(self.controls):
+            raise SchemaValidationError("duplicate control star")
+        if len({c.patch_id for c in self.controls}) != self.n_patches_with_controls:
+            raise SchemaValidationError("n_patches_with_controls disagrees with controls")
+        n_cal = sum(c.split == "calibration" for c in self.controls)
+        if abs(2 * n_cal - len(self.controls)) > 1:
+            raise SchemaValidationError("calibration / withheld split is not 50/50")
         return self

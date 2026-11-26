@@ -26,7 +26,8 @@ from fermi_desk.errors import (
     ProvenanceError,
     SchemaValidationError,
 )
-from fermi_desk.schemas import Hypothesis, ParameterRegistry, Survey
+from fermi_desk.models import hephaistos
+from fermi_desk.schemas import Hypothesis, ParameterRegistry, SigmaSysCalibrationFile, Survey
 
 MergePolicy = Literal["keep_first"]
 CATALOG_REQUIRED_COLUMNS = (
@@ -265,6 +266,137 @@ def load_targets(survey: Survey, root: Path) -> TargetTable:
     )
 
 
+# ------------------------------------------- reproduced_archive sigma_sys calibration
+def _canonical_sha256(obj: object) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, allow_nan=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class SigmaSysCalibration:
+    """Verified, measured W3 centroid registration floor (``reproduced_archive``)."""
+
+    survey_id: str
+    path: str
+    file_sha256: str
+    record: SigmaSysCalibrationFile
+
+    @property
+    def stats(self) -> dict:
+        return self.record.statistics
+
+    @property
+    def sigma_sys(self) -> u.Quantity:
+        return float(self.stats["calibration"]["sigma_sys_arcsec"]) * u.arcsec
+
+    @property
+    def interval_68(self) -> tuple[float, float]:
+        lo, hi = self.stats["calibration"]["bootstrap"]["p16_p84_arcsec"]
+        return float(lo), float(hi)
+
+    @property
+    def legacy_baseline(self) -> u.Quantity:
+        return self.record.legacy_baseline_sigma_sys_arcsec * u.arcsec
+
+    def summary(self) -> dict:
+        cal, wh = self.stats["calibration"], self.stats["withheld"]
+        return {
+            "id": self.record.id,
+            "path": self.path,
+            "file_sha256": self.file_sha256,
+            "content_sha256": self.record.content_sha256,
+            "data_tier": self.record.data_tier,
+            "code_git_sha": self.record.code_git_sha,
+            "rng_seed": self.record.rng_seed,
+            "query_window_utc": list(self.record.query_window_utc),
+            "n_controls": self.record.n_controls,
+            "n_patches_with_controls": self.record.n_patches_with_controls,
+            "primary_estimator": self.stats["primary_estimator"],
+            "sigma_sys_arcsec": float(self.sigma_sys.to_value(u.arcsec)),
+            "sigma_sys_68_arcsec": list(self.interval_68),
+            "sigma_sys_by_estimator_arcsec": cal["sigma_sys_by_estimator_arcsec"],
+            "n_calibration": cal["n_stars"],
+            "n_withheld": wh["n_stars"],
+            "withheld_false_alarm": {
+                k: {
+                    "n_flagged": wh[k]["n_flagged"],
+                    "n_stars": wh[k]["n_stars"],
+                    "rate": wh[k]["empirical_false_alarm"],
+                    "clopper_pearson_95": wh[k]["clopper_pearson_95"],
+                    "sigma_sys_arcsec": wh[k]["sigma_sys_arcsec"],
+                }
+                for k in (
+                    "out_of_sample_false_alarm_at_calibrated_floor",
+                    "false_alarm_at_legacy_baseline_floor",
+                    "false_alarm_with_no_floor",
+                )
+            },
+        }
+
+
+def _recompute_sigma_sys(rec: SigmaSysCalibrationFile) -> str:
+    """Offline re-derivation of the stored statistics from the stored controls."""
+    st = rec.statistics
+    est = hephaistos.SIGMA_SYS_ESTIMATORS[st["primary_estimator"]]
+
+    def arrays(split: str) -> tuple[u.Quantity, u.Quantity]:
+        rows = [c for c in rec.controls if c.split == split]
+        return (
+            np.array([c.offset_arcsec for c in rows]) * u.arcsec,
+            np.array([c.sigma_stat_arcsec for c in rows]) * u.arcsec,
+        )
+
+    r_c, s_c = arrays("calibration")
+    r_w, s_w = arrays("withheld")
+    sigma = float(est(r_c, s_c).to_value(u.arcsec))
+    stored = float(st["calibration"]["sigma_sys_arcsec"])
+    if not math.isclose(sigma, stored, rel_tol=0, abs_tol=1e-9):
+        raise ProvenanceError(f"recomputed sigma_sys {sigma} != stored {stored}")
+    wh = st["withheld"]
+    for key, floor in (
+        ("out_of_sample_false_alarm_at_calibrated_floor", sigma),
+        ("false_alarm_at_legacy_baseline_floor", rec.legacy_baseline_sigma_sys_arcsec),
+        ("false_alarm_with_no_floor", 0.0),
+    ):
+        fa = hephaistos.centroid_screen_false_alarms(
+            r_w, s_w, floor * u.arcsec, float(wh[key]["nominal_false_alarm"])
+        )
+        if fa["n_flagged"] != wh[key]["n_flagged"] or fa["n_stars"] != wh[key]["n_stars"]:
+            raise ProvenanceError(f"recomputed withheld {key} disagrees with stored value")
+    k = wh["out_of_sample_false_alarm_at_calibrated_floor"]
+    return (
+        f"sigma_sys[{st['primary_estimator']}] = {sigma:.4f} arcsec recomputed from "
+        f"{len(r_c)} calibration stars; withheld false alarms {k['n_flagged']}/{k['n_stars']} "
+        "recomputed"
+    )
+
+
+def load_sigma_sys_calibration(survey: Survey, root: Path) -> SigmaSysCalibration | None:
+    """Load and fully verify a survey's pinned sigma_sys calibration (None if absent).
+
+    Checks: file-bytes SHA-256 == pin in the survey YAML; schema; content_sha256 over
+    the canonical JSON; offline recomputation of sigma_sys and the withheld false-alarm
+    counts from the stored control table.
+    """
+    ir = survey.infrared
+    if ir is None or ir.sigma_sys_calibration_path is None:
+        return None
+    path = root / ir.sigma_sys_calibration_path
+    raw = path.read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha != ir.sigma_sys_calibration_sha256:
+        raise ProvenanceError(
+            f"{ir.sigma_sys_calibration_path}: sha256 {sha} != pinned "
+            f"{ir.sigma_sys_calibration_sha256}"
+        )
+    doc = json.loads(raw)
+    rec = SigmaSysCalibrationFile.model_validate(doc)
+    body = {k: v for k, v in doc.items() if k != "content_sha256"}
+    if _canonical_sha256(body) != rec.content_sha256:
+        raise ProvenanceError(f"{ir.sigma_sys_calibration_path}: content_sha256 mismatch")
+    _recompute_sigma_sys(rec)
+    return SigmaSysCalibration(survey.id, ir.sigma_sys_calibration_path, sha, rec)
+
+
 # --------------------------------------------------------------------- validation
 @dataclass(frozen=True)
 class CheckResult:
@@ -387,4 +519,17 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
                 record(
                     f"anchor_claim:{cp}", lambda s=s, cp=cp: _check_anchor_claim(s, graph.root, cp)
                 )
+        if s.infrared is not None and s.infrared.sigma_sys_calibration_path is not None:
+
+            def _calib(s: Survey = s) -> str:
+                cal = load_sigma_sys_calibration(s, graph.root)
+                assert cal is not None
+                return (
+                    f"sha256 {cal.file_sha256[:16]}..., {cal.record.data_tier}, "
+                    f"git {cal.record.code_git_sha[:12]}, {cal.record.n_controls} controls / "
+                    f"{cal.record.n_patches_with_controls} patches; "
+                    + _recompute_sigma_sys(cal.record)
+                )
+
+            record(f"sigma_sys_calibration:{s.infrared.sigma_sys_calibration_path}", _calib)
     return results

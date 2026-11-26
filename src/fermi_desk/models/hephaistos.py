@@ -458,3 +458,52 @@ def centroid_screen_false_alarms(
         "ks_rayleigh_p_value": float(ks.pvalue),
         "flagged_index": np.flatnonzero(flags).tolist(),
     }
+
+
+@dataclass(frozen=True)
+class RegistrationFloor:
+    """One W3 centroid registration floor fed to the drill-down, with its provenance.
+
+    The drill-down evaluates every floor side by side (legacy baseline and measured);
+    it never silently replaces one with another.
+    """
+
+    label: str
+    sigma_sys: u.Quantity
+    data_tier: str
+    source: str
+    interval_68_arcsec: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if _arcsec(self.sigma_sys, "sigma_sys") < 0:
+            raise ValueError("sigma_sys must be >= 0")
+
+    def as_dict(self) -> dict:
+        return {
+            "label": self.label,
+            "sigma_sys_arcsec": _arcsec(self.sigma_sys, "sigma_sys"),
+            "data_tier": self.data_tier,
+            "source": self.source,
+            "interval_68_arcsec": list(self.interval_68_arcsec)
+            if self.interval_68_arcsec
+            else None,
+        }
+
+
+def grid_shift(reference: BlendGrid, other: BlendGrid) -> dict:
+    """Cell-wise change (other - reference) of two grids on the same (theta, f_bg) axes."""
+    if not (
+        np.array_equal(reference.separations_arcsec, other.separations_arcsec)
+        and np.array_equal(reference.flux_fractions, other.flux_fractions)
+    ):
+        raise ValueError("grids must share separation and flux-fraction axes")
+    d_cen = other.centroid_recovery - reference.centroid_recovery
+    d_img = other.image_recovery - reference.image_recovery
+    return {
+        "centroid_recovery_delta": d_cen.tolist(),
+        "image_recovery_delta": d_img.tolist(),
+        "centroid_recovery_mean_delta": float(d_cen.mean()),
+        "image_recovery_mean_delta": float(d_img.mean()),
+        "centroid_false_alarm_delta": other.centroid_false_alarm - reference.centroid_false_alarm,
+        "image_false_alarm_delta": other.image_false_alarm - reference.image_false_alarm,
+    }

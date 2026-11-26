@@ -128,7 +128,9 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
             "sigmas_dex": [0.5, 1.0, 2.0],
             "n_mc": 2000,
         },
-        est_cpu_seconds=30.0,
+        # v0.1.1: ~4 min per full-parameter run (and again per replay) was measured
+        # during Milestone 3 verification; the original 30 s registration was stale.
+        est_cpu_seconds=240.0,
         est_reviewer_minutes=15.0,
         source="docs/MILESTONE_2.md B3 (registered jobs table)",
         diagnostic_priority=4,
@@ -261,13 +263,27 @@ class JobStore:
         inserted = []
         for job in jobs:
             if self.get(job.job_id) is not None:
-                # Backfill registration metadata on rows created before Milestone 2.5;
-                # status, seeds and output hashes are never touched.
+                # Refresh registration metadata on existing rows (diagnostic fields added in
+                # Milestone 2.5; cost estimates revised in v0.1.1). The stored EIG is reused
+                # for the utility score; status, seeds and output hashes are never touched.
                 impact, priority = compute_job_diagnostic(graph, job)
                 self.conn.execute(
-                    "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, source=? "
-                    "WHERE job_id=?",
-                    (impact, priority, job.source, job.job_id),
+                    "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, source=?, "
+                    "est_cpu_seconds=?, est_reviewer_minutes=?, "
+                    "utility_bits_per_hour=? WHERE job_id=?",
+                    (
+                        impact,
+                        priority,
+                        job.source,
+                        job.est_cpu_seconds,
+                        job.est_reviewer_minutes,
+                        utility_bits_per_hour(
+                            self.get(job.job_id)["expected_eig_bits"],
+                            job.est_cpu_seconds,
+                            job.est_reviewer_minutes,
+                        ),
+                        job.job_id,
+                    ),
                 )
                 continue
             res = compute_job_eig(graph, job)

@@ -76,7 +76,11 @@ uv run python scripts/run_wise_control_experiment.py --n-controls 120 --seed 42
 cd web && npm ci && npm run build && cd ..        # React + TypeScript + Vite bundle -> web/dist
 uv run fermi-desk serve                           # http://127.0.0.1:8000  (UI at /, API at /api/*, docs at /docs)
 # UI development with hot reload: run `uv run fermi-desk serve` and, in web/, `npm run dev` (proxies /api)
+uv run fermi-desk serve --host 0.0.0.0 --read-only # LAN/public bind: queue Run/Replay return 403 (CLI only)
 ```
+
+`serve` refuses any non-loopback `--host` unless `--read-only` is passed, because queue Run/Replay
+execute synchronously inside the HTTP request.
 
 ---
 

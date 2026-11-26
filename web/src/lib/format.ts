@@ -102,3 +102,63 @@ export function decadeTicks(lo: number, hi: number): number[] {
   for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++) out.push(10 ** e);
   return out;
 }
+
+// ------------------------------------------------------------- v0.1.1 helpers
+
+/** Tier-0 jobs at or above this estimate get an explicit "synchronous run" warning. */
+export const LONG_RUN_THRESHOLD_S = 120;
+
+/**
+ * Inline label for a long synchronous Tier-0 run, so a multi-minute browser request is not
+ * mistaken for a frozen page. Null below the threshold (or for a missing estimate).
+ */
+export function longRunLabel(estCpuSeconds: number | null | undefined): string | null {
+  if (estCpuSeconds === null || estCpuSeconds === undefined || !Number.isFinite(estCpuSeconds)) return null;
+  if (estCpuSeconds < LONG_RUN_THRESHOLD_S) return null;
+  return `~${Math.round(estCpuSeconds / 60)} min synchronous run`;
+}
+
+export const READ_ONLY_NOTICE = "Read-only mode — copy CLI command to run locally";
+
+export interface Tier0Gate {
+  runDisabled: boolean;
+  replayDisabled: boolean;
+  notice: string | null;
+}
+
+/**
+ * Enable/disable the Tier-0 Run and Verify Replay buttons. `readOnly` comes from
+ * /api/health: `null` means not yet known, and the buttons stay disabled until the server
+ * has confirmed read-write mode (the server also enforces this with HTTP 403).
+ */
+export function tier0Gate(readOnly: boolean | null | undefined, status: string, busy: boolean): Tier0Gate {
+  if (readOnly !== false) {
+    return {
+      runDisabled: true,
+      replayDisabled: true,
+      notice: readOnly === true ? READ_ONLY_NOTICE : "checking server mode…",
+    };
+  }
+  const done = status === "completed";
+  return { runDisabled: busy || done, replayDisabled: busy || !done, notice: null };
+}
+
+/**
+ * Plain-English reading of a log10 Bayes factor on the Jeffreys scale. |log10 BF| < 0.5
+ * ("barely worth mentioning") is reported as a null separation, never dressed up.
+ */
+export function bfReading(log10Bf: number | null | undefined): { kind: "null" | "weak" | "strong" | "unknown"; text: string } {
+  if (log10Bf === null || log10Bf === undefined || !Number.isFinite(log10Bf)) {
+    return { kind: "unknown", text: "headline not available" };
+  }
+  const a = Math.abs(log10Bf);
+  if (a < 0.5) return { kind: "null", text: "null separation (|log10 BF| < 0.5, Jeffreys: barely worth mentioning)" };
+  if (a < 1) return { kind: "weak", text: "substantial but not strong evidence (0.5 ≤ |log10 BF| < 1)" };
+  return { kind: "strong", text: "strong evidence (|log10 BF| ≥ 1)" };
+}
+
+/** "1,176×" style multiplier. */
+export function fmtMultiplier(x: number | null | undefined): string {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "—";
+  return `${Math.round(x).toLocaleString("en-US")}×`;
+}

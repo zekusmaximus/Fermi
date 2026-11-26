@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { ApiError, get, post, type Queue, type ReplayResult, type RunResult, type RunSummary, type Tier0Job } from "../api";
 import { Command, ErrorBox, Hash, Loading, Panel, StatusPill, useApi } from "../components/ui";
-import { fmtLog10, fmtNum, isCleanGitSha } from "../lib/format";
+import { fmtLog10, fmtNum, isCleanGitSha, longRunLabel, tier0Gate } from "../lib/format";
 
-export function QueueView() {
+/** `readOnly` is /api/health's flag; null while health is still loading. */
+export function QueueView({ readOnly }: { readOnly: boolean | null }) {
   const [tab, setTab] = useState<"t1" | "t0">("t1");
   const q = useApi(() => get<Queue>("/api/queue"), []);
   const runs = useApi(() => get<{ runs: RunSummary[]; limit: number }>("/api/runs"), []);
@@ -26,7 +27,7 @@ export function QueueView() {
       ) : tab === "t1" ? (
         <Tier1 q={q.data} />
       ) : (
-        <Tier0 q={q.data} onChange={() => (q.reload(), runs.reload())} />
+        <Tier0 q={q.data} readOnly={readOnly} onChange={() => (q.reload(), runs.reload())} />
       )}
       <Panel title="Recent receipts" aside={<button className="btn btn-xs" onClick={runs.reload}>refresh</button>}>
         {runs.error ? <ErrorBox error={runs.error} /> : null}
@@ -108,17 +109,17 @@ function Tier1({ q }: { q: Queue }) {
   );
 }
 
-function Tier0({ q, onChange }: { q: Queue; onChange: () => void }) {
+function Tier0({ q, readOnly, onChange }: { q: Queue; readOnly: boolean | null; onChange: () => void }) {
   return (
     <Panel title="Tier-0 compute jobs (offline, deterministic; EIG = 0.0 bits by construction)">
       {q.tier0_compute.map((j) => (
-        <Tier0Row key={j.job_id} j={j} onChange={onChange} />
+        <Tier0Row key={j.job_id} j={j} readOnly={readOnly} onChange={onChange} />
       ))}
     </Panel>
   );
 }
 
-function Tier0Row({ j, onChange }: { j: Tier0Job; onChange: () => void }) {
+function Tier0Row({ j, readOnly, onChange }: { j: Tier0Job; readOnly: boolean | null; onChange: () => void }) {
   const [busy, setBusy] = useState<"" | "run" | "replay">("");
   const [run, setRun] = useState<RunResult | null>(null);
   const [rep, setRep] = useState<ReplayResult | null>(null);
@@ -136,7 +137,8 @@ function Tier0Row({ j, onChange }: { j: Tier0Job; onChange: () => void }) {
       setBusy("");
     }
   };
-  const done = j.status === "completed";
+  const gate = tier0Gate(readOnly, j.status, busy !== "");
+  const longRun = longRunLabel(j.est_cpu_seconds);
   return (
     <article className="job">
       <header>
@@ -153,14 +155,22 @@ function Tier0Row({ j, onChange }: { j: Tier0Job; onChange: () => void }) {
         <span>seed {j.rng_seed ?? "—"}</span>
       </div>
       <div className="row-btns">
-        <button className="btn" disabled={busy !== "" || done} onClick={() => void act("run")}>
+        <button className="btn" disabled={gate.runDisabled} onClick={() => void act("run")}>
           {busy === "run" ? "running…" : "Run (seed 42)"}
         </button>
-        <button className="btn" disabled={busy !== "" || !done} onClick={() => void act("replay")}>
+        {longRun ? (
+          <span className={`long-run ${busy !== "" ? "long-run-active" : ""}`} title="the request blocks until the job finishes">
+            ⏱ {longRun}
+            {busy !== "" ? " — in progress, not frozen" : ""}
+          </span>
+        ) : null}
+        <button className="btn" disabled={gate.replayDisabled} onClick={() => void act("replay")}>
           {busy === "replay" ? "replaying…" : "Verify Replay"}
         </button>
-        <Command text={j.commands.replay} />
+        {gate.notice ? <span className="ro-notice">{gate.notice}</span> : null}
       </div>
+      {readOnly === true ? <Command text={j.commands.run} /> : null}
+      <Command text={j.commands.replay} />
       {err ? <ErrorBox error={err instanceof ApiError ? err : err} /> : null}
       {rep ? (
         <p className={rep.match ? "ok" : "bad"}>

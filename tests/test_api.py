@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from conftest import ROOT
-from fermi_desk.api import create_app, json_safe
+from fermi_desk.api import create_app, is_loopback_host, json_safe
 from fermi_desk.queue.store import JOB_DEFINITIONS
 
 FAST_JOBS = {
@@ -283,3 +283,116 @@ def test_json_safe_maps_non_finite_to_null():
         "a": None,
         "b": [None, 3],
     }
+
+
+# ------------------------------------------------------ v0.1.1 launch safety
+def test_health_reports_read_write_mode_by_default(client):
+    assert _ok(client, "/api/health")["read_only"] is False
+
+
+@pytest.fixture(scope="module")
+def ro_env(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("desk_ro")
+    app = create_app(
+        ROOT,
+        queue_path=tmp / "queue.sqlite",
+        queue_out_dir=tmp / "queue_out",
+        runs_dir=tmp / "runs",
+        compare_n_mc=1000,
+        seed_jobs=_jobs(),
+        read_only=True,
+    )
+    return TestClient(app), tmp
+
+
+def test_read_only_health_flag_and_403_on_run_and_replay(ro_env):
+    client, tmp = ro_env
+    assert _ok(client, "/api/health")["read_only"] is True
+    before = {j["job_id"]: j["status"] for j in _ok(client, "/api/queue")["tier0_compute"]}
+    for path, body in (
+        ("/api/queue/lookback_window_t_sweep/run", {"seed": 42}),
+        ("/api/queue/lookback_window_t_sweep/replay", None),
+        ("/api/queue/no_such_job/run", {}),  # refused before any job lookup
+        ("/api/queue/wise_independent_control_fields/run", {}),
+    ):
+        r = client.post(path, json=body)
+        assert r.status_code == 403, (path, r.text)
+        assert r.json()["detail"] == (
+            "Server is running in read-only mode; run or replay jobs locally via CLI."
+        )
+    after = {j["job_id"]: j["status"] for j in _ok(client, "/api/queue")["tier0_compute"]}
+    assert after == before and set(after.values()) == {"open"}
+    assert not (tmp / "queue_out").exists()
+    # reads are unaffected
+    assert client.post("/api/compare", json={"channels": ["radio"]}).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("host", "loopback"),
+    [
+        ("127.0.0.1", True),
+        ("localhost", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("127.0.0.2", True),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("192.168.1.10", False),
+        ("desk.example.org", False),
+    ],
+)
+def test_loopback_host_classification(host, loopback):
+    assert is_loopback_host(host) is loopback
+
+
+def _serve(monkeypatch, *args):
+    import uvicorn
+    from typer.testing import CliRunner
+
+    from fermi_desk.cli import app as cli_app
+
+    launched = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: launched.append((app, kw)))
+    return CliRunner().invoke(cli_app, ["serve", *args]), launched
+
+
+def test_serve_refuses_public_bind_without_read_only(monkeypatch):
+    result, launched = _serve(monkeypatch, "--host", "0.0.0.0")
+    assert result.exit_code != 0 and launched == []
+    assert "--read-only" in result.output and "Refusing" in result.output
+
+
+def test_serve_public_bind_with_read_only_starts_a_read_only_app(monkeypatch):
+    result, launched = _serve(monkeypatch, "--host", "0.0.0.0", "--read-only", "--port", "8799")
+    assert result.exit_code == 0, result.output
+    ((app, kw),) = launched
+    assert kw == {"host": "0.0.0.0", "port": 8799}
+    assert TestClient(app).post("/api/queue/disk_scale_height_sweep/replay").status_code == 403
+
+
+def test_eirp_sweep_cpu_estimate_is_240s(client):
+    (job,) = [j for j in JOB_DEFINITIONS if j.job_id == "eirp_luminosity_function_sweep"]
+    assert job.est_cpu_seconds == 240.0
+    t0 = {j["job_id"]: j for j in _ok(client, "/api/queue")["tier0_compute"]}
+    assert t0["eirp_luminosity_function_sweep"]["est_cpu_seconds"] == 240.0
+
+
+def test_reseed_refreshes_stale_cpu_estimate_without_touching_state(tmp_path):
+    from fermi_desk.queue.store import JobStore
+    from fermi_desk.registry import load_factor_graph
+
+    graph = load_factor_graph(ROOT)
+    s = JobStore(tmp_path / "queue.sqlite")
+    try:
+        s.seed(graph, _jobs())
+        s.conn.execute(
+            "UPDATE jobs SET est_cpu_seconds=30.0, status='claimed', claimed_by='x' "
+            "WHERE job_id='eirp_luminosity_function_sweep'"
+        )
+        s.conn.commit()
+        assert s.seed(graph, _jobs()) == []
+        row = s.get("eirp_luminosity_function_sweep")
+        assert row["est_cpu_seconds"] == 240.0
+        assert row["status"] == "claimed" and row["claimed_by"] == "x"
+    finally:
+        s.close()

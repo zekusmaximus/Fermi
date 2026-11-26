@@ -529,12 +529,30 @@ def serve(
         Path | None,
         typer.Option(help="Built Vite bundle to serve at / (default: web/dist if present)."),
     ] = None,
+    read_only: Annotated[
+        bool,
+        typer.Option(
+            "--read-only/--no-read-only",
+            help="Refuse queue run/replay (HTTP 403). Required for any non-loopback --host.",
+        ),
+    ] = False,
     root: Root = None,
 ) -> None:
     """Serve the offline desk: /api/* plus the compiled web UI (Milestone 3)."""
-    import uvicorn
+    from fermi_desk.api import create_app, is_loopback_host
 
-    from fermi_desk.api import create_app
+    if not is_loopback_host(host) and not read_only:
+        # Run/Replay execute engine code synchronously in the request; exposed on a LAN or
+        # public interface they are a CPU-exhaustion vector, so they must be switched off.
+        typer.echo(
+            f"Refusing to bind non-loopback host {host!r} in read-write mode: queue "
+            "run/replay execute synchronously and would be exposed to the network. "
+            "Pass --read-only for public/LAN binds (or use --host 127.0.0.1).",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    import uvicorn
 
     graph = load_factor_graph(root)
     static = static_dir or graph.root / "web" / "dist"
@@ -544,10 +562,12 @@ def serve(
     console.print(
         escape(
             f"fermi-desk serve | http://{host}:{port} | api=/api/health | "
+            f"mode={'read-only' if read_only else 'read-write (loopback)'} | "
             f"ui={'served from ' + _rel(static, graph.root) if has_ui else 'not built (npm run build)'}"
         )
     )
-    uvicorn.run(create_app(graph.root, static_dir=static if has_ui else None), host=host, port=port)
+    app_ = create_app(graph.root, static_dir=static if has_ui else None, read_only=read_only)
+    uvicorn.run(app_, host=host, port=port)
 
 
 # ------------------------------------------------------------------ adversary

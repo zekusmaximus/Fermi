@@ -16,6 +16,7 @@ Design rules:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import re
@@ -28,7 +29,7 @@ import astropy.units as u
 import numpy as np
 import pandas as pd
 import yaml
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,9 +61,21 @@ MAX_SEED = 2**32 - 1
 DEV_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
 JOB_ID_RE = re.compile(r"^[a-z0-9_]{1,80}$")
 RUNS_FEED_LIMIT = 50
+READ_ONLY_DETAIL = "Server is running in read-only mode; run or replay jobs locally via CLI."
 
 Seed = Annotated[StrictInt, Field(ge=0, le=MAX_SEED)]
 ChannelName = Literal["radio", "infrared", "solar_system"]
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for bind addresses reachable only from this machine (localhost, 127/8, ::1)."""
+    h = host.strip().strip("[]").lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False  # any other hostname may resolve to a routable interface
 
 
 # ------------------------------------------------------------------- JSON safety
@@ -128,6 +141,7 @@ class HealthOut(_Out):
     catalog_sha256: str | None
     wise_calibration_sha256: str | None
     receipt_schema_version: int
+    read_only: bool
 
 
 class RegistryOut(_Out):
@@ -206,8 +220,14 @@ def create_app(
     ir_n_trials: int = 40,
     adversary_n_mc: int = 4000,
     seed_jobs: Sequence[JobDefinition] | None = None,
+    read_only: bool = False,
 ) -> FastAPI:
-    """Build the desk app. Every path defaults inside the project root."""
+    """Build the desk app. Every path defaults inside the project root.
+
+    ``read_only=True`` (for any non-loopback deployment) refuses the two endpoints that
+    execute engine code synchronously, /api/queue/{job_id}/run and /replay, with HTTP 403;
+    all read endpoints are unchanged.
+    """
     graph: FactorGraph = load_factor_graph(root)
     root = graph.root
     queue_path = queue_path or root / "runs" / "queue.sqlite"
@@ -328,6 +348,11 @@ def create_app(
     def sha() -> str:
         return git_state(root)[0]
 
+    def writable() -> None:
+        # Runs before the job lookup, so a read-only server reveals nothing about job state.
+        if read_only:
+            raise HTTPException(status_code=403, detail=READ_ONLY_DETAIL)
+
     def store() -> JobStore:
         s = JobStore(queue_path)
         if not s.list():
@@ -351,6 +376,7 @@ def create_app(
             "catalog_sha256": radio_survey.catalog_sha256,
             "wise_calibration_sha256": cal_sha,
             "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+            "read_only": read_only,
         }
 
     @app.get("/api/registry", response_model=RegistryOut)
@@ -465,7 +491,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"unknown job {job_id!r}")
         return row
 
-    @app.post("/api/queue/{job_id}/run", response_model=RunOut)
+    @app.post("/api/queue/{job_id}/run", response_model=RunOut, dependencies=[Depends(writable)])
     def queue_run(job_id: str, req: RunRequest | None = None) -> dict:
         req = req or RunRequest()
         s = store()
@@ -510,7 +536,9 @@ def create_app(
             }
         )
 
-    @app.post("/api/queue/{job_id}/replay", response_model=ReplayOut)
+    @app.post(
+        "/api/queue/{job_id}/replay", response_model=ReplayOut, dependencies=[Depends(writable)]
+    )
     def queue_replay(job_id: str) -> dict:
         s = store()
         try:

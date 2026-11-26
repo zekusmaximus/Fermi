@@ -5,10 +5,12 @@ import { isCleanGitSha } from "./lib/format";
 import { AdversaryShelf } from "./views/AdversaryShelf";
 import { InfraredDrilldown } from "./views/InfraredDrilldown";
 import { MacroDesk, type View } from "./views/MacroDesk";
+import { Overview } from "./views/Overview";
 import { QueueView } from "./views/QueueView";
 import { RadioDrilldown } from "./views/RadioDrilldown";
 
 const NAV: { id: View; label: string }[] = [
+  { id: "overview", label: "Overview" },
   { id: "macro", label: "Macro Desk" },
   { id: "radio", label: "Radio" },
   { id: "infrared", label: "Infrared" },
@@ -17,7 +19,7 @@ const NAV: { id: View; label: string }[] = [
 ];
 
 export function App() {
-  const [view, setView] = useState<View>("macro");
+  const [view, setView] = useState<View>("overview");
   const [seed, setSeed] = useState(42);
   const health = useApi(() => get<Health>("/api/health"), []);
   const h = health.data;
@@ -46,6 +48,7 @@ export function App() {
           <span>
             rng_seed <span className="num">{seed}</span>
           </span>
+          {h?.read_only ? <span className="ro-pill">read-only</span> : null}
           <span className="muted">receipt v{h?.receipt_schema_version ?? "—"} · offline</span>
         </div>
       </header>
@@ -58,11 +61,12 @@ export function App() {
         ))}
       </nav>
       <main>
+        {view === "overview" ? <Overview health={h} go={setView} /> : null}
         {view === "macro" ? <MacroDesk seed={seed} setSeed={setSeed} go={setView} /> : null}
         {view === "radio" ? <RadioDrilldown /> : null}
         {view === "infrared" ? <InfraredDrilldown seed={seed} /> : null}
         {view === "adversary" ? <AdversaryShelf seed={seed} /> : null}
-        {view === "queue" ? <QueueView /> : null}
+        {view === "queue" ? <QueueView readOnly={h ? h.read_only : null} /> : null}
       </main>
       <footer className="foot muted small">
         Every number is computed by the local fermi-desk engine (no network). Tier colours: <span className="tier tier-published">published_catalog</span>{" "}

@@ -40,6 +40,7 @@ export interface Health {
   catalog_sha256: string | null;
   wise_calibration_sha256: string | null;
   receipt_schema_version: number;
+  read_only: boolean;
 }
 
 export interface MonocultureAudit {

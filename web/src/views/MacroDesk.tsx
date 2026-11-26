@@ -10,7 +10,7 @@ import {
   showIllustrativeBanner,
 } from "../lib/format";
 
-export type View = "macro" | "radio" | "infrared" | "adversary" | "queue";
+export type View = "overview" | "macro" | "radio" | "infrared" | "adversary" | "queue";
 
 const COMPONENT_ORDER = ["earth_unreached", "radio", "solar_system", "radio+solar_system", "infrared"];
 const CHANNELS: { id: Channel; label: string }[] = [
@@ -76,6 +76,15 @@ export function MacroDesk({
           Can Breakthrough Listen's 692-star survey separate frequent/slow expanders from
           rare/fast expanders—once we condition on Earth remaining unreached?
         </h1>
+        <aside className="why" aria-label="why this question">
+          <p className="eyebrow">Why this question?</p>
+          <p>
+            In a flat Galactic disk, doubling expansion speed while quartering civilization origin rates leaves the odds
+            of reaching Earth identical—but predicts different numbers of settled neighbors around an unreached Earth.
+            Use the controls below to test how much real survey data separates those two regimes, and how quickly
+            illustrative assumptions can distort the verdict if mixed in.
+          </p>
+        </aside>
       </div>
 
       <div className="controls" role="group" aria-label="comparison controls">

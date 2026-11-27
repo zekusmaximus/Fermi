@@ -270,3 +270,17 @@ button.door:hover { border-color: var(--accent); }
 .audit-headline .stat-big { font-size: 20px; margin-right: 4px; }
 .finding-detail { margin-top: 6px; }
 .finding-detail p { margin: 4px 0; }
+/* v0.2.2b: AllWISE Atlas vs unsmoothed unWISE W3 comparison (native HTML/CSS, no charts). */
+.cmp-table th { text-align: center; }
+.cmp-table thead .tier { display: block; width: fit-content; margin: 2px auto 0; }
+.cmp-table { font-size: 12px; }
+.cmp-table td { white-space: nowrap; }
+.cmp-table th, .cmp-table td { padding: 3px 5px; }
+.cmp-edge { border-left: 1px solid var(--line); }
+.cmp-illustrative { background: rgba(245, 158, 11, 0.06); }
+.cmp-edge.cmp-illustrative { border-left: 1px dashed var(--amber); }
+.cmp-centroid td { border-top: 1px solid color-mix(in srgb, var(--cyan) 35%, var(--line)); }
+.cmp-psf { margin-bottom: 6px; }
+.cmp-bar-cell { width: 28%; min-width: 120px; vertical-align: middle; }
+.cmp-bar { height: 8px; border-radius: 4px; background: var(--muted); }
+.cmp-bar-archive { background: var(--cyan); }

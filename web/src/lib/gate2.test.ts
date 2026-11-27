@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Gate2, Gate2Screen } from "../api";
-import { SOURCE_LABEL, armARecoveryByFlux, defaultSource, matchedControl } from "./gate2";
+import { SOURCE_LABEL, SOURCE_TIER, armARecoveryByFlux, defaultSource, matchedControl } from "./gate2";
 
 const screen = (armA: number[][], armB: number[]): Gate2Screen => ({
   n_stars: 4,
@@ -30,8 +30,15 @@ describe("Gate #2 heatmap source toggle", () => {
   it("defaults to the real withheld grid only when it is pinned", () => {
     expect(defaultSource(gate)).toBe("real");
     expect(defaultSource(null)).toBe("synthetic");
-    expect(SOURCE_LABEL.real).toBe("Real AllWISE W3 FITS — Withheld (reproduced_archive)");
-    expect(SOURCE_LABEL.synthetic).toBe("Synthetic Gaussian PSF (illustrative_calibration)");
+    expect(SOURCE_LABEL.real).toBe("AllWISE W3 Atlas (Gate #2)");
+    expect(SOURCE_LABEL.synthetic).toBe("Synthetic Gaussian PSF");
+    expect(SOURCE_LABEL.unwise).toBe("unWISE W3 (Unsmoothed — Fresh Split)");
+    // Tiers are never blended: both archive sources are cyan, the synthetic grid amber.
+    expect(SOURCE_TIER).toEqual({
+      real: "reproduced_archive",
+      synthetic: "illustrative_calibration",
+      unwise: "reproduced_archive",
+    });
   });
 });
 

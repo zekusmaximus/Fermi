@@ -57,6 +57,7 @@ from fermi_desk.registry import (
     load_factor_graph,
     load_fits_gate2,
     load_sigma_sys_calibration,
+    load_unwise_gate,
     run_validation,
 )
 from fermi_desk.schemas import (
@@ -188,6 +189,13 @@ class HealthOut(_Out):
     calibration_data_tier: str | None
     fits_gate2_sha256: str | None
     fits_gate2_data_tier: str | None
+    # v0.2.2b: the promoted unsmoothed unWISE W3 fresh-split gate (None until a survey pins
+    # it). n_controls = fresh sample size; n_calibration / n_withheld = stars evaluated.
+    unwise_gate_sha256: str | None
+    unwise_gate_data_tier: str | None
+    unwise_n_controls: int | None
+    unwise_n_calibration: int | None
+    unwise_n_withheld: int | None
     # v0.2.1b: the promoted Gaia DR3 background-field extension (None until a survey pins one)
     background_survey_id: str | None
     background_summary_sha256: str | None
@@ -349,6 +357,11 @@ def create_app(
                 "calibration_data_tier",
                 "fits_gate2_sha256",
                 "fits_gate2_data_tier",
+                "unwise_gate_sha256",
+                "unwise_gate_data_tier",
+                "unwise_n_controls",
+                "unwise_n_calibration",
+                "unwise_n_withheld",
                 "background_survey_id",
                 "background_summary_sha256",
                 "background_summary_data_tier",
@@ -400,6 +413,18 @@ def create_app(
         if gate is not None:
             out.update(
                 fits_gate2_sha256=gate.file_sha256, fits_gate2_data_tier=gate.record.data_tier
+            )
+        try:  # verified on load: pin, schema, zero-leakage ordering, offline recomputation
+            unwise = load_unwise_gate(ir_survey, root)
+        except (FermiDeskError, FileNotFoundError, KeyError, ValueError):
+            unwise = None  # validation (health.validation_failures) reports the reason
+        if unwise is not None:
+            out.update(
+                unwise_gate_sha256=unwise.file_sha256,
+                unwise_gate_data_tier=unwise.record.data_tier,
+                unwise_n_controls=len(unwise.record.sample.controls),
+                unwise_n_calibration=unwise.record.n_calibration,
+                unwise_n_withheld=unwise.record.n_withheld,
             )
         return out
 

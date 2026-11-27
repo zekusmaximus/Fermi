@@ -2,16 +2,20 @@
 // comes from the promoted reproduced_archive payload; nothing here is a remembered value.
 import type { Gate2, Gate2ScreenName } from "../api";
 
-export type HeatSource = "real" | "synthetic";
+/** "real" = AllWISE W3 Atlas (Gate #2); "unwise" = unsmoothed unWISE W3 fresh split (v0.2.2b). */
+export type HeatSource = "real" | "synthetic" | "unwise";
 
+/** Plain-English source labels (DESIGN.md Sec. 2); the tier is carried by the badge colour. */
 export const SOURCE_LABEL: Record<HeatSource, string> = {
-  real: "Real AllWISE W3 FITS — Withheld (reproduced_archive)",
-  synthetic: "Synthetic Gaussian PSF (illustrative_calibration)",
+  real: "AllWISE W3 Atlas (Gate #2)",
+  synthetic: "Synthetic Gaussian PSF",
+  unwise: "unWISE W3 (Unsmoothed — Fresh Split)",
 };
 
 export const SOURCE_TIER: Record<HeatSource, string> = {
   real: "reproduced_archive",
   synthetic: "illustrative_calibration",
+  unwise: "reproduced_archive",
 };
 
 /** The real withheld grid is the default whenever it is pinned; otherwise the synthetic one. */

@@ -541,6 +541,127 @@ def compare(
 
 
 # ---------------------------------------------------------------- ir-drilldown
+def _rate_text(rate: dict | None) -> str:
+    if rate is None:
+        return "-"
+    lo, hi = rate["clopper_pearson_95"]
+    return f"{rate['k']}/{rate['n']} = {rate['rate']:.3f} ({lo:.3f}-{hi:.3f})"
+
+
+def _print_unwise_gate(gate: dict | None) -> None:
+    """The promoted unWISE W3 fresh-split gate and its three-source comparison (v0.2.2b)."""
+    if gate is None:
+        console.print("  [yellow]No unWISE W3 gate result pinned in the IR survey.[/]")
+        return
+    cmp_, prov = gate["comparison"], gate["comparison"]["provenance"]
+    src = cmp_["sources"]
+    psf, noise = gate["empirical_psf"], gate["noise_model"]
+    level = gate["frozen_screens"]["image_scalar_conformal"]
+    fallback = (
+        f" (v0.2.2-R3 FALLBACK from requested {gate['conformal_alpha_requested']:g})"
+        if gate["conformal_alpha_fallback"]
+        else f" (requested alpha {gate['conformal_alpha_requested']:g})"
+    )
+    console.print(
+        escape(
+            f"  unWISE W3 unsmoothed, fresh |b| > 30 deg split ({gate['data_tier']}): "
+            f"{gate['path']} sha256={gate['file_sha256'][:16]}... "
+            f"git={gate['code_git_sha'][:12]} seed={gate['rng_seed']} | "
+            f"{gate['n_fetched_ok']}/{gate['n_requested']} cutouts, {gate['n_patches']} patches, "
+            f"min |b| {gate['min_abs_b_deg']:.2f} deg, {gate['n_calibration']} calibration / "
+            f"{gate['n_withheld']} withheld | empirical PSF FWHM "
+            f"{psf['fwhm_gaussian_arcsec']:.3f} arcsec Gaussian fit, "
+            f"{psf['fwhm_halfmax_arcsec']:.3f} arcsec half-max (nominal "
+            f"{psf['nominal_fwhm_arcsec']}) | pixel covariance lag-1 correlation "
+            f"{noise['correlation_lag1'][0]:.3f} / {noise['correlation_lag1'][1]:.3f} | conformal "
+            f"level (k+1)/(n_cal+1) = {level['k_exceedances'] + 1}/{level['n_calibration'] + 1} = "
+            f"{level['alpha_guaranteed']:.4f}{fallback}"
+        )
+    )
+    console.print(
+        escape(
+            f"  zero leakage: frozen {prov['frozen_at_utc']} (latest calibration fetch "
+            f"{prov['latest_calibration_fetch_utc']}) < earliest withheld fetch "
+            f"{prov['earliest_withheld_fetch_utc']}; {prov['n_gate1_star_overlap']} of "
+            f"{prov['n_fresh_stars']} fresh stars among the {prov['n_gate1_stars']} Gate #1 stars "
+            f"({prov['disjoint_from_gate1_path']} {prov['disjoint_from_gate1_sha256'][:16]}...)"
+        )
+    )
+    t = _table(
+        "W3 PSF and noise: unWISE W3 (reproduced_archive) vs AllWISE W3 Atlas Gate #2 "
+        "(reproduced_archive) vs synthetic Gaussian (illustrative_calibration)",
+        (
+            "source",
+            "data tier",
+            "PSF FWHM [arcsec]",
+            "pixel [arcsec]",
+            "n_cal / n_withheld",
+            "lag-1",
+        ),
+    )
+    for key in ("unwise_w3", "allwise_atlas_gate2", "synthetic_gaussian"):
+        v = src[key]
+        if v is None:
+            continue
+        lag = v["pixel_covariance_lag1_correlation"]
+        t.add_row(
+            v["label"],
+            v["data_tier"],
+            f"{v['psf_fwhm_arcsec']:.3f}",
+            "-" if v["pixel_scale_arcsec"] is None else f"{v['pixel_scale_arcsec']:.3f}",
+            "-" if v["n_calibration"] is None else f"{v['n_calibration']} / {v['n_withheld']}",
+            "not measured" if lag is None else f"{lag[0]:.3f} / {lag[1]:.3f}",
+        )
+    console.print(t)
+    t = _table(
+        "unWISE W3 withheld screens (2 x 2 image screens + both centroid floors): null false "
+        "alarm k/n = rate (95% CP), Arm A blend survival <= 3.25 arcsec, Arm B matched "
+        "centered-excess false rejection; Gate #2 / synthetic only where the same rule exists",
+        (
+            "screen",
+            "frozen cutoff",
+            "unWISE null FA",
+            "unWISE surv.",
+            "unWISE Arm B rejected",
+            "Atlas null FA",
+            "Atlas surv.",
+            "Atlas Arm B rejected",
+            "synth. FA",
+            "synth. surv.",
+        ),
+    )
+    for row in (*cmp_["image_screens"], *cmp_["centroid_floors"]):
+        if row["kind"] == "centroid":
+            cut = f"sigma_sys {row['sigma_sys_arcsec']:.4f} arcsec ({row['sigma_sys_source']})"
+        elif row["threshold_rule"] == "conformal":
+            cut = f"dchi2 > {row['threshold']:.2f} (level {row['alpha_guaranteed']:.4f})"
+        else:
+            cut = f"dchi2 > {row['threshold']:.2f} (scale {row['delta_chi2_scale']:.3f})"
+        u_, a, sy = row["unwise_w3"], row["allwise_atlas_gate2"], row["synthetic_gaussian"]
+        t.add_row(
+            row["screen"],
+            cut,
+            _rate_text(u_["null_false_alarm"]),
+            f"{u_['blend_survival_within_3p25_arcsec']:.3f}",
+            _rate_text(u_["arm_b_false_rejection_pooled"]),
+            _rate_text(a["null_false_alarm"]) if a else "-",
+            f"{a['blend_survival_within_3p25_arcsec']:.3f}" if a else "-",
+            _rate_text(a["arm_b_false_rejection_pooled"]) if a else "-",
+            f"{sy['null_false_alarm_rate']:.4f}" if sy else "-",
+            f"{sy['blend_survival_within_3p25_arcsec']:.3f}" if sy else "-",
+        )
+    console.print(t)
+    fresh = gate["fresh_sigma_sys"]
+    console.print(
+        escape(
+            f"  centroid floors: locked Gate #1 sigma_sys = {gate['locked_sigma_sys_arcsec']:.4f} "
+            f"arcsec (never overwritten) vs fresh |b| > 30 deg sigma_sys = "
+            f"{fresh['sigma_sys_arcsec']:.4f} arcsec ({fresh['primary_estimator']}, "
+            f"{fresh['n_stars']} calibration stars) | {cmp_['note']}"
+        )
+    )
+
+
 @app.command("ir-drilldown")
 def ir_drilldown(
     seed: Annotated[int, typer.Option(help="RNG seed for the injection-recovery grid (required).")],
@@ -713,6 +834,8 @@ def ir_drilldown(
                 f"{b['k']}/{b['n']} = {b['rate']:.3f}",
             )
         console.print(t)
+
+    _print_unwise_gate(r.get("unwise_w3_gate"))
 
     t = _table(
         "Published anchors: Hephaistos candidates D and E (W3 centroid screen) under each floor",

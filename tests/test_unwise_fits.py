@@ -5,6 +5,11 @@ in-test or by the script's in-memory rehearsal; nothing is read from the network
 blocks it) or from an archive cache, nothing is labelled as archival data outside ``tmp_path``
 copies, and no test writes inside the project tree. The only real inputs are the locked
 Gate #1 / Gate #2 artifacts, which are read and never written.
+
+Since v0.2.2b the project tree holds the PROMOTED unWISE artifact and its pin (covered by
+``test_unwise_artifact.py``). The pre-promotion and synthetic-pin paths below therefore run
+on ``data_copy`` trees that are first put back into the unpinned state (``_unpin``); the
+project artifact itself is only ever hashed here.
 """
 
 from __future__ import annotations
@@ -1058,12 +1063,30 @@ def test_offline_recompute_catches_resealed_tampering(doc, locked):
 
 
 # ------------------------------------------------------------ validate & survey pin
-def test_validate_reports_not_promoted_yet_while_unpinned():
-    graph = load_factor_graph(ROOT)
-    assert graph.surveys[IR].infrared.unwise_gate_path is None  # v0.2.2a pins nothing
-    assert not (ROOT / UNWISE_GATE_PATH).exists()
-    assert load_unwise_gate(graph.surveys[IR], ROOT) is None
-    res = {r.name: r for r in run_validation(ROOT)}
+def _unpin(root):
+    """Put a data/ copy back into the pre-promotion (v0.2.2a) state: no artifact, no pin."""
+    (root / UNWISE_GATE_PATH).unlink(missing_ok=True)
+    path = root / "data/surveys" / f"{IR}.yaml"
+    doc = yaml.safe_load(path.read_text("utf-8"))
+    for key in ("unwise_gate_path", "unwise_gate_sha256"):
+        doc["infrared"].pop(key, None)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False), "utf-8")
+
+
+def _project_artifact_untouched() -> bool:
+    """The promoted project artifact still hashes to the pin in the project survey YAML."""
+    pin = yaml.safe_load((ROOT / "data/surveys" / f"{IR}.yaml").read_text("utf-8"))["infrared"]
+    raw = (ROOT / UNWISE_GATE_PATH).read_bytes()
+    return hashlib.sha256(raw).hexdigest() == pin["unwise_gate_sha256"]
+
+
+def test_validate_reports_not_promoted_yet_while_unpinned(data_copy):
+    _unpin(data_copy)
+    graph = load_factor_graph(data_copy)
+    assert graph.surveys[IR].infrared.unwise_gate_path is None  # the v0.2.2a state
+    assert not (data_copy / UNWISE_GATE_PATH).exists()
+    assert load_unwise_gate(graph.surveys[IR], data_copy) is None
+    res = {r.name: r for r in run_validation(data_copy)}
     row = res["unwise_gate_promotion"]
     assert row.ok and "not promoted yet" in row.detail and "v0.2.2b" in row.detail
     assert all(r.ok for r in res.values()), [r for r in res.values() if not r.ok]
@@ -1071,6 +1094,7 @@ def test_validate_reports_not_promoted_yet_while_unpinned():
 
 
 def test_survey_pin_fields_are_optional_and_checked(data_copy):
+    _unpin(data_copy)
     path = data_copy / "data/surveys" / f"{IR}.yaml"
     doc = yaml.safe_load(path.read_text("utf-8"))
 
@@ -1133,11 +1157,12 @@ def test_promote_writes_a_sealed_artifact_and_prints_the_pin(script, promoted, c
     sha = hashlib.sha256(raw).hexdigest()
     assert f'unwise_gate_path: "{UNWISE_GATE_PATH}"' in printed
     assert f'unwise_gate_sha256: "{sha}"' in printed and "infrared" in printed
-    assert not (ROOT / UNWISE_GATE_PATH).exists()  # the project artifact path is never touched
+    assert _project_artifact_untouched()  # the project artifact is never rewritten
 
 
 def test_validate_enforces_everything_once_the_artifact_is_pinned(promoted, data_copy):
     raw = promoted[1].read_bytes()
+    _unpin(data_copy)
     # Present at the canonical path but not pinned: validate must fail.
     (data_copy / UNWISE_GATE_PATH).write_bytes(raw)
     row = {r.name: r for r in run_validation(data_copy)}["unwise_gate_promotion"]
@@ -1252,7 +1277,7 @@ def test_promote_refuses_dirty_synthetic_undersized_or_leaked_receipts(
     assert script.main(["--promote-from", str(path), "--out-file", str(out)]) == 1
     err = capsys.readouterr().err
     assert "Refusing to promote" in err and message in err, err
-    assert not out.exists() and not (ROOT / UNWISE_GATE_PATH).exists()
+    assert not out.exists() and _project_artifact_untouched()
 
 
 def test_the_untouched_rehearsal_receipt_is_itself_unpromotable(script, run, tmp_path, capsys):

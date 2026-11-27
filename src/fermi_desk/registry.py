@@ -11,6 +11,7 @@ import math
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -2004,6 +2005,10 @@ class UnwiseGateResult:
     def summary(self) -> dict:
         r = self.record
         psf, nm, fz, wh = r.empirical_psf, r.noise_model, r.frozen_screens, r.withheld
+        when = datetime.fromisoformat
+        counts: dict[str, list[int]] = {p.patch_id: [0, 0] for p in r.sample.patches}
+        for c in r.sample.controls:
+            counts[c.patch_id][c.split == "withheld"] += 1
         return {
             "id": r.id,
             "path": self.path,
@@ -2018,10 +2023,34 @@ class UnwiseGateResult:
             "frozen_state_sha256": r.frozen_state_sha256,
             "frozen_before_withheld_fetch": r.frozen_before_withheld_fetch,
             "disjoint_from_gate1_sha256": r.disjoint_from_gate1_sha256,
+            "latest_calibration_fetch_utc": max(fz.calibration.fetched_at_utc, key=when),
+            "earliest_withheld_fetch_utc": min(wh.fetched_at_utc, key=when),
             "n_patches": len(r.sample.patches),
             "n_controls": len(r.sample.controls),
             "n_calibration": r.n_calibration,
             "n_withheld": r.n_withheld,
+            "min_abs_b_deg": min(abs(c.b_deg) for c in r.sample.controls),
+            "patches": [
+                {
+                    "patch_id": p.patch_id,
+                    "l_deg": p.l_deg,
+                    "b_deg": p.b_deg,
+                    "radius_deg": p.radius_deg,
+                    "n_calibration_controls": counts[p.patch_id][0],
+                    "n_withheld_controls": counts[p.patch_id][1],
+                    "nearest_locked_patch_id": p.nearest_locked_patch_id,
+                    "nearest_locked_patch_separation_deg": p.nearest_locked_patch_separation_deg,
+                }
+                for p in r.sample.patches
+            ],
+            "n_requested": r.fetch.n_requested,
+            "n_fetched_ok": r.fetch.n_ok,
+            "n_failed": r.fetch.n_failed,
+            "unusable_cutouts": [dict(f) for f in r.fetch.failures],
+            "target_false_alarm": fz.target_false_alarm,
+            "conformal_alpha_requested": fz.conformal_alpha_requested,
+            "conformal_alpha_nominal": fz.conformal_alpha_nominal,
+            "conformal_alpha_fallback": fz.conformal_alpha_fallback,
             "empirical_psf": {
                 "fwhm_gaussian_arcsec": psf.fwhm_gaussian_arcsec,
                 "fwhm_halfmax_arcsec": psf.fwhm_halfmax_arcsec,

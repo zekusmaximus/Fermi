@@ -31,6 +31,13 @@ infrared:
   # bracket below, which stays illustrative.
   fits_gate2_path: "data/calibrations/wise_fits_gate2_withheld.json"
   fits_gate2_sha256: "d4818c100b02cea98d5beafcdea66e679c072e5d47e28fe8d3a960f78c64da99"
+  # v0.2.2b / Sprint 3: frozen-method blend screens on unsmoothed unWISE W3 coadds of a
+  # fresh |b| > 30 deg sample (252 controls / 16 patches, 126 calibration + 126 withheld,
+  # zero stars shared with Gate #1; reproduced_archive, seed 42, code 9c91244). Reported
+  # beside Gate #2 and the synthetic grid; it does NOT re-tier the completeness /
+  # false-positive bracket below, which stays illustrative.
+  unwise_gate_path: "data/calibrations/unwise_w3_gate_withheld.json"
+  unwise_gate_sha256: "b49e997054726bcfebd5b7ba5ca255a4071c3627af9ce7f871eee2799302f238"
   calibration_data_tier: illustrative_calibration
   calibration_construction: >-
     3 completeness values x 5 false-positive rates spanning 0.1x to 5x the published

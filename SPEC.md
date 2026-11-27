@@ -389,13 +389,14 @@ archive query window (`query_window_utc`, when cones were fetched) beside `assem
 that queried the archive, all clean). `fermi-desk validate` re-checks the pin, the schema, the
 seal and recomputes the validation sample and every suspected star's shell cell offline.
 
-**Unsmoothed unWISE W3 gate on a fresh split (v0.2.2; proposed for planning ratification).**
+**Unsmoothed unWISE W3 gate on a fresh split (v0.2.2; ratified, rulings v0.2.2-R1 to v0.2.2-R5).**
 Gate #2 failed its image-level screen on AllWISE Atlas coadds (13.69 arcsec empirical PSF,
 5/77 null false alarms, 0.934 blend survival). v0.2.2 repeats the two-arm protocol on
 unsmoothed unWISE W3 coadds (Lang 2014; native 2.75 arcsec pixels, never resampled) to
 separate two causes: Atlas smoothing, and the scalar-variance chi^2(3) cutoff. `v0.2.2a`
-ships the offline pipeline only (`models/unwise_fits.py`, `scripts/run_unwise_gate.py`); no
-archive is queried and nothing is promoted until `v0.2.2b`.
+shipped the offline pipeline (`models/unwise_fits.py`, `scripts/run_unwise_gate.py`);
+`v0.2.2b` ran the live two-stage campaign from a clean commit and promoted its result
+verbatim ("Promoted result" below).
 
 - **Fresh sample, disjoint by construction.** Seeded patches (default 16, radius 2 deg) whose
   whole cone lies at `|b| > 30 deg`, clear of LMC/SMC/M31, at least 20 deg apart and with
@@ -460,6 +461,75 @@ archive is queried and nothing is promoted until `v0.2.2b`.
   2.75 arcsec per pixel); `ENDPOINTS` in the script records it (`verified_live: True`,
   `LIVE_SMOKE_TEST`). Live defaults (ruling v0.2.2-R3): 224 target controls over the 16
   patches (`n_cal >= 100`, `n_withheld >= 100`) and conformal `alpha = 0.01`.
+
+**Ruling v0.2.2-R1 (PSF stamp normalisation).** Each calibration stamp is normalised by its
+least-squares amplitude against the nominal 6.5 arcsec Gaussian before the median stack; the
+Gate #2 own-summed-flux normalisation is not used on 2.75 arcsec pixels.
+
+**Ruling v0.2.2-R2 (the 2 x 2 is predeclared).** `image_gls_conformal` is the fourth image
+screen. The factorial `{scalar, GLS} x {parametric chi2, conformal}` was fixed before any
+unWISE cutout was fetched, so no corner is evaluated after the fact.
+
+**Ruling v0.2.2-R3 (sample size and conformal level).** The live target is `N >= 200`
+(`n_cal >= 100`, `n_withheld >= 100`) over the 16 fresh patches, with conformal `alpha = 0.01`:
+the frozen level `1 / (n_cal + 1)` is then at most `1/101 = 0.990%`. The `n_cal >= 60`
+promotion floor remains only as a fallback: with fewer than 99 evaluated calibration stars
+the freeze uses `1 / (n_cal + 1)` and records it (`conformal_alpha_fallback`). The promoted
+run did not need the fallback.
+
+**Ruling v0.2.2-R4 (smoke test, then a clean pre-fetch commit).** One cutout is fetched into a
+temporary `--cache-dir` outside the repository before the campaign; verified endpoints are
+marked `verified_live: True`; the result is committed (`v0.2.2b-prep`) so that the full fetch
+and the promotion carry a clean `code_git_sha`. `--allow-dirty` is never used for either.
+
+**Ruling v0.2.2-R5 (names, placement and constants).** `scripts/run_unwise_gate.py`,
+`data/cache/unwise_w3/`, the pin inside the `infrared:` block beside `fits_gate2_*`, the
+`unwise-gate-v1` covariance regularisation constants, and both centroid floors (the locked
+0.4356 arcsec value and the fresh `|b| > 30 deg` one, side by side) are kept as built.
+
+**Promoted result (v0.2.2b, `reproduced_archive`).**
+`data/calibrations/unwise_w3_gate_withheld.json`, 797,103 bytes, SHA-256
+`b49e997054726bcfebd5b7ba5ca255a4071c3627af9ce7f871eee2799302f238`, code
+`9c91244c2ceaed0ec0469d2020a320635f475af7`, seed 42. 252 controls in 16 patches (minimum
+`|b|` 30.65 deg), 252/252 cutouts usable, 126 calibration + 126 withheld stars, 0 of 252 among
+the 154 Gate #1 stars. Frozen `2026-11-27T23:14:45.764824+00:00`; the latest calibration
+cutout was fetched at `23:14:14.892243` and the earliest withheld cutout at `23:14:47.242114`.
+Nothing was retuned after the freeze.
+
+- *PSF.* Empirical FWHM 7.500 arcsec (Gaussian fit; 6.444 arcsec half-max area) from 126
+  stamps, against 13.690 arcsec on the Atlas (Gate #2) and 6.5 arcsec nominal.
+- *Pixel noise.* `V(0) = 0.831`, lag-1 correlation 0.180 / 0.184 (x / y), minimum eigenvalue
+  bound 0.0912 (positive definite). Gate #2 did not measure a pixel covariance.
+- *Conformal level.* `k = 0`, `(k + 1) / (n_cal + 1) = 1/127 = 0.787%` (requested 1%).
+- *Centroid floors.* Locked 0.4356 arcsec (Gate #1, unchanged) and fresh 0.3272 arcsec
+  (`robust_median`, 126 calibration stars).
+
+| Screen (withheld, n = 126) | Frozen cutoff | Null false alarm (95% CP) | Arm A survival <= 3.25" | Arm B false rejection (95% CP) |
+|---|---|---|---|---|
+| `image_scalar_chi2` | `dchi2 > 26.24` (scale 1.854) | 1/126 = 0.8% (0.0-4.3%) | 0.739 | 9/630 = 1.4% (0.7-2.7%) |
+| `image_gls_chi2` | `dchi2 > 23.56` (scale 1.665) | 1/126 = 0.8% (0.0-4.3%) | 0.718 | 9/630 = 1.4% (0.7-2.7%) |
+| `image_scalar_conformal` | `dchi2 > 34.44` (level 1/127) | 1/126 = 0.8% (0.0-4.3%) | 0.793 | 8/630 = 1.3% (0.5-2.5%) |
+| `image_gls_conformal` | `dchi2 > 28.00` (level 1/127) | 1/126 = 0.8% (0.0-4.3%) | 0.758 | 8/630 = 1.3% (0.5-2.5%) |
+| `centroid_locked` | `sigma_sys` 0.4356" | 1/126 = 0.8% (0.0-4.3%) | 0.673 | 6/630 = 1.0% (0.4-2.1%) |
+| `centroid_fresh` | `sigma_sys` 0.3272" | 2/126 = 1.6% (0.2-5.6%) | 0.553 | 20/630 = 3.2% (1.9-4.9%) |
+| Gate #2 Atlas `image` (n = 77) | scalar chi2 rule | 5/77 = 6.5% (2.1-14.5%) | 0.934 | 24/385 = 6.2% (4.0-9.1%) |
+| Gate #2 Atlas `centroid` (n = 77) | `sigma_sys` 0.4356" | 0/77 = 0.0% (0.0-4.7%) | 0.671 | 1/385 = 0.3% (0.0-1.4%) |
+
+Reading, stated without grading: on unsmoothed unWISE the Gate #2 scalar chi2 rule holds its
+null false-alarm rate (1/126, against 5/77 on the Atlas) and lets 73.9% of blends within
+3.25 arcsec through (93.4% on the Atlas); the GLS and conformal variants change survival by a
+few points (71.8% to 79.3%) and do not close the gap. Most close blends still survive every
+image screen, and no image screen beats the locked centroid screen (67.3%) on blend recall.
+The two archive samples share no star, so the Atlas and unWISE rows are two measurements,
+not a paired test. The result re-tiers nothing: the IR completeness / false-positive bracket
+stays `illustrative_calibration`, and the IR channel stays out of the verified headline.
+
+- **Surfaces.** `fermi-desk ir-drilldown` and `GET /api/infrared/drilldown` report the block
+  as `results.unwise_w3_gate` with a three-source `comparison` (unWISE W3, AllWISE W3 Atlas
+  Gate #2, synthetic Gaussian); a Gate #2 or synthetic cell is filled only where that source
+  applied the same rule (scalar chi2 image screen, locked-floor centroid screen) and is null
+  otherwise. `GET /api/health` reports `unwise_gate_sha256`, `unwise_gate_data_tier`,
+  `unwise_n_controls`, `unwise_n_calibration` and `unwise_n_withheld`.
 
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
@@ -564,9 +634,10 @@ linked evidence (`fermi-desk background-field`, `GET /api/queue`).
    `atlas_smoothing_caveat` in `ir-drilldown` receipts). Re-measure the same controls on
    unWISE coadds (native, unblurred PSF) and report both floors side by side; never
    overwrite the locked Atlas artifact.
-   **Offline pipeline implemented in v0.2.2a** (Sec. 4.3 "Unsmoothed unWISE W3 gate", proposed
-   for planning ratification), on a fresh sample rather than the locked 154 stars so that the
-   image screens are also tested out of sample; the live fetch and promotion are `v0.2.2b`.
+   **Implemented in v0.2.2** (Sec. 4.3 "Unsmoothed unWISE W3 gate", rulings v0.2.2-R1 to
+   v0.2.2-R5), on a fresh sample rather than the locked 154 stars so that the image screens
+   are also tested out of sample. Promoted in `v0.2.2b`: fresh floor 0.3272 arcsec beside the
+   locked 0.4356 arcsec, which is unchanged.
 
 ### v0.1.2: Public-Launch Gate #2 (brief: `docs/V0_1_2_GATE_2.md`)
 - Frozen-method real AllWISE W3 FITS blend screens on the 154 locked controls: empirical

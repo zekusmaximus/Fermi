@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { get, type FalseAlarm, type Gate2, type IrDrill } from "../api";
-import { ErrorBox, Hash, Loading, Panel, TierBadge, useApi } from "../components/ui";
+import { get, type FalseAlarm, type Gate2, type IrDrill, type UnwiseGate, type UnwiseScreenName } from "../api";
+import { ErrorBox, Hash, HelpPopover, Loading, Panel, TierBadge, useApi } from "../components/ui";
 import { cellColor, fmtNum, fmtPct } from "../lib/format";
 import {
   SCREEN_LABEL,
@@ -12,6 +12,36 @@ import {
   matchedControl,
   type HeatSource,
 } from "../lib/gate2";
+import {
+  HEAT_SOURCES,
+  LEGACY_SCREENS,
+  LEGACY_SCREEN_ENUM,
+  LEGACY_SCREEN_LABEL,
+  SCREEN_CONTROL_LABEL,
+  SOURCE_CONTROL_LABEL,
+  SOURCE_ENUM,
+  UNWISE_HEAT_SCREENS,
+  UNWISE_SCREEN_LABEL,
+  comparisonRows,
+  conformalLevel,
+  fmtRate,
+  freezeLeadSeconds,
+  lag1Text,
+  legacyCounterpart,
+  legacyScreenCaption,
+  likeForLikeStatement,
+  overlapStatement,
+  psfRows,
+  resolveSource,
+  screenHelp,
+  sourceAvailable,
+  sourceCaption,
+  sourceHelp,
+  unwiseCounterpart,
+  unwiseScreenCaption,
+  type ComparisonCell,
+  type LegacyScreen,
+} from "../lib/unwise";
 
 const LEGACY = "legacy_baseline";
 const MEASURED = "measured_reproduced_archive";
@@ -32,6 +62,7 @@ export function InfraredDrilldown({ seed }: { seed: number }) {
       </p>
       <CalibrationCard d={data} />
       <HeatmapPanel d={data} />
+      <UnwiseComparisonPanel d={data} />
       <MatchedControlCard d={data} />
       <AnchorCard d={data} />
       <FlipPanel d={data} />
@@ -152,35 +183,92 @@ type FloorView = "measured" | "legacy" | "delta";
 function HeatmapPanel({ d }: { d: IrDrill }) {
   const r = d.results;
   const gate = r.real_fits_gate2;
-  const [source, setSource] = useState<HeatSource>(defaultSource(gate));
+  const unwise = r.unwise_w3_gate;
+  const [requested, setRequested] = useState<HeatSource>(defaultSource(gate));
   const [screen, setScreen] = useState<Screen>("centroid");
+  const [unwiseScreen, setUnwiseScreen] = useState<UnwiseScreenName>("centroid_locked");
   const [floor, setFloor] = useState<FloorView>(r.floor_shift ? "measured" : "legacy");
-  const real = source === "real" && gate !== null;
-  const src: HeatSource = real ? "real" : "synthetic";
+  // A source whose artifact is not pinned falls back to the synthetic grid (never to another archive).
+  const src = resolveSource(requested, gate, unwise);
+  const real = src === "real";
+  const synGrid = (r.by_floor[MEASURED] ?? r.by_floor[LEGACY]!).grid;
+  const ctx = {
+    gate2: gate,
+    unwise,
+    synthetic: { psfFwhmArcsec: synGrid.spec.psf_fwhm_arcsec, snr: synGrid.spec.snr, nTrials: synGrid.n_trials_per_cell },
+  };
+  // Keep the same rule selected across sources where one exists (GLS / conformal are unWISE-only).
+  const pickSource = (next: HeatSource) => {
+    if (next === "unwise" && src !== "unwise") setUnwiseScreen(unwiseCounterpart(screen));
+    if (next !== "unwise" && src === "unwise") setScreen(legacyCounterpart(unwiseScreen));
+    setRequested(next);
+  };
   return (
     <Panel
       title="Blend-recovery heatmap — P(blend flagged)"
       aside={<TierBadge tier={SOURCE_TIER[src]} label={SOURCE_LABEL[src]} />}
-      className={real ? "panel-archive" : "panel-illustrative"}
+      className={src === "synthetic" ? "panel-illustrative" : "panel-archive"}
     >
       <div className="controls controls-inline">
-        <div className="seg" role="group" aria-label="grid source">
-          <button className={real ? "on" : ""} disabled={!gate} onClick={() => setSource("real")}>
-            {SOURCE_LABEL.real}
-          </button>
-          <button className={!real ? "on" : ""} onClick={() => setSource("synthetic")}>
-            {SOURCE_LABEL.synthetic}
-          </button>
+        <div className="ctl ctl-wide">
+          <span className="ctl-label">
+            {SOURCE_CONTROL_LABEL} <HelpPopover label="the three image sources" {...sourceHelp(unwise, gate)} />
+          </span>
+          <div className="seg seg-tall" role="radiogroup" aria-label={SOURCE_CONTROL_LABEL}>
+            {HEAT_SOURCES.map((s) => (
+              <button
+                key={s}
+                role="radio"
+                aria-checked={s === src}
+                className={s === src ? "on" : ""}
+                disabled={!sourceAvailable(s, gate, unwise)}
+                onClick={() => pickSource(s)}
+              >
+                <span className="seg-plain">{SOURCE_LABEL[s]}</span>
+                <span className="seg-enum">{SOURCE_ENUM[s]}</span>
+              </button>
+            ))}
+          </div>
+          <span className="ctl-caption" aria-live="polite">
+            {sourceCaption(src, ctx)}
+          </span>
         </div>
-        <div className="seg">
-          <button className={screen === "centroid" ? "on" : ""} onClick={() => setScreen("centroid")}>
-            Centroid
-          </button>
-          <button className={screen === "image" ? "on" : ""} onClick={() => setScreen("image")}>
-            Image-level (Δχ²)
-          </button>
+        <div className="ctl ctl-wide">
+          <span className="ctl-label">
+            {SCREEN_CONTROL_LABEL} <HelpPopover label="the blend screens" {...screenHelp(unwise)} />
+          </span>
+          <div className="seg seg-tall" role="radiogroup" aria-label={SCREEN_CONTROL_LABEL}>
+            {src === "unwise"
+              ? UNWISE_HEAT_SCREENS.map((s) => (
+                  <button
+                    key={s}
+                    role="radio"
+                    aria-checked={s === unwiseScreen}
+                    className={s === unwiseScreen ? "on" : ""}
+                    onClick={() => setUnwiseScreen(s)}
+                  >
+                    <span className="seg-plain">{UNWISE_SCREEN_LABEL[s]}</span>
+                    <span className="seg-enum">{s}</span>
+                  </button>
+                ))
+              : LEGACY_SCREENS.map((s: LegacyScreen) => (
+                  <button
+                    key={s}
+                    role="radio"
+                    aria-checked={s === screen}
+                    className={s === screen ? "on" : ""}
+                    onClick={() => setScreen(s)}
+                  >
+                    <span className="seg-plain">{LEGACY_SCREEN_LABEL[s]}</span>
+                    <span className="seg-enum">{LEGACY_SCREEN_ENUM[s]}</span>
+                  </button>
+                ))}
+          </div>
+          <span className="ctl-caption" aria-live="polite">
+            {src === "unwise" && unwise ? unwiseScreenCaption(unwise, unwiseScreen) : legacyScreenCaption(screen, real ? "real" : "synthetic")}
+          </span>
         </div>
-        {!real ? (
+        {src === "synthetic" ? (
           <div className="seg">
             <button disabled={!r.floor_shift} className={floor === "measured" ? "on" : ""} onClick={() => setFloor("measured")}>
               {fmtNum(r.by_floor[MEASURED]?.registration_floor.sigma_sys_arcsec, 3)}″ (Measured)
@@ -194,7 +282,210 @@ function HeatmapPanel({ d }: { d: IrDrill }) {
           </div>
         ) : null}
       </div>
-      {real && gate ? <RealGrid g={gate} screen={screen} /> : <SyntheticGrid d={d} screen={screen} floor={floor} />}
+      {src === "unwise" && unwise ? (
+        <UnwiseGrid g={unwise} screen={unwiseScreen} />
+      ) : real && gate ? (
+        <RealGrid g={gate} screen={screen} />
+      ) : (
+        <SyntheticGrid d={d} screen={screen} floor={floor} />
+      )}
+    </Panel>
+  );
+}
+
+/** Arm A recovery grid of one frozen unWISE screen (withheld real cutouts, reproduced_archive). */
+function UnwiseGrid({ g, screen }: { g: UnwiseGate; screen: UnwiseScreenName }) {
+  const s = g.screens[screen];
+  const cal = g.calibration_false_alarm_in_sample[screen];
+  const level = conformalLevel(g);
+  return (
+    <>
+      <HeatTable
+        seps={g.separations_arcsec}
+        fracs={g.flux_fractions}
+        values={s.arm_a_blend_recovery}
+        mode="prob"
+        title={(i, j) => {
+          const cp = s.arm_a_clopper_pearson_95[i]?.[j];
+          const cpText = cp ? ` (95% CP ${fmtPct(cp[0])}–${fmtPct(cp[1])})` : "";
+          return `θ=${g.separations_arcsec[i]}″ f_bg=${g.flux_fractions[j]}: ${kOverN(s.arm_a_k[i]?.[j], s.n_stars)} flagged${cpText}`;
+        }}
+      />
+      <p className="muted small num">
+        Arm A off-center injections into {s.n_stars} withheld unWISE W3 cutouts (one seeded azimuth per star and cell; exact 95%
+        intervals on hover) · empirical unWISE PSF FWHM {g.empirical_psf.fwhm_gaussian_arcsec.toFixed(2)}″ (nominal{" "}
+        {g.empirical_psf.nominal_fwhm_arcsec}″) on {g.empirical_psf.pixel_scale_arcsec}″ pixels · frozen on {g.n_calibration}{" "}
+        calibration stars · conformal level {level.text}
+        {level.fallback ? ` (fallback: ${fmtPct(level.requested)} was requested)` : ""} · calibration in-sample false alarm{" "}
+        {cal ? `${cal.k}/${cal.n}` : "—"} · withheld null false alarm {fmtRate(s.null_false_alarm)} (95% CP ≤{" "}
+        {fmtPct(s.null_false_alarm.clopper_pearson_95[1])}) · blend survival within 3.25″{" "}
+        <b>{s.blend_survival_within_3p25_arcsec.toFixed(3)}</b> · file <Hash sha={g.file_sha256} /> · code <Hash sha={g.code_git_sha} />
+      </p>
+    </>
+  );
+}
+
+function CmpCells({ cell, n, illustrative = false }: { cell: ComparisonCell | null; n: 2 | 3; illustrative?: boolean }) {
+  const edge = illustrative ? "cmp-edge cmp-illustrative" : "cmp-edge";
+  if (!cell) {
+    return (
+      <td colSpan={n} className={`muted small ${edge}`} title="This source never applied this rule; the cell is empty by construction.">
+        — no counterpart
+      </td>
+    );
+  }
+  return (
+    <>
+      <td className={`r num ${edge}`} title={cell.nullFaNote}>
+        {cell.nullFa}
+        <br />
+        <span className="muted small">{cell.nullFaBelow}</span>
+      </td>
+      <td className={illustrative ? "r num cmp-illustrative" : "r num"}>{fmtPct(cell.survival)}</td>
+      {n === 3 ? (
+        <td className="r num" title={cell.armBNote ?? ""}>
+          {cell.armB ?? "—"}
+          <br />
+          <span className="muted small">{cell.armBBelow ?? ""}</span>
+        </td>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * AllWISE Atlas (Gate #2) vs unsmoothed unWISE W3 (fresh split), with the synthetic grid in
+ * its own amber column group. Native HTML / CSS only; every number is read from the payload.
+ */
+function UnwiseComparisonPanel({ d }: { d: IrDrill }) {
+  const g = d.results.unwise_w3_gate;
+  if (!g) {
+    return (
+      <Panel title="AllWISE Atlas vs. Unsmoothed unWISE W3 Comparison">
+        <p className="muted">No unWISE W3 gate result is pinned in the IR survey.</p>
+      </Panel>
+    );
+  }
+  const c = g.comparison;
+  const p = c.provenance;
+  const psf = psfRows(c);
+  const widest = Math.max(...psf.map((x) => x.fwhmArcsec));
+  const rows = comparisonRows(c);
+  const level = conformalLevel(g);
+  const statement = likeForLikeStatement(c);
+  const src = c.sources;
+  return (
+    <Panel
+      title="AllWISE Atlas vs. Unsmoothed unWISE W3 Comparison"
+      aside={<TierBadge tier={g.data_tier} />}
+      className="panel-archive"
+    >
+      {statement ? <p className="statement">{statement}</p> : null}
+      <p className="eyebrow">Empirical W3 PSF width (FWHM of a Gaussian fit to the stacked calibration stars)</p>
+      <table className="tbl tbl-compact cmp-psf">
+        <tbody>
+          {psf.map((x) => (
+            <tr key={x.key}>
+              <td>
+                {x.label} {x.tier ? <TierBadge tier={x.tier} /> : <span className="muted small">reference value</span>}
+              </td>
+              <td className="r num">
+                <b>{x.fwhmArcsec.toFixed(2)}″</b>
+              </td>
+              <td className="num small muted">{x.key === "nominal" ? "1.00 ×" : `${x.ratioToNominal.toFixed(2)} × nominal`}</td>
+              <td className="cmp-bar-cell" aria-hidden="true">
+                <div className={x.tier ? "cmp-bar cmp-bar-archive" : "cmp-bar"} style={{ width: `${(100 * x.fwhmArcsec) / widest}%` }} />
+              </td>
+              <td className="small muted">{x.detail}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted small num">
+        Stars: unWISE {src.unwise_w3.n_calibration} calibration / {src.unwise_w3.n_withheld} withheld
+        {src.allwise_atlas_gate2
+          ? ` · Atlas ${src.allwise_atlas_gate2.n_calibration} calibration / ${src.allwise_atlas_gate2.n_withheld} withheld`
+          : ""}{" "}
+        · pixel-noise lag-1 correlation (x / y): unWISE {lag1Text(src.unwise_w3.pixel_covariance_lag1_correlation)}, Atlas{" "}
+        {src.allwise_atlas_gate2?.pixel_covariance_lag1_correlation ? lag1Text(src.allwise_atlas_gate2.pixel_covariance_lag1_correlation) : "not measured"}
+      </p>
+
+      <p className="eyebrow">
+        2 × 2 image screens and both centroid floors — withheld stars only, blends within {c.max_separation_arcsec}″
+      </p>
+      <div className="scroll-x">
+        <table className="tbl tbl-compact cmp-table">
+          <thead>
+            <tr>
+              <th rowSpan={2}>screen</th>
+              <th rowSpan={2}>frozen cutoff</th>
+              <th colSpan={3} className="cmp-edge">
+                {SOURCE_LABEL.unwise} <TierBadge tier={src.unwise_w3.data_tier} />
+              </th>
+              <th colSpan={3} className="cmp-edge">
+                {SOURCE_LABEL.real} {src.allwise_atlas_gate2 ? <TierBadge tier={src.allwise_atlas_gate2.data_tier} /> : null}
+              </th>
+              <th colSpan={2} className="cmp-edge cmp-illustrative">
+                {SOURCE_LABEL.synthetic} <TierBadge tier={src.synthetic_gaussian.data_tier} />
+              </th>
+            </tr>
+            <tr>
+              <th className="r cmp-edge">null false alarm</th>
+              <th className="r">blends surviving</th>
+              <th className="r">centered excess rejected</th>
+              <th className="r cmp-edge">null false alarm</th>
+              <th className="r">blends surviving</th>
+              <th className="r">centered excess rejected</th>
+              <th className="r cmp-edge cmp-illustrative">null false alarm</th>
+              <th className="r cmp-illustrative">blends surviving</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.screen} className={row.kind === "centroid" ? "cmp-centroid" : ""}>
+                <td>
+                  {row.label}
+                  <br />
+                  <span className="seg-enum">{row.screen}</span>
+                </td>
+                <td className="num small">
+                  {row.frozen.split(" · ").map((part) => (
+                    <div key={part}>{part}</div>
+                  ))}
+                </td>
+                <CmpCells cell={row.unwise} n={3} />
+                <CmpCells cell={row.atlas} n={3} />
+                <CmpCells cell={row.synthetic} n={2} illustrative />
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="muted small">
+        "Null false alarm" = clean stars wrongly flagged (lower is better). "Blends surviving" = Arm A blends within{" "}
+        {c.max_separation_arcsec}″ the screen misses (lower is better). "Centered excess rejected" = Arm B, a genuine on-star excess
+        wrongly flagged (lower is better). The range under each archive rate is its exact 95% Clopper–Pearson interval. {c.note}
+      </p>
+      <p className="small num">
+        <b>Centroid floors.</b> Locked Gate #1 σ_sys = {g.locked_sigma_sys_arcsec.toFixed(4)}″ (never overwritten) · fresh |b| &gt; 30°
+        σ_sys = {g.fresh_sigma_sys.sigma_sys_arcsec.toFixed(4)}″ ({g.fresh_sigma_sys.primary_estimator}, {g.fresh_sigma_sys.n_stars}{" "}
+        calibration stars). <b>Conformal level.</b> {level.text}
+        {level.fallback ? ` — v0.2.2-R3 fallback (${fmtPct(level.requested)} requested)` : ` (requested ≤ ${fmtPct(level.requested)})`}.
+      </p>
+      <p className="small num">
+        <b>Provenance.</b> code <Hash sha={p.code_git_sha} n={12} /> · pinned SHA-256 <Hash sha={p.file_sha256} n={16} /> ·{" "}
+        {overlapStatement(p)} (<Hash sha={p.disjoint_from_gate1_sha256} />) · {p.n_patches} patches, min |b| {p.min_abs_b_deg.toFixed(2)}°
+        · frozen {p.frozen_at_utc}, {freezeLeadSeconds(p).toFixed(1)} s before the first withheld fetch · rule{" "}
+        <span className="num">{p.rule_version}</span>
+      </p>
+      <details>
+        <summary>Caveats ({g.caveats.length})</summary>
+        <ul className="small">
+          {g.caveats.map((cv) => (
+            <li key={cv}>{cv}</li>
+          ))}
+        </ul>
+      </details>
     </Panel>
   );
 }

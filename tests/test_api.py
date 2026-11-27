@@ -16,6 +16,9 @@ from conftest import ROOT
 from fermi_desk.api import create_app, is_loopback_host, json_safe
 from fermi_desk.queue.store import JOB_DEFINITIONS
 
+# v0.2.2b: SHA-256 of the promoted data/calibrations/unwise_w3_gate_withheld.json
+UNWISE_GATE_SHA256 = "b49e997054726bcfebd5b7ba5ca255a4071c3627af9ce7f871eee2799302f238"
+
 FAST_JOBS = {
     "lookback_window_t_sweep": {
         "n_points": 2,
@@ -87,6 +90,14 @@ def test_health_reports_provenance(client):
     assert (h["n_controls"], h["n_calibration"], h["n_withheld"]) == (154, 77, 77)
     assert h["calibration_data_tier"] == "reproduced_archive"
     assert h["fits_gate2_data_tier"] == "reproduced_archive" and len(h["fits_gate2_sha256"]) == 64
+    # v0.2.2b: the promoted unsmoothed unWISE W3 fresh-split gate, read from the verified file.
+    assert h["unwise_gate_data_tier"] == "reproduced_archive"
+    assert h["unwise_gate_sha256"] == UNWISE_GATE_SHA256
+    assert (h["unwise_n_controls"], h["unwise_n_calibration"], h["unwise_n_withheld"]) == (
+        252,
+        126,
+        126,
+    )
 
 
 def test_registry_groups_tiers_with_monoculture_audits(client):
@@ -148,6 +159,126 @@ def test_infrared_drilldown_payload(client):
     assert res["data_tier"] == "illustrative_calibration"  # synthetic grid keeps its tier
     assert r["rng_seed"] == 42
     assert client.get("/api/infrared/drilldown?seed=-3").status_code == 422
+
+
+def test_infrared_drilldown_exposes_the_promoted_unwise_w3_gate(client):
+    """v0.2.2b: the unWISE W3 block and its three-source comparison, tiers never blended."""
+    r = client.get("/api/infrared/drilldown?seed=42")
+    assert r.status_code == 200, r.text
+    res = r.json()["results"]
+    u = res["unwise_w3_gate"]
+    assert u["data_tier"] == "reproduced_archive" and u["file_sha256"] == UNWISE_GATE_SHA256
+    assert len(u["code_git_sha"]) == 40 and u["rule_version"] == "unwise-gate-v1"
+    assert (u["n_controls"], u["n_calibration"], u["n_withheld"]) == (252, 126, 126)
+    assert u["frozen_before_withheld_fetch"] is True
+    assert u["latest_calibration_fetch_utc"] < u["frozen_at_utc"] < u["earliest_withheld_fetch_utc"]
+    assert u["conformal_alpha_requested"] == 0.01 and u["conformal_alpha_fallback"] is False
+    assert set(u["screens"]) == {
+        "centroid_locked",
+        "centroid_fresh",
+        "image_scalar_chi2",
+        "image_gls_chi2",
+        "image_scalar_conformal",
+        "image_gls_conformal",
+        "naive_flux_excess",
+    }
+    assert u["locked_sigma_sys_arcsec"] == pytest.approx(0.4356, abs=1e-4)
+    assert u["fresh_sigma_sys"]["sigma_sys_arcsec"] != u["locked_sigma_sys_arcsec"]
+
+    c = u["comparison"]
+    src = c["sources"]
+    assert set(src) == {"unwise_w3", "allwise_atlas_gate2", "synthetic_gaussian"}
+    assert (
+        src["unwise_w3"]["data_tier"]
+        == src["allwise_atlas_gate2"]["data_tier"]
+        == ("reproduced_archive")
+    )
+    assert src["synthetic_gaussian"]["data_tier"] == "illustrative_calibration"
+    assert c["nominal_w3_fwhm_arcsec"] == src["synthetic_gaussian"]["psf_fwhm_arcsec"] == 6.5
+    gate2 = res["real_fits_gate2"]
+    assert (
+        src["allwise_atlas_gate2"]["psf_fwhm_arcsec"]
+        == (gate2["empirical_psf"]["fwhm_gaussian_arcsec"])
+    )
+    assert src["allwise_atlas_gate2"]["psf_fwhm_arcsec"] == pytest.approx(13.69, abs=5e-3)
+    assert src["unwise_w3"]["psf_fwhm_arcsec"] == u["empirical_psf"]["fwhm_gaussian_arcsec"]
+    assert src["unwise_w3"]["pixel_scale_arcsec"] == 2.75
+    assert len(src["unwise_w3"]["pixel_covariance_lag1_correlation"]) == 2
+    assert src["allwise_atlas_gate2"]["pixel_covariance_lag1_correlation"] is None
+
+    image = {row["screen"]: row for row in c["image_screens"]}
+    assert list(image) == [
+        "image_scalar_chi2",
+        "image_gls_chi2",
+        "image_scalar_conformal",
+        "image_gls_conformal",
+    ]
+    assert [(r_["statistic"], r_["threshold_rule"]) for r_ in image.values()] == [
+        ("scalar", "chi2"),
+        ("gls", "chi2"),
+        ("scalar", "conformal"),
+        ("gls", "conformal"),
+    ]
+    floors = {row["screen"]: row for row in c["centroid_floors"]}
+    assert list(floors) == ["centroid_locked", "centroid_fresh"]
+    for name, row in {**image, **floors}.items():
+        cell = row["unwise_w3"]
+        assert cell == {
+            "n_stars": 126,
+            "null_false_alarm": u["screens"][name]["null_false_alarm"],
+            "blend_survival_within_3p25_arcsec": u["screens"][name][
+                "blend_survival_within_3p25_arcsec"
+            ],
+            "arm_b_false_rejection_pooled": u["screens"][name]["arm_b_false_rejection_pooled"],
+        }
+        fa = cell["null_false_alarm"]
+        lo, hi = fa["clopper_pearson_95"]  # Clopper-Pearson 95% bounds on the withheld null FA
+        assert fa["n"] == 126 and 0.0 <= lo <= fa["rate"] <= hi <= 1.0
+        assert row["calibration_false_alarm_in_sample"]["n"] == 126
+    # Gate #2 and the synthetic grid appear only where they applied the same rule.
+    like = image["image_scalar_chi2"]
+    assert like["counterpart"] == "image"
+    assert (
+        like["allwise_atlas_gate2"]["null_false_alarm"]
+        == gate2["screens"]["image"]["null_false_alarm"]
+    )
+    assert like["allwise_atlas_gate2"]["null_false_alarm"]["k"] == 5  # Gate #2: 5/77
+    assert like["allwise_atlas_gate2"]["blend_survival_within_3p25_arcsec"] == pytest.approx(
+        0.934, abs=5e-4
+    )
+    assert like["synthetic_gaussian"]["arm_b_false_rejection_pooled"] is None
+    assert (
+        floors["centroid_locked"]["allwise_atlas_gate2"]["null_false_alarm"]
+        == (gate2["screens"]["centroid"]["null_false_alarm"])
+    )
+    for name in ("image_gls_chi2", "image_scalar_conformal", "image_gls_conformal"):
+        assert image[name]["allwise_atlas_gate2"] is None
+        assert image[name]["synthetic_gaussian"] is None and image[name]["counterpart"] is None
+    assert floors["centroid_fresh"]["allwise_atlas_gate2"] is None
+    assert floors["centroid_locked"]["sigma_sys_source"] == "locked"
+    assert floors["centroid_fresh"]["sigma_sys_arcsec"] == u["fresh_sigma_sys"]["sigma_sys_arcsec"]
+    for name in ("image_scalar_conformal", "image_gls_conformal"):
+        assert image[name]["alpha_guaranteed"] == pytest.approx(1 / 127)
+
+    prov = c["provenance"]
+    assert prov["file_sha256"] == UNWISE_GATE_SHA256 and prov["n_gate1_star_overlap"] == 0
+    assert (prov["n_fresh_stars"], prov["n_gate1_stars"], prov["n_patches"]) == (252, 154, 16)
+    assert prov["disjoint_from_gate1_sha256"].startswith("2da2a234")
+    assert prov["min_abs_b_deg"] > 30.0
+    assert prov["frozen_at_utc"] < prov["earliest_withheld_fetch_utc"]
+    # Ruling v0.2.1-R4: no Gaia id anywhere in the block is a JSON number.
+    for key, value in _walk(u):
+        if key == "gaia_dr3_source_id":
+            assert isinstance(value, str) and value.isdigit(), value
+        if isinstance(value, int) and not isinstance(value, bool):
+            assert abs(value) <= MAX_SAFE_JSON_INT, (key, value)
+    import re
+
+    assert re.search(r'"gaia_dr3_source_id":\s*[0-9-]', r.text) is None
+    assert re.search(r'"star_ids":\s*\[\s*[0-9]', r.text) is None
+    # The synthetic grid keeps its own tier; the IR drill-down tier is unchanged.
+    assert res["data_tier"] == "illustrative_calibration"
+    assert res["blend_survival_side_by_side"]["real_fits"]["data_tier"] == "reproduced_archive"
 
 
 def test_adversary_receipt(client):

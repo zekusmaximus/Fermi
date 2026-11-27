@@ -46,6 +46,12 @@ export interface Health {
   calibration_data_tier: string | null;
   fits_gate2_sha256: string | null;
   fits_gate2_data_tier: string | null;
+  /** v0.2.2b: promoted unsmoothed unWISE W3 fresh-split gate (null until a survey pins it). */
+  unwise_gate_sha256: string | null;
+  unwise_gate_data_tier: string | null;
+  unwise_n_controls: number | null;
+  unwise_n_calibration: number | null;
+  unwise_n_withheld: number | null;
   /** v0.2.1b: promoted Gaia DR3 background-field extension (null until a survey pins one). */
   background_survey_id: string | null;
   background_summary_sha256: string | null;
@@ -730,6 +736,185 @@ export interface Gate2 {
   caveats: string[];
 }
 
+/** v0.2.2b: screens of the unsmoothed unWISE W3 gate (rule version unwise-gate-v1). */
+export type UnwiseScreenName =
+  | "centroid_locked"
+  | "centroid_fresh"
+  | "image_scalar_chi2"
+  | "image_gls_chi2"
+  | "image_scalar_conformal"
+  | "image_gls_conformal"
+  | "naive_flux_excess";
+
+export interface UnwiseScreen extends Gate2Screen {
+  role: string;
+}
+
+/** One reproduced_archive screen result on withheld real cutouts. */
+export interface UnwiseArchiveCell {
+  n_stars: number;
+  null_false_alarm: Rate;
+  blend_survival_within_3p25_arcsec: number;
+  arm_b_false_rejection_pooled: Rate;
+}
+
+/** The synthetic Gaussian grid's screen result (illustrative_calibration; it has no Arm B). */
+export interface UnwiseSyntheticCell {
+  n_null_trials: number;
+  null_false_alarm_rate: number;
+  blend_survival_within_3p25_arcsec: number;
+  arm_b_false_rejection_pooled: null;
+  registration_floor: string;
+}
+
+export interface UnwiseComparisonRow {
+  screen: UnwiseScreenName;
+  kind: "image" | "centroid";
+  label: string;
+  role: string;
+  /** Image screens only. */
+  statistic?: "scalar" | "gls";
+  threshold_rule?: "chi2" | "conformal";
+  threshold?: number;
+  delta_chi2_scale?: number | null;
+  alpha_guaranteed?: number | null;
+  k_exceedances?: number | null;
+  /** Centroid screens only. */
+  sigma_sys_arcsec?: number;
+  sigma_sys_source?: string;
+  threshold_arcsec_at_calibration_median_snr?: number;
+  calibration_false_alarm_in_sample: Rate;
+  unwise_w3: UnwiseArchiveCell;
+  /** Null unless Gate #2 applied the same rule (scalar chi2 image, locked-floor centroid). */
+  allwise_atlas_gate2: UnwiseArchiveCell | null;
+  synthetic_gaussian: UnwiseSyntheticCell | null;
+  counterpart: "image" | "centroid" | null;
+}
+
+export interface UnwiseSourceInfo {
+  label: string;
+  data_tier: string;
+  psf_fwhm_arcsec: number;
+  psf_fwhm_halfmax_arcsec: number | null;
+  pixel_scale_arcsec: number | null;
+  n_psf_stars: number | null;
+  n_controls: number | null;
+  n_calibration: number | null;
+  n_withheld: number | null;
+  pixel_covariance_lag1_correlation: [number, number] | null;
+  noise_model: string;
+  code_git_sha: string | null;
+  file_sha256: string | null;
+}
+
+export interface UnwiseProvenance {
+  pinned_by_survey: string;
+  path: string;
+  file_sha256: string;
+  content_sha256: string;
+  code_git_sha: string;
+  rule_version: string;
+  frozen_at_utc: string;
+  latest_calibration_fetch_utc: string;
+  earliest_withheld_fetch_utc: string;
+  frozen_before_withheld_fetch: boolean;
+  disjoint_from_gate1_path: string;
+  disjoint_from_gate1_sha256: string;
+  n_gate1_stars: number;
+  n_fresh_stars: number;
+  n_gate1_star_overlap: number;
+  min_abs_b_deg: number;
+  n_patches: number;
+}
+
+/** Three-source comparison: unWISE W3 vs AllWISE W3 Atlas (Gate #2) vs synthetic Gaussian. */
+export interface UnwiseComparison {
+  max_separation_arcsec: number;
+  weighting: string;
+  nominal_w3_fwhm_arcsec: number;
+  sources: {
+    unwise_w3: UnwiseSourceInfo;
+    allwise_atlas_gate2: UnwiseSourceInfo | null;
+    synthetic_gaussian: UnwiseSourceInfo;
+  };
+  image_screens: UnwiseComparisonRow[];
+  centroid_floors: UnwiseComparisonRow[];
+  provenance: UnwiseProvenance;
+  note: string;
+}
+
+/** Promoted unsmoothed unWISE W3 fresh-split gate (reproduced_archive, v0.2.2b). */
+export interface UnwiseGate {
+  id: string;
+  path: string;
+  file_sha256: string;
+  content_sha256: string;
+  data_tier: string;
+  rule_version: string;
+  code_git_sha: string;
+  rng_seed: number;
+  query_window_utc: string[];
+  frozen_at_utc: string;
+  frozen_state_sha256: string;
+  frozen_before_withheld_fetch: boolean;
+  disjoint_from_gate1_sha256: string;
+  latest_calibration_fetch_utc: string;
+  earliest_withheld_fetch_utc: string;
+  n_patches: number;
+  n_controls: number;
+  n_calibration: number;
+  n_withheld: number;
+  min_abs_b_deg: number;
+  patches: {
+    patch_id: string;
+    l_deg: number;
+    b_deg: number;
+    radius_deg: number;
+    n_calibration_controls: number;
+    n_withheld_controls: number;
+    nearest_locked_patch_id: string;
+    nearest_locked_patch_separation_deg: number;
+  }[];
+  n_requested: number;
+  n_fetched_ok: number;
+  n_failed: number;
+  /** Cutouts that could not be used; every id is a decimal string (ruling v0.2.1-R4). */
+  unusable_cutouts: { gaia_dr3_source_id: string; split: string; kind: string; reason: string }[];
+  target_false_alarm: number;
+  conformal_alpha_requested: number;
+  conformal_alpha_nominal: number;
+  /** True when the frozen level is the v0.2.2-R3 fallback 1 / (n_cal + 1). */
+  conformal_alpha_fallback: boolean;
+  empirical_psf: {
+    fwhm_gaussian_arcsec: number;
+    fwhm_halfmax_arcsec: number;
+    nominal_fwhm_arcsec: number;
+    n_stars: number;
+    pixel_scale_arcsec: number;
+  };
+  noise_model: {
+    variance_inflation: number;
+    correlation_lag1: [number, number];
+    shrinkage: number;
+    minimum_eigenvalue_bound: number;
+  };
+  locked_sigma_sys_arcsec: number;
+  fresh_sigma_sys: {
+    primary_estimator: string;
+    sigma_sys_arcsec: number;
+    sigma_sys_by_estimator_arcsec: Record<string, number>;
+    n_stars: number;
+  };
+  frozen_screens: Record<UnwiseScreenName, Record<string, string | number | null>>;
+  calibration_false_alarm_in_sample: Record<string, Rate>;
+  separations_arcsec: number[];
+  flux_fractions: number[];
+  screens: Record<UnwiseScreenName, UnwiseScreen>;
+  survival_weighting: string;
+  caveats: string[];
+  comparison: UnwiseComparison;
+}
+
 export interface SurvivalSideBySide {
   max_separation_arcsec: number;
   weighting: string;
@@ -762,6 +947,8 @@ export interface IrDrill {
     data_tier: string;
     real_fits_gate2: Gate2 | null;
     blend_survival_side_by_side: SurvivalSideBySide | null;
+    /** v0.2.2b: null until the IR survey pins the promoted unWISE W3 gate. */
+    unwise_w3_gate: UnwiseGate | null;
     registration_floors: RegistrationFloor[];
     small_sample_false_alarm_bounds: SmallSampleBounds | null;
     control_experiment: {

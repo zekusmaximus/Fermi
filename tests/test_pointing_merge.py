@@ -779,7 +779,16 @@ def test_reproduced_archive_summary_needs_clean_sha_complete_coverage_and_receip
     base = {**synthetic.doc, "data_tier": "reproduced_archive", "source_receipt": receipt}
     with pytest.raises(ProvenanceError, match="clean 40-hex commit"):
         BackgroundSummaryFile.model_validate(base)
-    clean = {**base, "code_git_sha": "b" * 40}
+    # ... nor without saying when it was assembled, from which raw cone bytes, and which
+    # commits queried the archive (the receipt itself is gitignored).
+    cone = {
+        "assembled_at_utc": "2026-11-26T00:00:02+00:00",
+        "cone_cache_manifest_sha256": synthetic.doc["merge_provenance"]["input_sha256s"][1],
+        "cone_cache_code_git_shas": ["c" * 40],
+    }
+    with pytest.raises(ProvenanceError, match="assembled_at_utc"):
+        BackgroundSummaryFile.model_validate({**base, "code_git_sha": "b" * 40})
+    clean = {**base, "code_git_sha": "b" * 40, **cone}
     # Positive control for the negative cases below (in memory only, never written): with a
     # clean commit, full coverage and a receipt the gate opens.
     assert BackgroundSummaryFile.model_validate(clean).n_pointings_completed == 692
@@ -789,6 +798,16 @@ def test_reproduced_archive_summary_needs_clean_sha_complete_coverage_and_receip
         BackgroundSummaryFile.model_validate({**clean, "source_receipt": None})
     with pytest.raises(SchemaValidationError, match="beam_fwhm_arcmin / 2"):
         BackgroundSummaryFile.model_validate({**clean, "cone_radius_arcmin": 4.0})
+    for over, message in (
+        ({"assembled_at_utc": "2026-11-25T00:00:00+00:00"}, "precede assembled_at_utc"),
+        ({"fetched_at_utc": "2026-11-26T00:00:00+00:00"}, "last archive query time"),
+        ({"cone_cache_manifest_sha256": None}, "cone_cache_manifest_sha256"),
+        ({"cone_cache_manifest_sha256": "0" * 64}, "recorded cone cache"),
+        ({"cone_cache_code_git_shas": []}, "non-clean tree"),
+        ({"cone_cache_code_git_shas": ["c" * 40, "dirty"]}, "non-clean tree"),
+    ):
+        with pytest.raises(ProvenanceError, match=message):
+            BackgroundSummaryFile.model_validate({**clean, **over})
     # The frozen protocol constants: 692 pointings, 8.4' beam / 4.2' cone, d_max = 10 kpc,
     # a validation sample of at least 1,000 background stars.
     assert (clean["n_pointings"], clean["beam_fwhm_arcmin"], clean["cone_radius_arcmin"]) == (
@@ -1049,6 +1068,21 @@ def test_live_fetch_stops_after_consecutive_failures_and_caps_attempts(
     assert rec["cache"]["n_attempted_this_run"] == 2
     assert rec["cache"]["aborted_after_consecutive_failures"] is False
     assert script._NETWORK_ALLOWED is False  # the guard is restored after the run
+
+
+def test_archive_query_window_is_when_cones_were_fetched_not_when_the_run_ran(script):
+    """A resumed / cache-only run must not stamp the artifact with its own wall clock."""
+    rows = [
+        {"pointing_index": 1, "fetched_at_utc": "2026-11-27T16:39:02.280882+00:00"},
+        {"pointing_index": 0, "fetched_at_utc": "2026-11-27T16:18:22.081409+00:00"},
+        {"pointing_index": 2, "fetched_at_utc": "2026-11-27T16:25:00.000000+00:00"},
+    ]
+    run = ("2026-11-27T16:39:44+00:00", "2026-11-27T16:39:46+00:00")
+    assert script.archive_query_window(rows, run) == (
+        "2026-11-27T16:18:22.081409+00:00",
+        "2026-11-27T16:39:02.280882+00:00",
+    )
+    assert script.archive_query_window([], run) == run
 
 
 def _receipt(script, **over):

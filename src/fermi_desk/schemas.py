@@ -952,6 +952,14 @@ class BackgroundSummaryFile(_Frozen):
     validation_sample: BackgroundValidationSample
     spatial_correlation_assumption: str = Field(min_length=1)
     source_receipt: SourceReceipt | None = None
+    # Self-description without the (gitignored) receipt. `query_window_utc` /
+    # `fetched_at_utc` are when cones were actually fetched from the archive;
+    # `assembled_at_utc` is when this summary was built from the cone cache (later, for
+    # a resumed or cache-only run). The manifest digest pins the raw cone bytes and the
+    # commit list names every code version that queried the archive.
+    assembled_at_utc: str | None = None
+    cone_cache_manifest_sha256: str | None = None
+    cone_cache_code_git_shas: list[str] = Field(default_factory=list)
     content_sha256: str
 
     @model_validator(mode="after")
@@ -1007,6 +1015,33 @@ class BackgroundSummaryFile(_Frozen):
                 )
             if self.source_receipt is None:
                 raise ProvenanceError("reproduced_archive summary needs its source_receipt")
+            if self.assembled_at_utc is None:
+                raise ProvenanceError("reproduced_archive summary needs assembled_at_utc")
+            _iso_utc(self.assembled_at_utc, "assembled_at_utc")
+            first, last = (datetime.fromisoformat(t) for t in self.query_window_utc)
+            if not first <= last <= datetime.fromisoformat(self.assembled_at_utc):
+                raise ProvenanceError(
+                    "archive query window must be ordered and precede assembled_at_utc"
+                )
+            if self.fetched_at_utc != self.query_window_utc[1]:
+                raise ProvenanceError("fetched_at_utc must be the last archive query time")
+            if self.cone_cache_manifest_sha256 is None or not _SHA256_RE.match(
+                self.cone_cache_manifest_sha256
+            ):
+                raise ProvenanceError(
+                    "reproduced_archive summary needs cone_cache_manifest_sha256 (64-hex)"
+                )
+            if mp.input_sha256s[1] != self.cone_cache_manifest_sha256:
+                raise ProvenanceError(
+                    "merge provenance was not computed from the recorded cone cache"
+                )
+            if not self.cone_cache_code_git_shas or any(
+                not _GIT_SHA_RE.match(s) for s in self.cone_cache_code_git_shas
+            ):
+                raise ProvenanceError(
+                    "cone cache holds pointings fetched from a non-clean tree: "
+                    f"{self.cone_cache_code_git_shas}"
+                )
             canonical = {
                 "n_pointings": (self.n_pointings, BL_LBAND_N_POINTINGS),
                 "beam_fwhm_arcmin": (self.beam_fwhm_arcmin, BL_LBAND_BEAM_FWHM_ARCMIN),

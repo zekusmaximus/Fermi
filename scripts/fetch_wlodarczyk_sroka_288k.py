@@ -517,6 +517,7 @@ def assemble(
     n_validation: int,
     background_sha256: str = "",
     binning: radio.ShellBinning = radio.DEFAULT_SHELL_BINNING,
+    extra_meta: dict | None = None,
 ) -> tuple[dict, MergedTargets]:
     """Cones -> distances -> union_targets_by_pointing -> compact summary document."""
     fwhm, cone = beam(parent)
@@ -555,6 +556,7 @@ def assemble(
             "primary_catalog_path": parent.catalog_path,
             "n_pointings_completed": n_completed,
             "angular_match_epoch": ANGULAR_MATCH_EPOCH,
+            **(extra_meta or {}),
         },
         rng_seed=rng_seed,
         n_validation=n_validation,
@@ -583,6 +585,20 @@ def shell_binning(bin_dex: float) -> radio.ShellBinning:
         eirp_log10_w_min=8.0,
         n_eirp_bins=math.ceil(12.0 / bin_dex),
     )
+
+
+def archive_query_window(
+    per_pointing: Sequence[dict], fallback: tuple[str, str]
+) -> tuple[str, str]:
+    """(first, last) time a cone was actually fetched from the archive.
+
+    A resumed or cache-only run assembles cones that were queried earlier, so the run's
+    own wall-clock window is NOT when the archive was queried. The per-pointing manifest
+    entries carry the true fetch times (compared as parsed datetimes, not as text).
+    """
+    times = [str(r["fetched_at_utc"]) for r in per_pointing if r.get("fetched_at_utc")]
+    times.sort(key=datetime.fromisoformat)
+    return (times[0], times[-1]) if times else fallback
 
 
 # -------------------------------------------------------- synthetic rehearsal
@@ -874,6 +890,9 @@ def live_fetch(args: argparse.Namespace) -> int:
     manifest_digest = canonical_sha256(
         {str(r["pointing_index"]): r["sha256"] for r in per_pointing}
     )
+    # When the archive was really queried (not when this - possibly cache-only - run ran).
+    archive_window = archive_query_window(per_pointing, (started, finished))
+    cache_shas = sorted({str(r.get("code_git_sha")) for r in per_pointing})
     summary = None
     if n_done:
         summary, _ = assemble(
@@ -882,7 +901,7 @@ def live_fetch(args: argparse.Namespace) -> int:
             parent,
             data_tier="reproduced_archive",
             code_git_sha=git_sha,
-            window=(started, finished),
+            window=archive_window,
             source_service=f"{ep['label']}: {ep['url']} ({ep['gaia_source']}, {ep['distance_table']})",
             adql=adql_template(args.endpoint),
             n_completed=n_done,
@@ -890,6 +909,13 @@ def live_fetch(args: argparse.Namespace) -> int:
             n_validation=args.n_validation,
             binning=shell_binning(args.bin_dex),
             background_sha256=manifest_digest,
+            extra_meta={
+                # The artifact must describe itself without the gitignored receipt: when
+                # it was assembled, from which raw cone bytes, fetched by which commits.
+                "assembled_at_utc": finished,
+                "cone_cache_manifest_sha256": manifest_digest,
+                "cone_cache_code_git_shas": cache_shas,
+            },
         )
     receipt = {
         "kind": KIND,
@@ -898,7 +924,8 @@ def live_fetch(args: argparse.Namespace) -> int:
         "code_git_sha": git_sha,
         "git_head": git_head,
         "rng_seed": args.seed,
-        "query_window_utc": [started, finished],
+        "query_window_utc": [started, finished],  # this run (may be cache-only)
+        "archive_query_window_utc": list(archive_window),  # when cones were fetched
         "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         "endpoint": ep,
         "methodology_note": METHODOLOGY_NOTE,
@@ -917,7 +944,7 @@ def live_fetch(args: argparse.Namespace) -> int:
             "n_fetched_this_run": n_new,
             "n_attempted_this_run": n_attempted,
             "aborted_after_consecutive_failures": aborted,
-            "code_git_shas": sorted({str(r.get("code_git_sha")) for r in per_pointing}),
+            "code_git_shas": cache_shas,
         },
         "failures": failures,
         "per_pointing": per_pointing,

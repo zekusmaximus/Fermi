@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An offline-reproducible **empirical constraint engine and Bayesian Optimal Experimental Design (BOED) desk** for the Fermi paradox (`v0.2.0`).
+An offline-reproducible **empirical constraint engine and Bayesian Optimal Experimental Design (BOED) desk** for the Fermi paradox (`v0.2.1`).
 
 Instead of cataloging verbal hypotheses or static Drake Equation sliders, this repository encodes Galactic-scale Fermi resolutions as parameterized probability models over a shared physical registry, evaluates them against SHA-256-locked astronomical catalogs and archive calibrations, audits catalog and geometric assumptions adversarially, and ranks the highest-leverage next archival queries and diagnostic compute sweeps by **Expected Information Gain (bits per hour)** and **diagnostic priority**.
 
@@ -21,7 +21,7 @@ From the interactive desk (starting on the live **Overview** landing view), you 
 
 ---
 
-## Verified Empirical Results (`v0.2.0`)
+## Verified Empirical Results (`v0.2.1`)
 
 Null verdicts and out-of-sample screen failures are first-class outputs here, never tuned away:
 
@@ -32,6 +32,8 @@ Null verdicts and out-of-sample screen failures are first-class outputs here, ne
 | **Macro Radio — `finite_disk_3d`, `--marginalize-lookback` (`50 kyr–10 Myr`)** | `published_catalog` | **`-0.08566`** (uniform) / **`-0.09370`** (exponential) — null on Jeffreys scale (`\|log10 BF\| < 0.5`; BL 692 radio term `~1e-4 dex`) |
 | **Gate #1 — AllWISE Astrometric Floor (`154` stars / `12` patches)** | `reproduced_archive` | **`sigma_sys = 0.4356"`** (vs. `0.500"` legacy); **`0/77`** withheld 3-sigma false alarms (`95% UL <= 0.047`; vs. `11/77` with no floor) |
 | **Gate #2 — Real AllWISE W3 Atlas FITS Withheld Two-Arm Test (`154/154` cutouts)** | `reproduced_archive` | Empirical Atlas PSF FWHM **`13.69"`** (vs. `6.5"` nominal). Frozen centroid screen holds (**`0.671`** blend survival `<= 3.25"`, **`0.3%`** Arm B centered-excess rejection). Frozen image-level `delta_chi2` screen **fails out of sample** (`5/77 = 6.5%` null FA, `0.934` survival vs. `0.760` synthetic) — preserved as an honest negative result |
+
+- **`v0.2.1` — Gaia DR3 background field in the 692 beams (`reproduced_archive`; EIG values additionally `illustrative_calibration`, never a verified bound):** **`119,947`** off-axis background stars in `46,888` shell cells (SHA-256 `eb43b118ab4d0258d9fe20474b73d187cb62a98018b20790b4112f875b0018a9`), merged star-by-star with the primaries via `union_targets_by_pointing` and attenuated by the GBT beam and distance. The realized information gain is a **null-strength result**: **`0.00235 bits`** in the physical mode (`distance_scaled_eirp`; `0.0145` predicted) vs. `0.651 bits` in the unphysical flat mode. The same audit exposed a **catalog erratum**: Isaacson et al. (2017) Table 1 prints **`14/692`** targets at `+10°` instead of `-10°`. The locked target list is left exactly as published; the affected background cones are corrected non-destructively through the SHA-256-pinned `data/adversary_claims/isaacson_2017_dec_sign_flip.yaml`. (`692stars.csv` separately prints 3 targets at `+00°` instead of `-00°`; the locked catalog does not inherit those.)
 
 ---
 
@@ -56,10 +58,10 @@ Requires Python 3.11+, [`uv`](https://docs.astral.sh/uv/), and Node.js 20+ (only
 # 1. Install Python dependencies
 uv sync
 
-# 2. Validate all YAML schemas, Astropy units, locked SHA-256 hashes, and offline recomputations (36/36)
+# 2. Validate all YAML schemas, Astropy units, locked SHA-256 hashes, and offline recomputations (41/41)
 uv run fermi-desk validate
 
-# 3. Run the offline Scientific CI test suite (275 tests; non-loopback sockets hard-blocked)
+# 3. Run the offline Scientific CI test suite (386 tests; non-loopback sockets hard-blocked)
 uv run pytest -v
 
 # 4. Run flagship macro comparisons (2D baseline, 3D EIRP, and v0.2.0 finite disk + T marginalization)
@@ -68,6 +70,9 @@ uv run fermi-desk compare --geometry thick_disk_3d --radio-mode distance_scaled_
 uv run fermi-desk compare --geometry finite_disk_3d --radio-mode flat_probability --seed 42
 uv run fermi-desk compare --geometry finite_disk_3d --disk-profile exponential --radio-mode flat_probability --seed 42
 uv run fermi-desk compare --geometry finite_disk_3d --radio-mode flat_probability --marginalize-lookback --seed 42
+
+# 5. v0.2.1: merge the 119,947 Gaia DR3 background stars into the 692 beams (off-axis attenuation)
+uv run fermi-desk compare --geometry thin_disk_2d --radio-mode distance_scaled_eirp --pointing-merge-policy union_targets_by_pointing --seed 42
 ```
 
 `--marginalize-lookback` integrates the lookback window `T` over the registry's log-uniform prior (`50 kyr–10 Myr`) in likelihood space via 16-node Gauss–Legendre quadrature in `ln T`; expect roughly 40 s (`thin_disk_2d`), 95 s (`finite_disk_3d`), or 2.5 min (`thick_disk_3d`). Every `compare` run writes a deterministic JSON `RunReceipt` (git SHA, RNG seed, active surveys, data tiers, `results_sha256`) to `runs/`.
@@ -77,6 +82,7 @@ uv run fermi-desk compare --geometry finite_disk_3d --radio-mode flat_probabilit
 ```bash
 uv run fermi-desk ir-drilldown --seed 42               # Real-FITS Gate #2 vs. synthetic Gaussian grid + D/E anchors
 uv run fermi-desk adversary run --seed 42              # HIP 1692 triple-distance audit, 16 beam pairs, D/E, symmetry, validity
+uv run fermi-desk background-field                     # v0.2.1 background field: counts, pointing audit, realized vs. predicted EIG
 uv run fermi-desk queue seed                           # Seed/refresh SQLite BOED queue (non-destructive on existing runs)
 uv run fermi-desk queue list
 uv run fermi-desk queue claim lookback_window_t_sweep --by you
@@ -87,7 +93,7 @@ uv run fermi-desk queue replay lookback_window_t_sweep # Reproduces output_sha25
 ### Interactive Research Desk (FastAPI + React/TypeScript/Vite, 100% Offline)
 
 ```bash
-cd web && npm ci && npm test && npm run build && cd .. # 38 Vitest tests + production bundle -> web/dist
+cd web && npm ci && npm test && npm run build && cd .. # 85 Vitest tests + production bundle -> web/dist
 uv run fermi-desk serve                                # [http://127.0.0.1:8000](http://127.0.0.1:8000) (UI at /, API at /api/*, docs at /docs)
 # UI hot-reload dev: run `uv run fermi-desk serve` and, in web/, `npm run dev` (proxies /api)
 uv run fermi-desk serve --host 0.0.0.0 --read-only     # LAN/public bind: queue Run/Replay return 403 (CLI only)
@@ -110,6 +116,7 @@ uv run python scripts/run_wise_fits_gate2.py --seed 42 # Gate #2: IRSA W3 Atlas 
 ```text
 ├── SPEC.md                       # Master architecture, data contracts, and core invariants
 ├── AGENTS.md                     # Universal scientific & engineering laws + §5 handoff protocol
+├── DESIGN.md                     # UI legibility, data-tier colors, and offline visualization rules for web/
 ├── docs/
 │   ├── PLANNING_LEDGER.md        # Locked SHA-256 hashes, canonical baselines, and chronological rulings
 │   ├── V0_2_ROADMAP.md           # v0.2 sprint roadmap (finite disk, 288k union merge, unWISE, large-N)
@@ -120,12 +127,14 @@ uv run python scripts/run_wise_fits_gate2.py --seed 42 # Gate #2: IRSA W3 Atlas 
 │   ├── hypotheses/               # Tier 1–3 hypothesis definitions
 │   ├── surveys/                  # Calibrated survey metadata and pinned artifact hashes
 │   ├── catalogs/                 # Locked published_catalog targets (bl_692_targets.csv)
+│   │   └── bl_gbt_lband_background_summary.json   # Locked reproduced_archive Gaia DR3 background field (v0.2.1)
 │   ├── calibrations/             # Locked reproduced_archive WISE Gate #1 & Gate #2 artifacts
 │   └── adversary_claims/         # Structured catalog/methodology anchor claims (HIP 1692, Hephaistos)
+│       └── isaacson_2017_dec_sign_flip.yaml       # Isaacson (2017) -10° erratum + pinned pointing overlay (v0.2.1)
 ├── scripts/                      # Opt-in live archive fetchers with SHA-256 provenance receipts
 ├── src/fermi_desk/               # Schemas, physics kernels, Bayesian engine, Adversary, Queue, CLI, API
 ├── web/                          # React + TypeScript + Vite interactive desk (6 views, zero chart bloat)
-└── tests/                        # Offline Scientific CI invariants, API, and regression tests (275 tests)
+└── tests/                        # Offline Scientific CI invariants, API, and regression tests (386 tests)
 ```
 
 ---

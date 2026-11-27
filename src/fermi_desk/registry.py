@@ -40,6 +40,7 @@ from fermi_desk.schemas import (
     Hypothesis,
     MergeProvenance,
     ParameterRegistry,
+    PointingCorrectionsFile,
     SigmaSysCalibrationFile,
     Survey,
     WiseFitsGate2File,
@@ -733,6 +734,133 @@ def primary_sightings(survey: Survey, root: Path) -> SightingTable:
     )
 
 
+# ------------------------------------ pointing-correction overlay (ruling v0.2.1-R5)
+CATALOG_COORD_TOLERANCE_DEG = 1e-9  # overlay catalog_* values are verbatim catalog values
+
+
+@dataclass(frozen=True)
+class PointingOverlay:
+    """SHA-256-verified pointing corrections for one locked primary catalog.
+
+    Non-destructive: :meth:`apply` returns a copy of the primary sightings in which the
+    corrected targets carry their J2000 truth position. The catalog file is never written,
+    and the returned table keeps the catalog's SHA-256 (the overlay has its own).
+    """
+
+    path: str
+    sha256: str
+    record: PointingCorrectionsFile
+
+    @property
+    def target_names(self) -> list[str]:
+        return [c.target_name for c in self.record.pointing_corrections]
+
+    def _rows(self, primary: SightingTable) -> list[tuple[int, object]]:
+        """(pointing index, correction) pairs, after checking the overlay fits ``primary``."""
+        rec = self.record
+        if primary.role != "primary":
+            raise SchemaValidationError("pointing corrections apply to a primary target list")
+        if primary.sha256 != rec.locked_catalog.sha256:
+            raise ProvenanceError(
+                f"{self.path} corrects catalog {rec.locked_catalog.sha256[:12]}..., not the "
+                f"primary list {primary.sha256[:12]}... it was applied to"
+            )
+        index = {str(n): i for i, n in enumerate(primary.names)}
+        rows = []
+        for c in rec.pointing_corrections:
+            i = index.get(c.target_name)
+            if i is None:
+                raise ProvenanceError(f"{self.path}: {c.target_name!r} is not a catalog target")
+            if (
+                abs(float(primary.ra_deg[i]) - c.catalog_ra_deg) > CATALOG_COORD_TOLERANCE_DEG
+                or abs(float(primary.dec_deg[i]) - c.catalog_dec_deg) > CATALOG_COORD_TOLERANCE_DEG
+            ):
+                raise ProvenanceError(
+                    f"{self.path}: {c.target_name} catalog coordinates "
+                    f"({primary.ra_deg[i]}, {primary.dec_deg[i]}) differ from the recorded "
+                    f"({c.catalog_ra_deg}, {c.catalog_dec_deg}); was the overlay already applied?"
+                )
+            want = MISSING_GAIA_ID if c.gaia_dr3_source_id is None else int(c.gaia_dr3_source_id)
+            if int(primary.gaia_dr3_source_id[i]) != want:
+                raise ProvenanceError(
+                    f"{self.path}: {c.target_name} gaia_dr3_source_id disagrees with the catalog"
+                )
+            rows.append((i, c))
+        return rows
+
+    def apply(self, primary: SightingTable) -> SightingTable:
+        """Primary sightings with the corrected J2000 positions (every other row unchanged)."""
+        ra, dec = np.array(primary.ra_deg, float), np.array(primary.dec_deg, float)
+        for i, c in self._rows(primary):
+            ra[i], dec[i] = c.true_ra_deg, c.true_dec_deg
+        return replace(primary, ra_deg=ra, dec_deg=dec)
+
+    def corrected_pointings(
+        self, primary: SightingTable, cone_receipts: Mapping[int, Mapping] | None = None
+    ) -> list[dict]:
+        """``CorrectedPointing`` rows of the artifact, in catalog (pointing-index) order.
+
+        ``primary`` is the UNCORRECTED catalog table. ``cone_receipts`` maps a pointing index
+        to its cone cache manifest entry (live runs); rehearsals have none.
+        """
+        out = []
+        for i, c in sorted(self._rows(primary), key=lambda r: r[0]):
+            row = {
+                "target_name": c.target_name,
+                "pointing_index": int(i),
+                "catalog_ra_deg": c.catalog_ra_deg,
+                "catalog_dec_deg": c.catalog_dec_deg,
+                "cone_ra_deg": c.true_ra_deg,
+                "cone_dec_deg": c.true_dec_deg,
+                "truth_source": c.truth_source,
+            }
+            entry = (cone_receipts or {}).get(int(i))
+            if entry is not None:
+                row.update({k: entry.get(k) for k in ("adql_sha256", "fetched_at_utc")})
+                row["code_git_sha"] = entry.get("code_git_sha")
+            out.append(row)
+        return out
+
+    def summary_meta(
+        self, primary: SightingTable, cone_receipts: Mapping[int, Mapping] | None = None
+    ) -> dict:
+        """The ``BackgroundSummaryFile`` keys that record this overlay."""
+        rows = self.corrected_pointings(primary, cone_receipts)
+        return {
+            "pointing_corrections_path": self.path,
+            "pointing_corrections_sha256": self.sha256,
+            "n_corrected_pointings": len(rows),
+            "corrected_target_names": [r["target_name"] for r in rows],
+            "corrected_pointings": rows,
+        }
+
+
+def load_pointing_overlay(
+    root: Path, rel_path: str, expected_sha256: str | None = None
+) -> PointingOverlay:
+    """Load a pointing-correction overlay; a pinned SHA-256 that does not match is an error."""
+    path = root / rel_path
+    if not path.is_file():
+        raise ProvenanceError(f"pointing corrections {rel_path} missing")
+    raw = path.read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None and sha != expected_sha256:
+        raise ProvenanceError(f"{rel_path}: sha256 {sha} != pinned {expected_sha256}")
+    doc = yaml.safe_load(raw.decode("utf-8"))
+    if not isinstance(doc, dict):
+        raise SchemaValidationError(f"{rel_path}: expected a YAML mapping")
+    return PointingOverlay(rel_path, sha, PointingCorrectionsFile.model_validate(doc))
+
+
+def survey_pointing_overlay(survey: Survey, root: Path) -> PointingOverlay | None:
+    """The overlay an extension survey pins (verified against the pin), or None."""
+    if survey.pointing_corrections_path is None:
+        return None
+    return load_pointing_overlay(
+        root, survey.pointing_corrections_path, survey.pointing_corrections_sha256
+    )
+
+
 def pointing_unit_vectors(ra_deg: np.ndarray, dec_deg: np.ndarray) -> np.ndarray:
     """Galactic Cartesian unit vectors of ICRS directions (same frame as ``TargetTable.xyz``)."""
     cart = SkyCoord(
@@ -961,10 +1089,40 @@ class BackgroundField:
     record: BackgroundSummaryFile
     shells: radio.BackgroundShells
     detail: str
+    # Ruling v0.2.1-R5: the overlay the survey pins (None when it pins none). Whether the
+    # ARTIFACT was built with it is `record.pointing_corrections_sha256`.
+    pointing_overlay: PointingOverlay | None = None
 
     @property
     def merge_provenance(self) -> MergeProvenance:
         return self.record.merge_provenance
+
+    def pointing_corrections(self) -> dict:
+        """Overlay state: what the survey pins against what this artifact was built with.
+
+        ``uncorrected`` pointings are overlay entries whose cone in this artifact is still
+        centred on the locked catalog's (wrong) coordinates.
+        """
+        r, ov = self.record, self.pointing_overlay
+        pinned = ov.target_names if ov else []
+        applied = set(r.corrected_target_names)
+        uncorrected = [n for n in pinned if n not in applied]
+        return {
+            "pointing_corrections_path": ov.path if ov else None,
+            "pointing_corrections_sha256": ov.sha256 if ov else None,
+            "claim_id": ov.record.id if ov else None,
+            "ruling": ov.record.ruling if ov else None,
+            "locked_catalog_path": r.primary_catalog_path,
+            "locked_catalog_sha256": r.primary_catalog_sha256,
+            "locked_catalog_modified": False,
+            "n_pinned_corrections": len(pinned),
+            "artifact_built_with_overlay": r.pointing_corrections_sha256 is not None,
+            "n_corrected_pointings": r.n_corrected_pointings,
+            "corrected_target_names": list(r.corrected_target_names),
+            "corrected_pointings": [c.model_dump() for c in r.corrected_pointings],
+            "n_uncorrected_pointings": len(uncorrected),
+            "uncorrected_target_names": uncorrected,
+        }
 
     def summary(self) -> dict:
         r = self.record
@@ -991,6 +1149,7 @@ class BackgroundField:
             "distance_cuts": r.distance_cuts.model_dump(),
             "merge_provenance": r.merge_provenance.model_dump(),
             "dedup_audit": self.dedup_counts(),
+            "pointing_corrections": self.pointing_corrections(),
             "scope": self.scope(),
             "methodology_note": r.methodology_note,
         }
@@ -1160,8 +1319,69 @@ PUBLISHED_BACKGROUND_SCOPE: dict = {
 }
 
 
+def _overlay_primaries(
+    rec: BackgroundSummaryFile, prim: SightingTable, overlay: PointingOverlay | None
+) -> SightingTable:
+    """Beam centres the summary was built with: the catalog, plus the overlay it records.
+
+    A summary that records corrected pointings must record exactly the overlay the survey
+    pins, applied to exactly its entries, with the cone centres the overlay states and (for
+    cones that came from the archive) the ADQL of a query at those centres.
+    """
+    if overlay is not None:
+        overlay.corrected_pointings(prim)  # the pinned overlay must fit the locked catalog
+    if rec.pointing_corrections_sha256 is None:
+        return prim
+    if overlay is None:
+        raise ProvenanceError(
+            "background summary records pointing corrections but its survey pins no overlay"
+        )
+    if (rec.pointing_corrections_path, rec.pointing_corrections_sha256) != (
+        overlay.path,
+        overlay.sha256,
+    ):
+        raise ProvenanceError(
+            f"background summary was built with pointing corrections "
+            f"{rec.pointing_corrections_sha256[:12]}..., the survey pins {overlay.sha256[:12]}..."
+        )
+    want = overlay.corrected_pointings(prim)
+    got = rec.corrected_pointings
+    if [c.target_name for c in got] != [w["target_name"] for w in want]:
+        raise ProvenanceError(
+            "background summary did not correct exactly the pointings of the pinned overlay"
+        )
+    radius = f"{rec.cone_radius_arcmin / 60.0:.8f}"
+    for c, w in zip(got, want, strict=True):
+        same = c.pointing_index == w["pointing_index"] and all(
+            math.isclose(getattr(c, k), w[k], rel_tol=0.0, abs_tol=CATALOG_COORD_TOLERANCE_DEG)
+            for k in ("catalog_ra_deg", "catalog_dec_deg", "cone_ra_deg", "cone_dec_deg")
+        )
+        if not same or c.truth_source != w["truth_source"]:
+            raise ProvenanceError(
+                f"{c.target_name}: cone centre ({c.cone_ra_deg}, {c.cone_dec_deg}) is not the "
+                f"overlay's corrected position ({w['cone_ra_deg']}, {w['cone_dec_deg']})"
+            )
+        if c.adql_sha256 is not None:
+            adql = (
+                rec.adql_template.replace("{ra_deg}", f"{c.cone_ra_deg:.6f}")
+                .replace("{dec_deg}", f"{c.cone_dec_deg:.6f}")
+                .replace("{radius_deg}", radius)
+            )
+            if hashlib.sha256(adql.encode()).hexdigest() != c.adql_sha256:
+                raise ProvenanceError(
+                    f"{c.target_name}: the cached cone was not queried at the corrected "
+                    f"coordinates ({c.cone_ra_deg:.6f}, {c.cone_dec_deg:.6f})"
+                )
+    return overlay.apply(prim)
+
+
 def _recompute_background_summary(
-    rec: BackgroundSummaryFile, survey: Survey, parent: Survey, root: Path, file_sha: str
+    rec: BackgroundSummaryFile,
+    survey: Survey,
+    parent: Survey,
+    root: Path,
+    file_sha: str,
+    overlay: PointingOverlay | None = None,
 ) -> tuple[str, radio.BackgroundShells]:
     """Offline re-derivation of everything the summary asserts about itself.
 
@@ -1169,6 +1389,8 @@ def _recompute_background_summary(
     constants, shell checksum, and per-star recomputation on the validation sample:
     theta from the beam centre, off-axis EIRP_min, both bin indices, zero Gaia ids shared
     with the primaries and zero unmatched ID-less primaries inside the fallback radius.
+    Beam centres are the locked catalog's coordinates with the summary's recorded pointing
+    corrections applied (ruling v0.2.1-R5); the catalog itself is only ever read.
     """
     if survey.parent_pointing_survey_id != parent.id:
         raise ProvenanceError(f"{survey.id} does not declare {parent.id!r} as its parent pointing")
@@ -1181,6 +1403,7 @@ def _recompute_background_summary(
     prim = primary_sightings(parent, root)  # verifies the parent catalog checksum first
     if rec.primary_catalog_sha256 != prim.sha256 or rec.primary_catalog_path != parent.catalog_path:
         raise ProvenanceError("background summary was de-duplicated against a different catalog")
+    centres = _overlay_primaries(rec, prim, overlay)  # beam centres / dedup positions
     mp, da, sh = rec.merge_provenance, rec.dedup_audit, rec.shells
     if mp.input_surveys != [parent.id, survey.id]:
         raise ProvenanceError(
@@ -1224,7 +1447,7 @@ def _recompute_background_summary(
             raise ProvenanceError("validation star points at an unknown pointing")
         theta = np.array([s.theta_arcmin for s in bg])
         d = np.array([s.distance_pc for s in bg])
-        centre = SkyCoord(prim.ra_deg[pidx] * u.deg, prim.dec_deg[pidx] * u.deg)
+        centre = SkyCoord(centres.ra_deg[pidx] * u.deg, centres.dec_deg[pidx] * u.deg)
         star = SkyCoord([s.ra_deg for s in bg] * u.deg, [s.dec_deg for s in bg] * u.deg)
         theta_re = centre.separation(star).to_value(u.arcmin)
         if np.max(np.abs(theta_re - theta)) > 1e-6:
@@ -1256,7 +1479,7 @@ def _recompute_background_summary(
             match = SkyCoord(
                 [s.ra_match_deg for s in bg] * u.deg, [s.dec_match_deg for s in bg] * u.deg
             )
-            no_id = SkyCoord(prim.ra_deg[~has_id] * u.deg, prim.dec_deg[~has_id] * u.deg)
+            no_id = SkyCoord(centres.ra_deg[~has_id] * u.deg, centres.dec_deg[~has_id] * u.deg)
             _, _, sep, _ = match.search_around_sky(no_id, tol * u.arcsec)
             if np.any(sep.to_value(u.arcsec) < tol):
                 raise DoubleCountingError(
@@ -1313,7 +1536,7 @@ def _recompute_background_summary(
         if m.theta_arcmin > cone + 1e-9:
             raise ProvenanceError("primary-matched sighting lies outside the cone radius")
     shells = radio.BackgroundShells(
-        pointing_unit_xyz=pointing_unit_vectors(prim.ra_deg, prim.dec_deg),
+        pointing_unit_xyz=pointing_unit_vectors(centres.ra_deg, centres.dec_deg),
         pointing_index=np.asarray(sh.pointing_index, np.int64),
         distance_bin=np.asarray(sh.distance_bin, np.int64),
         eirp_min_bin=np.asarray(sh.eirp_min_bin, np.int64),
@@ -1333,6 +1556,13 @@ def _recompute_background_summary(
         f"{da.n_suspected_unmatched_primary} suspected_unmatched_primary row(s) "
         f"({len(suspects)} distinct stars) kept in the shells and reported (v0.2.1-R3)"
     )
+    if rec.pointing_corrections_sha256 is not None:
+        n_adql = sum(c.adql_sha256 is not None for c in rec.corrected_pointings)
+        detail += (
+            f"; {rec.n_corrected_pointings} cone centre(s) corrected by the pinned overlay "
+            f"{rec.pointing_corrections_path} ({rec.pointing_corrections_sha256[:8]}...), "
+            f"{n_adql} cone query hash(es) recomputed at the corrected coordinates (v0.2.1-R5)"
+        )
     return detail, shells
 
 
@@ -1363,9 +1593,10 @@ def load_background_summary(survey: Survey, parent: Survey, root: Path) -> Backg
     body = {k: v for k, v in doc.items() if k != "content_sha256"}
     if _canonical_sha256(body) != rec.content_sha256:
         raise ProvenanceError(f"{survey.background_summary_path}: content_sha256 mismatch")
-    detail, shells = _recompute_background_summary(rec, survey, parent, root, sha)
+    overlay = survey_pointing_overlay(survey, root)  # ProvenanceError on a pin mismatch
+    detail, shells = _recompute_background_summary(rec, survey, parent, root, sha, overlay)
     return BackgroundField(
-        survey.id, parent.id, survey.background_summary_path, sha, rec, shells, detail
+        survey.id, parent.id, survey.background_summary_path, sha, rec, shells, detail, overlay
     )
 
 
@@ -1828,6 +2059,39 @@ def _check_background_promotion(graph: FactorGraph) -> str:
     return "pinned by " + ", ".join(f"{s.id} -> {s.background_summary_path}" for s in pinned)
 
 
+def _check_pointing_corrections(graph: FactorGraph, survey: Survey) -> str:
+    """The pinned pointing-correction overlay (ruling v0.2.1-R5), end to end and offline.
+
+    SHA-256 pin, schema, fit to the locked catalog (which is only read), and the state of
+    the promoted summary: every corrected cone must have been queried at the overlay's
+    coordinates (re-derived in ``_overlay_primaries``).
+    """
+    parent = graph.surveys[survey.parent_pointing_survey_id or ""]
+    overlay = survey_pointing_overlay(survey, graph.root)
+    if overlay is None:
+        raise ProvenanceError(f"{survey.id} pins no pointing corrections")
+    prim = primary_sightings(parent, graph.root)
+    rows = overlay.corrected_pointings(prim)
+    pc = load_background_summary(survey, parent, graph.root).pointing_corrections()
+    head = (
+        f"sha256 {overlay.sha256[:16]}... pinned by {survey.id} ({overlay.record.ruling}); "
+        f"{len(rows)} corrections fit the locked {parent.catalog_path} ({prim.sha256[:8]}..., "
+        "read-only)"
+    )
+    if not pc["artifact_built_with_overlay"]:
+        return (
+            f"{head}; promoted summary PREDATES the overlay: 0/{len(rows)} cones corrected, "
+            f"{pc['n_uncorrected_pointings']} uncorrected flipped cone(s) - re-run "
+            "scripts/fetch_wlodarczyk_sroka_288k.py --fetch, then --promote-from"
+        )
+    decs = [c["cone_dec_deg"] for c in pc["corrected_pointings"]]
+    return (
+        f"{head}; promoted summary: {pc['n_corrected_pointings']}/{len(rows)} cones fetched at "
+        f"the corrected coordinates (cone dec {min(decs):+.4f} .. {max(decs):+.4f} deg), "
+        f"{pc['n_uncorrected_pointings']} uncorrected"
+    )
+
+
 def _check_lookback_prior(reg: ParameterRegistry) -> str:
     p = reg.get("lookback_window_gyr")
     lo, hi = p.marginalization_log_bounds  # raises SchemaValidationError if undeclared
@@ -1900,6 +2164,11 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
                 )
 
             record(f"background_summary:{s.background_summary_path}", _background)
+        if s.pointing_corrections_path is not None:
+            record(
+                f"pointing_corrections:{s.pointing_corrections_path}",
+                lambda s=s: _check_pointing_corrections(graph, s),
+            )
         if s.catalog_path:
             record(
                 f"checksum:{s.catalog_path}",

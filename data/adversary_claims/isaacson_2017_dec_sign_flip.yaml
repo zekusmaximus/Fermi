@@ -1,0 +1,282 @@
+# Isaacson et al. (2017) Table 1 declination sign flip (ruling v0.2.1-R5; forensic run
+# v0.2.1c-diag, 2026-11-27). Values are data, not code branches: this file is the single
+# canonical source of the 14 J2000 pointing corrections. It is SHA-256-pinned by
+# data/surveys/bl_gbt_lband_background_gaia_dr3.yaml and applied as a NON-DESTRUCTIVE overlay
+# when background cones are fetched and de-duplicated. The locked primary catalog
+# (data/catalogs/bl_692_targets.csv) is never edited.
+id: isaacson_2017_dec_sign_flip
+ruling: "v0.2.1-R5"
+pointing_group_id: bl_gbt_lband_2017
+claim: >-
+  Table 1 of Isaacson et al. (2017) prints every target whose true declination lies in
+  (-11 deg, -10 deg] without its minus sign. The published table has 0 rows with a
+  declination degree field of -10 and 35 with +10. The locked bl_692_targets.csv takes its
+  coordinates from that table, so 14 of the 692 Enriquez et al. (2017) targets sit
+  20.1 - 21.9 deg north of the star that was observed.
+locked_catalog:
+  path: "data/catalogs/bl_692_targets.csv"
+  sha256: "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2"
+  policy: >-
+    immutable (rulings v0.2.1-R3 and v0.2.1-R5): the catalog keeps the published coordinates
+    verbatim; corrections live in this overlay only
+# Expected state of the LOCKED catalog (recounted offline by audit_catalog_dec_sign_flip).
+catalog_band_census:
+  flipped_band_deg: [10.0, 11.0]      # [lo, hi)
+  n_targets_in_flipped_band: 16       # 14 flipped + 2 genuine northern controls
+  mirror_band_deg: [-11.0, -10.0]     # [lo, hi)
+  n_targets_in_mirror_band: 0
+# The sign-restored catalog position (ra_deg, -dec_deg) must lie within this distance of the
+# recorded J2000 truth for every correction.
+match_tolerance_arcsec: 2.0
+overlay_rule: >-
+  For each entry of pointing_corrections the cone centre and the primary position used by the
+  de-duplication step are (true_ra_deg, true_dec_deg), J2000. Every other pointing keeps its
+  published catalog coordinates.
+evidence:
+  - label: isaacson_2017_vizier_table1
+    data_tier: published_catalog
+    source: "VizieR J/PASP/129/E4501/table1 (Isaacson et al. 2017, PASP 129, 054501), vizier.cfa.harvard.edu asu-tsv"
+    retrieved_at_utc: "2026-11-27"
+    n_unique_targets: 1702
+    n_dec_degree_field_minus_10: 0
+    n_dec_degree_field_plus_10: 35
+    n_hip_targets_with_true_dec_in_mirror_band: 21
+    n_of_those_printed_with_plus_sign: 21
+    note: >-
+      Neighbouring degree fields hold 8 - 15 rows each; -09, -11, -12 and -00 carry their
+      signs. All 21 Hipparcos stars of the table whose true declination is in (-11, -10] deg
+      are printed as +10 (checked against VizieR I/311/hip2); 14 of them are in the 692-star
+      Enriquez et al. (2017) L-band sample.
+  - label: isaacson_2017_arxiv_source
+    data_tier: published_catalog
+    source: "arXiv:1701.06227 e-print, file table1709_4paper.txt (\\input by BL_targetlist.tex)"
+    retrieved_at_utc: "2026-11-27"
+    eprint_sha256: "6cb20619f5ee4fabcb2de80aa3e7c46164d3e4c7b20d2f33f3740b528b6fedc8"
+    n_dec_degree_field_minus_10: 0
+    n_dec_degree_field_10_unsigned: 35
+    note: >-
+      The authors' own table already lacks the sign (e.g. "HIP103388 & 20:56:46.6 & 10:26:54"),
+      so the error predates the CDS ingestion. The IOP machine-readable table and the CDS
+      table1.dat / ReadMe could not be fetched on 2026-11-27 and were not compared.
+  - label: enriquez_2017_692stars_csv
+    data_tier: published_catalog
+    source: "https://seti.berkeley.edu/lband2017/692stars.csv (Enriquez et al. 2017 target list)"
+    retrieved_at_utc: "2026-11-27"
+    file_sha256: "11abacadebf8285a58c6b56903f0b63448e8ac3a38dace92effc85ebf783ae9e"
+    note: >-
+      Gives the correct -10 deg declination for all 14 flipped targets. scripts/fetch_bl_692.py
+      reads only its name column, so these coordinates never reached bl_692_targets.csv.
+truth_sources:
+  gaia_dr3:
+    data_tier: reproduced_archive
+    source: "ARI Heidelberg Gaia TAP, gaiadr3.gaia_source, by the catalog's gaia_dr3_source_id"
+    queried_at_utc: "2026-11-27"
+    code_git_sha: "d6c1ff5401db6358d982d4c8a184d88dd1c688ba"   # clean tree, read-only v0.2.1c-diag
+    epoch: "J2000.0: epoch 2016.0 positions propagated linearly with pmra / cos(dec) and pmdec"
+    precision_note: "recorded to 1e-6 deg (3.6 mas) as printed by the diagnostic"
+  hip2:
+    data_tier: reproduced_archive
+    source: "VizieR I/311/hip2 (van Leeuwen 2007), by Hipparcos number"
+    queried_at_utc: "2026-11-27"
+    code_git_sha: "d6c1ff5401db6358d982d4c8a184d88dd1c688ba"
+    epoch: "J2000.0: epoch 1991.25 positions propagated linearly with pmRA / cos(dec) and pmDE"
+    precision_note: "recorded to 1e-6 deg (3.6 mas) as printed by the diagnostic"
+# gaia_dr3_source_id is a quoted decimal string (ruling v0.2.1-R4) or null.
+# catalog_* are the verbatim values of the locked catalog; true_* are J2000 from truth_source;
+# offset_deg is the angular separation between the two.
+pointing_corrections:
+  - target_name: "HIP 22288"
+    gaia_dr3_source_id: "3181588219554237184"
+    catalog_ra_deg: 72.004583
+    catalog_dec_deg: 10.933611
+    true_ra_deg: 72.004756
+    true_dec_deg: -10.933646
+    truth_source: gaia_dr3
+    offset_deg: 21.8673
+    raw_isaacson_dec: "+10 56 01"
+    raw_692stars_dec: "-10:56:02.0"
+  - target_name: "HIP 77349"
+    gaia_dr3_source_id: null
+    catalog_ra_deg: 236.8525
+    catalog_dec_deg: 10.896389
+    true_ra_deg: 236.852679
+    true_dec_deg: -10.896495
+    truth_source: hip2
+    offset_deg: 21.7929
+    raw_isaacson_dec: "+10 53 47"
+    raw_692stars_dec: "-10:53:49.9"
+  - target_name: "HIP 11029"
+    gaia_dr3_source_id: "5175014311223513984"
+    catalog_ra_deg: 35.50625
+    catalog_dec_deg: 10.7775
+    true_ra_deg: 35.506382
+    true_dec_deg: -10.777535
+    truth_source: gaia_dr3
+    offset_deg: 21.5550
+    raw_isaacson_dec: "+10 46 39"
+    raw_692stars_dec: "-10:46:40.1"
+  - target_name: "HIP 115445"
+    gaia_dr3_source_id: "2436812303124645504"
+    catalog_ra_deg: 350.770417
+    catalog_dec_deg: 10.764167
+    true_ra_deg: 350.770397
+    true_dec_deg: -10.764244
+    truth_source: gaia_dr3
+    offset_deg: 21.5284
+    raw_isaacson_dec: "+10 45 51"
+    raw_692stars_dec: "-10:45:47.2"
+  - target_name: "HIP 8497"
+    gaia_dr3_source_id: "2461043306017773696"
+    catalog_ra_deg: 27.39625
+    catalog_dec_deg: 10.686389
+    true_ra_deg: 27.396262
+    true_dec_deg: -10.686409
+    truth_source: gaia_dr3
+    offset_deg: 21.3728
+    raw_isaacson_dec: "+10 41 11"
+    raw_692stars_dec: "-10:41:11.8"
+  - target_name: "HIP 75253"
+    gaia_dr3_source_id: "6316161317608434944"
+    catalog_ra_deg: 230.652917
+    catalog_dec_deg: 10.661111
+    true_ra_deg: 230.652896
+    true_dec_deg: -10.661127
+    truth_source: gaia_dr3
+    offset_deg: 21.3222
+    raw_isaacson_dec: "+10 39 40"
+    raw_692stars_dec: "-10:39:43.6"
+  - target_name: "HIP 3909"
+    gaia_dr3_source_id: "2473608009504466688"
+    catalog_ra_deg: 12.531667
+    catalog_dec_deg: 10.644167
+    true_ra_deg: 12.531621
+    true_dec_deg: -10.644329
+    truth_source: gaia_dr3
+    offset_deg: 21.2885
+    raw_isaacson_dec: "+10 38 39"
+    raw_692stars_dec: "-10:38:42.7"
+  - target_name: "HIP 34104"
+    gaia_dr3_source_id: null
+    catalog_ra_deg: 106.07375
+    catalog_dec_deg: 10.508611
+    true_ra_deg: 106.073777
+    true_dec_deg: -10.508808
+    truth_source: hip2
+    offset_deg: 21.0174
+    raw_isaacson_dec: "+10 30 31"
+    raw_692stars_dec: "-10:30:44.3"
+  - target_name: "HIP 103388"
+    gaia_dr3_source_id: "6890353330746858368"
+    catalog_ra_deg: 314.194167
+    catalog_dec_deg: 10.448333
+    true_ra_deg: 314.194154
+    true_dec_deg: -10.448541
+    truth_source: gaia_dr3
+    offset_deg: 20.8969
+    raw_isaacson_dec: "+10 26 54"
+    raw_692stars_dec: "-10:27:11.9"
+  - target_name: "HIP 58576"
+    gaia_dr3_source_id: null
+    catalog_ra_deg: 180.185417
+    catalog_dec_deg: 10.445833
+    true_ra_deg: 180.185214
+    true_dec_deg: -10.446015
+    truth_source: hip2
+    offset_deg: 20.8918
+    raw_isaacson_dec: "+10 26 45"
+    raw_692stars_dec: "-10:26:52.8"
+  - target_name: "HIP 4845"
+    gaia_dr3_source_id: "2473055951588089088"
+    catalog_ra_deg: 15.587917
+    catalog_dec_deg: 10.423611
+    true_ra_deg: 15.588059
+    true_dec_deg: -10.423859
+    truth_source: gaia_dr3
+    offset_deg: 20.8475
+    raw_isaacson_dec: "+10 25 25"
+    raw_692stars_dec: "-10:25:27.8"
+  - target_name: "HIP 9094"
+    gaia_dr3_source_id: "2462426800883134336"
+    catalog_ra_deg: 29.29
+    catalog_dec_deg: 10.242222
+    true_ra_deg: 29.290031
+    true_dec_deg: -10.242426
+    truth_source: gaia_dr3
+    offset_deg: 20.4846
+    raw_isaacson_dec: "+10 14 32"
+    raw_692stars_dec: "-10:14:35.9"
+  - target_name: "HIP 5364"
+    gaia_dr3_source_id: "2470140321630664064"
+    catalog_ra_deg: 17.1475
+    catalog_dec_deg: 10.182222
+    true_ra_deg: 17.147464
+    true_dec_deg: -10.182264
+    truth_source: gaia_dr3
+    offset_deg: 20.3645
+    raw_isaacson_dec: "+10 10 56"
+    raw_692stars_dec: "-10:10:58.4"
+  - target_name: "HIP 76219"
+    gaia_dr3_source_id: "6316829270922140032"
+    catalog_ra_deg: 233.544583
+    catalog_dec_deg: 10.064444
+    true_ra_deg: 233.544594
+    true_dec_deg: -10.064533
+    truth_source: gaia_dr3
+    offset_deg: 20.1290
+    raw_isaacson_dec: "+10 03 52"
+    raw_692stars_dec: "-10:03:55.8"
+# Genuinely northern targets of the same catalog band: +10 deg in both published tables and
+# in Gaia DR3. They must never be flipped, and must never appear in pointing_corrections.
+northern_controls:
+  - target_name: "HIP 59608"
+    gaia_dr3_source_id: "3906361133255335296"
+    catalog_ra_deg: 183.357917
+    catalog_dec_deg: 10.262222
+    raw_isaacson_dec: "+10 15 44"
+    raw_692stars_dec: "+10:15:43.9"
+  - target_name: "HIP 92283"
+    gaia_dr3_source_id: "4503794795019024000"
+    catalog_ra_deg: 282.121667
+    catalog_dec_deg: 10.745278
+    raw_isaacson_dec: "+10 44 43"
+    raw_692stars_dec: "+10:44:35.9"
+# A second, independent upstream discrepancy, recorded so nobody "fixes" the flip by swapping
+# in the other table wholesale. It is a difference between two published tables. Whether the
+# telescope tracked the printed coordinate is NOT established here: that needs the filterbank
+# headers of the observations, which have not been checked.
+secondary_discrepancies:
+  - id: enriquez_2017_692stars_minus_zero_sign_drop
+    data_tier: published_catalog
+    source: "https://seti.berkeley.edu/lband2017/692stars.csv"
+    description: >-
+      Three targets with a true declination in (-1, 0) deg are printed with a plus sign in
+      692stars.csv. Isaacson et al. (2017) Table 1 has the correct sign.
+    inherited_by_locked_catalog: false
+    telescope_pointing_claim: "none (filterbank headers not verified)"
+    records:
+      - target_name: "HIP 99711"
+        gaia_dr3_source_id: "4224259562941398400"
+        catalog_dec_deg: -0.866667
+        true_dec_deg: -0.866880
+        truth_source: gaia_dr3
+        raw_isaacson_dec: "-00 52 00"
+        raw_692stars_dec: "+00:51:55.4"
+      - target_name: "HIP 12530"
+        gaia_dr3_source_id: "2498460442625153536"
+        catalog_dec_deg: -0.695556
+        true_dec_deg: -0.695652
+        truth_source: gaia_dr3
+        raw_isaacson_dec: "-00 41 44"
+        raw_692stars_dec: "+00:41:46.3"
+      - target_name: "HIP 82588"
+        gaia_dr3_source_id: "4381250547575102208"
+        catalog_dec_deg: -0.026389
+        true_dec_deg: -0.026422
+        truth_source: gaia_dr3
+        raw_isaacson_dec: "-00 01 35"
+        raw_692stars_dec: "+00:01:58.1"
+citations:
+  - "Isaacson et al. 2017, PASP 129, 054501 (arXiv:1701.06227; VizieR J/PASP/129/E4501/table1)"
+  - "Enriquez et al. 2017, ApJ 849, 104 (arXiv:1709.03491; https://seti.berkeley.edu/lband2017/692stars.csv)"
+  - "Gaia Collaboration 2023, A&A 674, A1 (Gaia DR3)"
+  - "van Leeuwen 2007, A&A 474, 653 (Hipparcos, the new reduction; VizieR I/311/hip2)"

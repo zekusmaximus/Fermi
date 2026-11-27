@@ -781,8 +781,13 @@ def test_no_api_payload_carries_a_gaia_id_or_integer_javascript_would_round(clie
         for key, value in _walk(_ok(client, path)):
             if isinstance(value, bool) or not isinstance(value, int):
                 if key == "gaia_dr3_source_id":
-                    assert isinstance(value, str) and value.isdigit(), (path, value)
-                    n_ids += 1
+                    # null = the catalog has no Gaia DR3 id for that target (ruling v0.2.1-R5:
+                    # "a quoted string or null"); an id that exists is always a decimal string.
+                    assert value is None or (isinstance(value, str) and value.isdigit()), (
+                        path,
+                        value,
+                    )
+                    n_ids += value is not None
                 continue
             assert abs(value) <= MAX_SAFE_JSON_INT, (path, key, value)
             assert key != "gaia_dr3_source_id", (path, value)

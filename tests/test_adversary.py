@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import astropy.units as u
@@ -10,7 +11,9 @@ import pytest
 import yaml
 
 from fermi_desk.adversary.checks import (
+    DEC_SIGN_FLIP_CLAIM,
     HIP1692_CLAIM,
+    audit_catalog_dec_sign_flip,
     audit_distance_revision,
     audit_duplicate_pointings,
     audit_hip1692_distance_revision,
@@ -165,6 +168,195 @@ def test_build_context_targets_carry_coordinates(graph):
         graph, RunConfig(geometry="thin_disk_2d", radio_mode="flat_probability", seed=0)
     )
     assert ctx.targets.ra_deg is not None and len(ctx.targets.ra_deg) == 692
+
+
+# ------------------------------------- catalog declination sign flip (v0.2.1-R5)
+LOCKED_CATALOG_SHA256 = "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2"
+FLIPPED = {
+    "HIP 22288", "HIP 77349", "HIP 11029", "HIP 115445", "HIP 8497", "HIP 75253", "HIP 3909",
+    "HIP 34104", "HIP 103388", "HIP 58576", "HIP 4845", "HIP 9094", "HIP 5364", "HIP 76219",
+}  # fmt: skip
+NO_GAIA_ID = {"HIP 34104", "HIP 58576", "HIP 77349"}
+NORTHERN_CONTROLS = {"HIP 59608", "HIP 92283"}
+MINUS_ZERO = {"HIP 99711", "HIP 12530", "HIP 82588"}
+
+
+def _catalog_sha(root) -> str:
+    return hashlib.sha256((root / "data/catalogs/bl_692_targets.csv").read_bytes()).hexdigest()
+
+
+def test_catalog_dec_sign_audit_reproduces_the_14_flips_offline(graph):
+    before = _catalog_sha(graph.root)
+    f = audit_catalog_dec_sign_flip(graph)
+    # A real catalog erratum is a first-class finding, never a pass and never hidden.
+    assert (f.check, f.status, f.severity) == ("catalog_dec_sign_audit", "finding", "warning")
+    d = f.details
+    assert d["problems"] == [] and d["ruling"] == "v0.2.1-R5"
+    # The mirror band of the locked catalog is empty; the flipped band holds 14 + 2.
+    assert d["band_census"]["mirror_band_deg"] == [-11.0, -10.0]
+    assert d["band_census"]["n_targets_in_mirror_band"] == 0
+    assert d["band_census"]["flipped_band_deg"] == [10.0, 11.0]
+    assert d["band_census"]["n_targets_in_flipped_band"] == 16
+    rows = {a["target_name"]: a for a in d["affected_targets"]}
+    assert set(rows) == FLIPPED and d["n_affected_targets"] == 14 and d["n_catalog_targets"] == 692
+    for name, a in rows.items():
+        assert all(a["checks"].values()), (name, a["checks"])
+        assert 10.0 <= a["catalog_dec_deg"] < 11.0 and -11.0 <= a["true_dec_deg"] < -10.0
+        assert a["sign_restored_separation_arcsec"] <= d["match_tolerance_arcsec"] == 2.0
+        assert 20.1 <= a["offset_deg"] <= 21.9
+        assert a["truth_data_tier"] == "reproduced_archive"
+        # ruling v0.2.1-R4: an id is a decimal string; a target without one is null
+        gid = a["gaia_dr3_source_id"]
+        assert (gid is None) == (name in NO_GAIA_ID)
+        assert gid is None or (isinstance(gid, str) and gid.isdigit())
+        assert a["truth_source"] == ("hip2" if name in NO_GAIA_ID else "gaia_dr3")
+    assert any(
+        int(a["gaia_dr3_source_id"]) > 2**53 for a in rows.values() if a["gaia_dr3_source_id"]
+    )
+    # The two genuinely northern targets of the band are controls: reported, never flipped.
+    controls = {c["target_name"]: c for c in d["northern_controls"]}
+    assert set(controls) == NORTHERN_CONTROLS and not NORTHERN_CONTROLS & FLIPPED
+    assert all(c["in_flipped_band"] and not c["corrected"] for c in controls.values())
+    # 692stars.csv -00 deg rows: an upstream table discrepancy the catalog does not inherit,
+    # with no claim about where the telescope pointed.
+    (sec,) = d["secondary_discrepancies"]
+    assert {r["target_name"] for r in sec["records"]} == MINUS_ZERO
+    assert sec["inherited_by_locked_catalog"] is False
+    assert all(
+        r["catalog_dec_deg"] < 0 and r["raw_692stars_dec"].startswith("+00") for r in sec["records"]
+    )
+    assert sec["telescope_pointing_claim"].startswith("none")
+    # The exact immutable catalog hash is in the finding, and the audit wrote nothing.
+    assert d["locked_catalog"] == {
+        "path": "data/catalogs/bl_692_targets.csv",
+        "sha256": LOCKED_CATALOG_SHA256,
+        "checksum_verified": True,
+        "modified_by_this_audit": False,
+    }
+    assert _catalog_sha(graph.root) == before == LOCKED_CATALOG_SHA256
+    assert {e["data_tier"] for e in d["evidence"]} == {"published_catalog"}
+    json.dumps(d)  # receipt-serialisable
+
+
+def test_catalog_dec_sign_audit_is_recomputed_from_the_catalog_rows(graph):
+    """Independent recount in the test: negate the catalog declination, compare with truth."""
+    import pandas as pd
+    from astropy.coordinates import SkyCoord
+
+    df = pd.read_csv(graph.root / "data/catalogs/bl_692_targets.csv").set_index("target_name")
+    dec = df["dec_deg"]
+    assert int(((dec >= -11.0) & (dec < -10.0)).sum()) == 0
+    assert set(df.index[(dec >= 10.0) & (dec < 11.0)]) == FLIPPED | NORTHERN_CONTROLS
+    claim = yaml.safe_load((graph.root / DEC_SIGN_FLIP_CLAIM).read_text("utf-8"))
+    assert [c["target_name"] for c in claim["pointing_corrections"]] != []
+    for c in claim["pointing_corrections"]:
+        row = df.loc[c["target_name"]]
+        truth = SkyCoord(c["true_ra_deg"] * u.deg, c["true_dec_deg"] * u.deg)
+        restored = SkyCoord(row.ra_deg * u.deg, -row.dec_deg * u.deg)
+        assert restored.separation(truth) < 2.0 * u.arcsec
+        assert SkyCoord(row.ra_deg * u.deg, row.dec_deg * u.deg).separation(truth) > 20 * u.deg
+        # quoted string or null in the file itself (never a YAML integer)
+        assert c["gaia_dr3_source_id"] is None or isinstance(c["gaia_dr3_source_id"], str)
+    f = audit_catalog_dec_sign_flip(graph)
+    by = {a["target_name"]: a for a in f.details["affected_targets"]}
+    for c in claim["pointing_corrections"]:
+        assert by[c["target_name"]]["offset_deg"] == pytest.approx(c["offset_deg"], abs=5e-4)
+
+
+def test_catalog_dec_sign_audit_is_part_of_every_adversary_run(graph):
+    rec = run_adversary(graph, seed=9, pair=PAIR, n_mc=100)
+    checks = [f["check"] for f in rec["results"]["findings"]]
+    assert checks.count("catalog_dec_sign_audit") == 1
+    assert checks.index("catalog_dec_sign_audit") == checks.index("hip1692_distance_revision") + 1
+    f = next(x for x in rec["results"]["findings"] if x["check"] == "catalog_dec_sign_audit")
+    assert f["status"] == "finding" and f["details"]["n_affected_targets"] == 14
+    assert f["details"]["locked_catalog"]["sha256"] == LOCKED_CATALOG_SHA256
+
+
+def _edit_claim(root, edit) -> None:
+    path = root / DEC_SIGN_FLIP_CLAIM
+    doc = yaml.safe_load(path.read_text("utf-8"))
+    edit(doc)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False), "utf-8")
+
+
+def _first(doc, name):
+    return next(c for c in doc["pointing_corrections"] if c["target_name"] == name)
+
+
+@pytest.mark.parametrize(
+    ("label", "edit", "message"),
+    [
+        (
+            "truth_left_in_the_north",
+            lambda d: _first(d, "HIP 22288").update(true_dec_deg=10.933646),
+            "HIP 22288",
+        ),
+        (
+            "catalog_value_edited",
+            lambda d: _first(d, "HIP 5364").update(catalog_dec_deg=-10.182222),
+            "catalog_coordinates_match_claim",
+        ),
+        (
+            "wrong_gaia_id",
+            lambda d: _first(d, "HIP 9094").update(gaia_dr3_source_id="2462426800883134337"),
+            "gaia_dr3_source_id_matches_claim",
+        ),
+        (
+            "numeric_gaia_id",
+            lambda d: _first(d, "HIP 9094").update(gaia_dr3_source_id=2462426800883134336),
+            "gaia_dr3_source_id",
+        ),
+        (
+            "correction_dropped",
+            lambda d: d["pointing_corrections"].pop(0),
+            "neither corrected nor declared controls",
+        ),
+        (
+            "control_flipped",
+            lambda d: d["pointing_corrections"].append(
+                {
+                    **_first(d, "HIP 22288"),
+                    "target_name": "HIP 59608",
+                    "gaia_dr3_source_id": "3906361133255335296",
+                }
+            ),
+            "both as a correction and as a control",
+        ),
+        (
+            "other_catalog",
+            lambda d: d["locked_catalog"].update(sha256="0" * 64),
+            "different catalog",
+        ),
+        (
+            "wrong_census",
+            lambda d: d["catalog_band_census"].update(n_targets_in_mirror_band=14),
+            "claim expects 14",
+        ),
+        (
+            "wrong_offset",
+            lambda d: _first(d, "HIP 76219").update(offset_deg=2.0),
+            "offset_matches_claim",
+        ),
+    ],
+)
+def test_catalog_dec_sign_audit_detects_a_tampered_claim(data_copy, label, edit, message):
+    _edit_claim(data_copy, edit)
+    f = audit_catalog_dec_sign_flip(load_factor_graph(data_copy))
+    assert (f.status, f.severity) == ("fail", "critical"), label
+    assert message in f.summary, (label, f.summary)
+
+
+def test_catalog_dec_sign_audit_detects_a_modified_catalog(data_copy):
+    """Editing the locked catalog (even to 'fix' it) breaks its checksum: the audit fails."""
+    path = data_copy / "data/catalogs/bl_692_targets.csv"
+    raw = path.read_bytes()
+    old, new = b"HIP 22288,72.004583,10.933611,", b"HIP 22288,72.004583,-10.933611,"
+    assert raw.count(old) == 1
+    path.write_bytes(raw.replace(old, new))  # one byte added, nothing else touched
+    f = audit_catalog_dec_sign_flip(load_factor_graph(data_copy))
+    assert (f.status, f.severity) == ("fail", "critical")
+    assert "checksum mismatch" in f.summary
 
 
 def test_beam_sharing_pairs_are_structured_receipt_records(graph):

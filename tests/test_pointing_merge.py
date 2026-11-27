@@ -24,6 +24,7 @@ import astropy.units as u
 import numpy as np
 import pytest
 import yaml
+from astropy.coordinates import SkyCoord
 from typer.testing import CliRunner
 
 from conftest import ROOT
@@ -36,6 +37,7 @@ from fermi_desk.errors import (
     SchemaValidationError,
     UnitValidationError,
 )
+from fermi_desk.inference import background_field as bgf
 from fermi_desk.inference.engine import (
     RECEIPT_SCHEMA_VERSION,
     RunConfig,
@@ -1192,3 +1194,415 @@ def test_merge_policy_grid_is_closed():
     ok = [REJECT_DUPLICATE_POINTING_GROUP, UNION_TARGETS_BY_POINTING]
     assert [validate_pointing_merge_policy(p) for p in ok] == ok
     assert len(set(itertools.chain(ok))) == 2
+
+
+# ===================================== pointing-correction overlay (ruling v0.2.1-R5)
+OVERLAY_PATH = "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml"
+CATALOG_PATH = "data/catalogs/bl_692_targets.csv"
+FLIPPED = {
+    "HIP 22288", "HIP 77349", "HIP 11029", "HIP 115445", "HIP 8497", "HIP 75253", "HIP 3909",
+    "HIP 34104", "HIP 103388", "HIP 58576", "HIP 4845", "HIP 9094", "HIP 5364", "HIP 76219",
+}  # fmt: skip
+FLIPPED_NO_ID = {"HIP 34104", "HIP 58576", "HIP 77349"}
+NORTHERN_CONTROLS = ("HIP 59608", "HIP 92283")
+
+
+def _file_sha(path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_overlay_moves_exactly_14_pointings_and_never_touches_the_catalog(graph, script):
+    before = _file_sha(ROOT / CATALOG_PATH)
+    pts = script.load_pointings()
+    cat, prim, overlay = pts.catalog, pts.primary, pts.overlay
+    assert overlay.path == OVERLAY_PATH and overlay.sha256 == _file_sha(ROOT / OVERLAY_PATH)
+    assert overlay.sha256 == graph.surveys[EXT].pointing_corrections_sha256  # pinned
+    moved = np.flatnonzero((cat.ra_deg != prim.ra_deg) | (cat.dec_deg != prim.dec_deg))
+    assert moved.tolist() == sorted(pts.corrected_indices) and len(moved) == 14
+    names = [str(n) for n in cat.names]
+    assert {names[i] for i in moved} == FLIPPED
+    assert np.all((cat.dec_deg[moved] >= 10) & (cat.dec_deg[moved] < 11))
+    assert np.all((prim.dec_deg[moved] >= -11) & (prim.dec_deg[moved] < -10))
+    # The corrected centre is the sign-restored published position to within 2 arcsec.
+    restored = SkyCoord(cat.ra_deg[moved] * u.deg, -cat.dec_deg[moved] * u.deg)
+    fixed = SkyCoord(prim.ra_deg[moved] * u.deg, prim.dec_deg[moved] * u.deg)
+    assert restored.separation(fixed).max() < 2.0 * u.arcsec
+    for control in NORTHERN_CONTROLS:  # genuinely northern: never flipped
+        i = names.index(control)
+        assert i not in moved and prim.dec_deg[i] == cat.dec_deg[i] > 10.0
+    # Only coordinates of those 14 rows differ; the table still carries the catalog's hash.
+    assert prim.sha256 == cat.sha256 == before == script.LOCKED_CATALOG_SHA256
+    assert np.array_equal(prim.gaia_dr3_source_id, cat.gaia_dr3_source_id)
+    assert [str(n) for n in prim.names] == names and np.all(prim.theta.value == 0.0)
+    # The overlay refuses a table it was not written for, and refuses to be applied twice.
+    with pytest.raises(ProvenanceError, match="already applied"):
+        overlay.apply(prim)
+    with pytest.raises(ProvenanceError, match="corrects catalog"):
+        overlay.apply(dataclasses.replace(cat, sha256="0" * 64))
+    assert script.load_pointings(corrections_path=None).overlay is None
+    assert _file_sha(ROOT / CATALOG_PATH) == before  # read, never written
+
+
+def test_overlay_sha256_pin_is_verified_by_registry_validate_and_fetcher(data_copy, script):
+    g = load_factor_graph(data_copy)
+    ext, parent = g.surveys[EXT], g.surveys[PARENT]
+    assert ext.pointing_corrections_path == OVERLAY_PATH
+    assert ext.pointing_corrections_sha256 == _file_sha(data_copy / OVERLAY_PATH)
+    load_background_summary(ext, parent, data_copy)  # pin matches
+    row = {r.name: r for r in run_validation(data_copy)}[f"pointing_corrections:{OVERLAY_PATH}"]
+    assert row.ok and "14 corrections fit the locked" in row.detail
+    # One appended comment byte-changes the overlay: every consumer refuses it.
+    path = data_copy / OVERLAY_PATH
+    path.write_bytes(path.read_bytes() + b"# tampered\n")
+    with pytest.raises(ProvenanceError, match="!= pinned"):
+        load_background_summary(ext, parent, data_copy)
+    with pytest.raises(ProvenanceError, match="!= pinned"):
+        script.load_pointings(root=data_copy)
+    bad = {r.name: r for r in run_validation(data_copy) if not r.ok}
+    assert f"pointing_corrections:{OVERLAY_PATH}" in bad
+    assert f"background_summary:{BACKGROUND_SUMMARY_PATH}" in bad
+    # Schema: path and SHA-256 are pinned together, on a background-summary survey only.
+    doc = ext.model_dump()
+    with pytest.raises(ProvenanceError, match="given together"):
+        Survey.model_validate({**doc, "pointing_corrections_sha256": None})
+    with pytest.raises(ProvenanceError, match="64-hex"):
+        Survey.model_validate({**doc, "pointing_corrections_sha256": "abc"})
+    with pytest.raises(SchemaValidationError, match="overlay on background cones"):
+        Survey.model_validate(
+            {
+                **g.surveys[PARENT].model_dump(),
+                "pointing_corrections_path": OVERLAY_PATH,
+                "pointing_corrections_sha256": "0" * 64,
+            }
+        )
+
+
+def test_cone_cache_is_keyed_by_the_queried_centre(script, tmp_path):
+    cache = script.Cache(tmp_path / "c", writable=True)
+    radius = 4.2 * u.arcmin
+    north, south = (72.004583, 10.933611), (72.004756, -10.933646)  # HIP 22288: catalog, truth
+
+    def sha(centre):
+        return hashlib.sha256(script.cone_adql("ari", *centre, radius).encode()).hexdigest()
+
+    assert sha(north) != sha(south)  # the centre is part of the ADQL text
+    assert script.Cache.centre_key(1.6825, -7.539444) == ("1.682500", "-7.539444")
+    # A v0.2.1b entry records no centre: it is validated by the ADQL hash alone.
+    cache.put(216, "old\n", {"adql_sha256": sha(north), "n_rows": 0})
+    cache.put(7, "other\n", {"adql_sha256": "q7", "n_rows": 0})
+    assert cache.get(216, sha(north), north)[0] == "old\n"
+    assert cache.get(216, sha(south), south) is None  # centre moved: miss, re-fetch
+    # The re-fetch records the queried centre; the superseded reply is kept, not destroyed.
+    entry = {"adql_sha256": sha(south), "ra_deg": south[0], "dec_deg": south[1], "n_rows": 0}
+    cache.put(216, "new\n", entry)
+    assert cache.get(216, sha(south), south)[0] == "new\n"
+    assert cache.get(216, sha(south), north) is None  # recorded centre != requested centre
+    assert cache.get(216, sha(north), north) is None
+    (kept,) = [k for k in cache.manifest if k.startswith("superseded/")]
+    assert (tmp_path / "c" / kept).read_bytes() == b"old\n"
+    assert cache.manifest[kept]["superseded_by_adql_sha256"] == sha(south)
+    assert cache.get(7, "q7")[0] == "other\n"  # every other pointing is untouched
+    reopened = script.Cache(tmp_path / "c", writable=False)
+    assert reopened.get(216, sha(south), south)[0] == "new\n" and len(reopened.manifest) == 3
+
+
+@pytest.mark.parametrize("target", sorted(FLIPPED_NO_ID))
+def test_idless_corrected_primary_absorbs_its_gaia_sighting_only_at_the_corrected_position(
+    script, target
+):
+    """A flipped primary without a Gaia id can only be matched by the 3 arcsec fallback, and
+    only if the de-duplication uses its corrected position: at the catalog position (21 deg
+    away) the star leaks into the background shells and is counted twice."""
+    pts = script.load_pointings()
+    i = [str(n) for n in pts.catalog.names].index(target)
+    assert pts.catalog.gaia_dr3_source_id[i] == MISSING_GAIA_ID
+    d = float(pts.catalog.distance[i].to_value(u.pc))
+    ra, dec = float(pts.primary.ra_deg[i]), float(pts.primary.dec_deg[i])
+    star_id = 9_100_000_000_000_000_001
+    background = sightings(
+        EXT,
+        "background",
+        [
+            ("the primary itself", star_id, ra, dec + 1.0 * ARCSEC, d, i, 1.0 / 60.0),
+            ("a field star", star_id + 1, ra, dec + 90.0 * ARCSEC, 900.0, i, 1.5),
+        ],
+    )
+    fixed = union_targets_by_pointing(GROUP, [pts.primary, background])
+    assert fixed.provenance.n_background_absorbed_by_primary == 1
+    assert fixed.provenance.n_dedup_angular_fallback == 1
+    survivors = fixed.gaia_dr3_source_id[fixed.winner[fixed.winner_role == "background"]]
+    assert survivors.tolist() == [star_id + 1]
+    assert script.suspected_unmatched_primaries(fixed, pts.primary) == []
+    # Same sightings against the uncorrected catalog positions: nothing is absorbed.
+    leaked = union_targets_by_pointing(GROUP, [pts.catalog, background])
+    assert leaked.provenance.n_background_absorbed_by_primary == 0
+    assert len(leaked) == len(fixed) + 1
+
+
+@pytest.fixture(scope="module")
+def overlay_run(script, synthetic, tmp_path_factory):
+    """Offline rehearsal of the v0.2.1c re-fetch, end to end.
+
+    1. A complete 692-cone cache at the CATALOG centres (the v0.2.1b state; manifest entries
+       stripped to the v0.2.1b format, which recorded no cone centre).
+    2. ``--fetch`` again with the overlay on (the default).
+    ``fetch_cone`` is stubbed with seeded SYNTHETIC cones, so no request leaves the process.
+    """
+    tmp = tmp_path_factory.mktemp("overlay_run")
+    cache, out1, out2 = tmp / "cache", tmp / "o1", tmp / "o2"
+    real_load = script.load_pointings
+    pts = real_load()
+    key = script.Cache.centre_key
+    replies = {
+        key(pts.catalog.ra_deg[i], pts.catalog.dec_deg[i]): frame.to_csv(index=False)
+        for i, frame in synthetic.frames.items()
+    }
+    rng = np.random.default_rng(np.random.SeedSequence([11, 0x53594E]))
+    corrected = script.synthetic_cone_frames(
+        pts.primary, pts.corrected_indices, synthetic.cone, rng, 6
+    )
+    for i, frame in corrected.items():
+        # A second generator call restarts its synthetic id counter: move these stars to
+        # their own id range so no synthetic id exists at two sky positions (real Gaia ids
+        # of the primaries' own sightings are kept).
+        ids = [int(x) for x in frame["source_id"]]
+        frame = frame.assign(
+            source_id=[str(x + 5_000_000 if x >= script.SYNTHETIC_ID_BASE else x) for x in ids]
+        )
+        replies[key(pts.primary.ra_deg[i], pts.primary.dec_deg[i])] = frame.to_csv(index=False)
+    calls: list[tuple[float, float]] = []
+
+    def fake_cone(endpoint, ra, dec, radius):
+        calls.append((ra, dec))
+        text = replies[key(ra, dec)]
+        return text, len(script.parse_cone_csv(text))
+
+    argv = ["--fetch", "--cache-dir", str(cache), "--sleep", "0"]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(script, "fetch_cone", fake_cone)
+        mp.setattr(script, "_post", lambda *a, **k: pytest.fail("network attempted"))
+        mp.setattr(script, "git_state", lambda root: ("b" * 40, "b" * 40))
+        mp.setattr(script, "load_pointings", lambda: real_load(corrections_path=None))
+        rc1 = script.main([*argv, "--out", str(out1)])
+        calls1, calls[:] = list(calls), []
+        manifest_path = cache / "manifest.json"
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        for entry in manifest.values():
+            for k in ("ra_deg", "dec_deg", "pointing_corrected"):
+                entry.pop(k)
+        manifest_path.write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n", "utf-8")
+        before = {name: (entry, (cache / name).read_bytes()) for name, entry in manifest.items()}
+        mp.setattr(script, "load_pointings", real_load)
+        mp.setattr(script, "git_state", lambda root: ("c" * 40, "c" * 40))
+        rc2 = script.main([*argv, "--out", str(out2)])
+    (path1,) = out1.glob("*.json")
+    (path2,) = out2.glob("*.json")
+    return SimpleNamespace(
+        pts=pts,
+        cache=cache,
+        rc=(rc1, rc2),
+        calls1=calls1,
+        calls2=list(calls),
+        before=before,
+        receipt1=json.loads(path1.read_text("utf-8")),
+        receipt2=json.loads(path2.read_text("utf-8")),
+        receipt2_path=path2,
+    )
+
+
+def test_refetch_with_the_overlay_queries_only_the_14_moved_cones(overlay_run, script):
+    o = overlay_run
+    corrected = sorted(o.pts.corrected_indices)
+    assert o.rc == (0, 0)
+    assert len(o.calls1) == 692 and "pointing_corrections_sha256" not in o.receipt1["summary"]
+    c = o.receipt2["cache"]
+    assert (c["n_fetched_this_run"], c["n_cache_hits_this_run"], c["n_attempted_this_run"]) == (
+        14,
+        678,
+        14,
+    )
+    assert o.receipt2["status"] == "ok" and o.receipt2["failures"] == []
+    assert c["fetched_pointing_indices_this_run"] == corrected
+    assert c["code_git_shas"] == ["b" * 40, "c" * 40]
+    # Every new query went to a corrected, southern centre - and nowhere else.
+    key = script.Cache.centre_key
+    assert len(o.calls2) == 14 and all(-11.0 <= dec < -10.0 for _, dec in o.calls2)
+    assert {key(*x) for x in o.calls2} == {
+        key(o.pts.primary.ra_deg[i], o.pts.primary.dec_deg[i]) for i in corrected
+    }
+    # The 678 valid cones are untouched (same manifest entry, same bytes); each of the 14
+    # replaced cones is kept under superseded/ and its new entry records the queried centre.
+    manifest = json.loads((o.cache / "manifest.json").read_text("utf-8"))
+    moved = {script.Cache.name(i) for i in corrected}
+    assert len(o.before) == 692 and len(manifest) == 692 + 14
+    for name, (entry, raw) in o.before.items():
+        if name not in moved:
+            assert manifest[name] == entry and (o.cache / name).read_bytes() == raw
+            continue
+        new = manifest[name]
+        assert new["adql_sha256"] != entry["adql_sha256"] and new["pointing_corrected"] is True
+        assert -11.0 <= new["dec_deg"] < -10.0 and new["code_git_sha"] == "c" * 40
+        kept = f"superseded/{name[:-4]}.{entry['sha256'][:12]}.csv"
+        assert (o.cache / kept).read_bytes() == raw
+        assert manifest[kept]["adql_sha256"] == entry["adql_sha256"]
+    locked = o.receipt2["locked_inputs"]
+    assert locked["primary_catalog_sha256"] == script.LOCKED_CATALOG_SHA256
+    assert locked["pointing_corrections_sha256"] == _file_sha(ROOT / OVERLAY_PATH)
+    assert set(o.receipt2["pointing_corrections"]["corrected_target_names"]) == FLIPPED
+
+
+def test_overlay_summary_absorbs_every_corrected_primary(overlay_run, script, synthetic):
+    s = overlay_run.receipt2["summary"]
+    assert s["pointing_corrections_path"] == OVERLAY_PATH
+    assert s["pointing_corrections_sha256"] == _file_sha(ROOT / OVERLAY_PATH)
+    assert s["n_corrected_pointings"] == 14 and set(s["corrected_target_names"]) == FLIPPED
+    assert s["primary_catalog_sha256"] == script.LOCKED_CATALOG_SHA256
+    assert "v0.2.1-R5" in s["methodology_note"] and OVERLAY_PATH in s["methodology_note"]
+    for c in s["corrected_pointings"]:
+        assert 10.0 <= c["catalog_dec_deg"] < 11.0 and -11.0 <= c["cone_dec_deg"] < -10.0
+        adql = script.cone_adql("ari", c["cone_ra_deg"], c["cone_dec_deg"], synthetic.cone)
+        assert hashlib.sha256(adql.encode()).hexdigest() == c["adql_sha256"]
+        assert c["code_git_sha"] == "c" * 40 and c["fetched_at_utc"]
+    # The dedup invariant: 11 by Gaia id, the 3 ID-less ones by the < 3 arcsec fallback, and
+    # none of the 14 left over as a suspected unmatched primary.
+    how = {}
+    for m in s["validation_sample"]["primary_matched"]:
+        if m["primary_target_name"] in FLIPPED:
+            how.setdefault(m["primary_target_name"], []).append(m)
+    assert set(how) == FLIPPED
+    for name, rows in how.items():
+        want = "angular_fallback" if name in FLIPPED_NO_ID else "gaia_dr3_source_id"
+        assert {m["match"] for m in rows} == {want}, name
+        assert all(m["separation_arcsec"] < 3.0 and m["theta_arcmin"] <= 4.2 for m in rows)
+    suspects = {r["primary_target_name"] for r in s["dedup_audit"]["suspected_unmatched_primary"]}
+    assert not suspects & FLIPPED
+    assert s["merge_provenance"]["n_duplicate_gaia_ids_post_merge"] == 0
+
+
+def _repin(root, artifact_sha: str, n_stars: int, **extra) -> None:
+    path = root / "data" / "surveys" / f"{EXT}.yaml"
+    doc = yaml.safe_load(path.read_text("utf-8"))
+    doc.update(background_summary_sha256=artifact_sha, n_targets=n_stars, **extra)
+    path.write_text(yaml.safe_dump(doc), "utf-8")
+
+
+@pytest.fixture(scope="module")
+def overlay_root(overlay_run, script, tmp_path_factory):
+    """The rehearsal receipt promoted into a data/ copy and pinned (offline)."""
+    tmp = tmp_path_factory.mktemp("overlay_root")
+    out = tmp / "promoted.json"
+    assert script.promote(overlay_run.receipt2_path, out) == 0
+    root = tmp / "root"
+    shutil.copytree(ROOT / "data", root / "data", ignore=shutil.ignore_patterns("cache", "fits"))
+    (root / BACKGROUND_SUMMARY_PATH).write_bytes(out.read_bytes())
+    doc = json.loads(out.read_bytes())
+    _repin(root, _file_sha(out), doc["shells"]["n_stars"])
+    return SimpleNamespace(root=root, doc=doc)
+
+
+def test_promoted_overlay_summary_is_reverified_offline(overlay_root, overlay_run):
+    root = overlay_root.root
+    g = load_factor_graph(root)
+    bf = load_background_summary(g.surveys[EXT], g.surveys[PARENT], root)
+    assert "14 cone centre(s) corrected by the pinned overlay" in bf.detail
+    assert "14 cone query hash(es) recomputed at the corrected coordinates" in bf.detail
+    pc = bf.pointing_corrections()
+    assert pc["artifact_built_with_overlay"] and pc["locked_catalog_modified"] is False
+    assert (pc["n_corrected_pointings"], pc["n_uncorrected_pointings"]) == (14, 0)
+    assert pc["pointing_corrections_sha256"] == _file_sha(ROOT / OVERLAY_PATH)
+    assert bf.summary()["pointing_corrections"]["n_pinned_corrections"] == 14
+    # The shells of a corrected pointing lie along the corrected (southern) direction.
+    pts = overlay_run.pts
+    for i in pts.corrected_indices:
+        want = SkyCoord(pts.primary.ra_deg[i] * u.deg, pts.primary.dec_deg[i] * u.deg)
+        got = SkyCoord(*bf.shells.pointing_unit_xyz[i], representation_type="cartesian",
+                       frame="galactic").icrs  # fmt: skip
+        assert got.separation(want) < 1e-6 * u.arcsec
+    a = bgf.pointing_centre_audit(g, bf)
+    stale, fixed = a["uncorrected_flipped_cones"], a["corrected_via_overlay"]
+    assert stale["n"] == 0 and stale["targets"] == []
+    assert stale["n_background_stars_in_those_pointings"] == 0
+    assert fixed["n"] == fixed["n_pinned_corrections"] == 14 and set(fixed["targets"]) == FLIPPED
+    assert (fixed["n_absorbed_by_gaia_id"], fixed["n_absorbed_by_angular_fallback"]) == (11, 3)
+    assert fixed["not_absorbed"] == [] and fixed["n_listed_as_suspected_unmatched_primary"] == 0
+    assert fixed["overlay_path"] == OVERLAY_PATH and fixed["locked_catalog_modified"] is False
+    res = {r.name: r for r in run_validation(root)}
+    assert all(r.ok for r in res.values()), [r for r in res.values() if not r.ok]
+    detail = res[f"pointing_corrections:{OVERLAY_PATH}"].detail
+    assert (
+        "14/14 cones fetched at the corrected coordinates" in detail and "0 uncorrected" in detail
+    )
+    assert _file_sha(root / CATALOG_PATH) == _file_sha(ROOT / CATALOG_PATH)
+
+
+def test_overlay_tampering_in_a_promoted_summary_is_caught_offline(overlay_root, script, tmp_path):
+    from fermi_desk.registry import seal_background_summary as seal
+
+    doc = overlay_root.doc
+    cps = doc["corrected_pointings"]
+
+    def load(new_doc=None, overlay_bytes=None, repin_overlay=False):
+        root = tmp_path / f"case{len(list(tmp_path.iterdir()))}"
+        shutil.copytree(overlay_root.root / "data", root / "data")
+        extra = {}
+        if overlay_bytes is not None:
+            (root / OVERLAY_PATH).write_bytes(overlay_bytes)
+            if repin_overlay:
+                extra["pointing_corrections_sha256"] = _file_sha(root / OVERLAY_PATH)
+        if new_doc is not None:
+            sha, _ = write_background_summary(seal(new_doc), root / BACKGROUND_SUMMARY_PATH)
+            _repin(root, sha, new_doc["shells"]["n_stars"], **extra)
+        elif extra:
+            _repin(
+                root, _file_sha(root / BACKGROUND_SUMMARY_PATH), doc["shells"]["n_stars"], **extra
+            )
+        g = load_factor_graph(root)
+        return load_background_summary(g.surveys[EXT], g.surveys[PARENT], root)
+
+    load()  # the untampered copy verifies
+    tampered = (ROOT / OVERLAY_PATH).read_bytes() + b"# edited\n"
+    with pytest.raises(ProvenanceError, match="!= pinned"):  # overlay changed, pin not
+        load(overlay_bytes=tampered)
+    with pytest.raises(ProvenanceError, match="the survey pins"):  # re-pinned: artifact disagrees
+        load(overlay_bytes=tampered, repin_overlay=True)
+    north = {**cps[0], "cone_dec_deg": cps[0]["catalog_dec_deg"]}
+    with pytest.raises(ProvenanceError, match="not the overlay's corrected position"):
+        load({**doc, "corrected_pointings": [north, *cps[1:]]})
+    catalog_query = script.cone_adql(
+        "ari", cps[0]["catalog_ra_deg"], cps[0]["catalog_dec_deg"], 4.2 * u.arcmin
+    )
+    stale = {**cps[0], "adql_sha256": hashlib.sha256(catalog_query.encode()).hexdigest()}
+    with pytest.raises(ProvenanceError, match="not queried at the corrected coordinates"):
+        load({**doc, "corrected_pointings": [stale, *cps[1:]]})
+    fewer = {
+        **doc,
+        "corrected_pointings": cps[1:],
+        "corrected_target_names": doc["corrected_target_names"][1:],
+        "n_corrected_pointings": 13,
+    }
+    with pytest.raises(ProvenanceError, match="did not correct exactly"):
+        load(fewer)
+    # Dropping the overlay record altogether leaves stars 21 deg from their catalog beam
+    # centre: the offline theta recomputation refuses the summary.
+    corrected_idx = {c["pointing_index"] for c in cps}
+    sample = doc["validation_sample"]["background"]
+    assert any(s["pointing_index"] in corrected_idx for s in sample)
+    keys = (
+        "pointing_corrections_path",
+        "pointing_corrections_sha256",
+        "n_corrected_pointings",
+        "corrected_target_names",
+        "corrected_pointings",
+    )
+    with pytest.raises(ProvenanceError, match="theta"):
+        load({k: v for k, v in doc.items() if k not in keys})
+    # Schema: a promoted summary cannot record corrections without the pinned overlay,
+    # nor a corrected cone without its query hash and clean commit.
+    with pytest.raises(ProvenanceError, match="without a pinned overlay"):
+        BackgroundSummaryFile.model_validate(
+            {**doc, "pointing_corrections_path": None, "pointing_corrections_sha256": None}
+        )
+    for field in ("adql_sha256", "code_git_sha", "fetched_at_utc"):
+        broken = [{**cps[0], field: None}, *cps[1:]]
+        with pytest.raises(ProvenanceError):
+            BackgroundSummaryFile.model_validate({**doc, "corrected_pointings": broken})

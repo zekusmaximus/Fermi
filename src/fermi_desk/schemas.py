@@ -361,6 +361,10 @@ class Survey(_Frozen):
     # Compact promoted background-field summary (BackgroundSummaryFile), pinned by SHA-256.
     background_summary_path: str | None = None
     background_summary_sha256: str | None = None
+    # Ruling v0.2.1-R5: SHA-256-pinned pointing corrections applied as a non-destructive
+    # overlay when the background cones are fetched and de-duplicated (PointingCorrectionsFile).
+    pointing_corrections_path: str | None = None
+    pointing_corrections_sha256: str | None = None
 
     @field_validator("pointing_merge_policy", mode="before")
     @classmethod
@@ -394,6 +398,22 @@ class Survey(_Frozen):
             raise SchemaValidationError(
                 f"{self.id}: a background summary is only valid on a survey that declares "
                 "parent_pointing_survey_id"
+            )
+        if (self.pointing_corrections_path is None) != (self.pointing_corrections_sha256 is None):
+            raise ProvenanceError(
+                f"{self.id}: pointing_corrections_path and pointing_corrections_sha256 must be "
+                "given together"
+            )
+        if self.pointing_corrections_sha256 is not None and not _SHA256_RE.match(
+            self.pointing_corrections_sha256
+        ):
+            raise ProvenanceError(
+                f"{self.id}: pointing_corrections_sha256 must be a 64-hex SHA-256"
+            )
+        if self.pointing_corrections_path is not None and self.background_summary_path is None:
+            raise SchemaValidationError(
+                f"{self.id}: pointing corrections are an overlay on background cones and are only "
+                "valid on a survey that pins a background summary"
             )
         if self.channel == "radio" and (
             self.radio_sensitivity is None
@@ -684,6 +704,160 @@ def _iso_utc(value: str, name: str) -> str:
     return value
 
 
+# ------------------------------------ pointing-correction overlay (ruling v0.2.1-R5)
+TruthSource = Literal["gaia_dr3", "hip2"]
+
+
+class PointingCorrection(_Frozen):
+    """One corrected pointing: the locked catalog's coordinates and the J2000 truth."""
+
+    target_name: str = Field(min_length=1)
+    gaia_dr3_source_id: GaiaSourceIdStr | None
+    catalog_ra_deg: float = Field(ge=0, lt=360)
+    catalog_dec_deg: float = Field(ge=-90, le=90)
+    true_ra_deg: float = Field(ge=0, lt=360)
+    true_dec_deg: float = Field(ge=-90, le=90)
+    truth_source: TruthSource
+    offset_deg: float = Field(gt=0)
+    raw_isaacson_dec: str = Field(min_length=1)
+    raw_692stars_dec: str = Field(min_length=1)
+
+
+class PointingControl(_Frozen):
+    """A target of the audited band that is genuinely where the catalog says (never corrected)."""
+
+    target_name: str = Field(min_length=1)
+    gaia_dr3_source_id: GaiaSourceIdStr | None
+    catalog_ra_deg: float = Field(ge=0, lt=360)
+    catalog_dec_deg: float = Field(ge=-90, le=90)
+    raw_isaacson_dec: str = Field(min_length=1)
+    raw_692stars_dec: str = Field(min_length=1)
+
+
+class SecondaryDiscrepancyRecord(_Frozen):
+    target_name: str = Field(min_length=1)
+    gaia_dr3_source_id: GaiaSourceIdStr | None
+    catalog_dec_deg: float = Field(ge=-90, le=90)
+    true_dec_deg: float = Field(ge=-90, le=90)
+    truth_source: TruthSource
+    raw_isaacson_dec: str = Field(min_length=1)
+    raw_692stars_dec: str = Field(min_length=1)
+
+
+class SecondaryDiscrepancy(_Open):
+    """An upstream published-table discrepancy the locked catalog does NOT inherit."""
+
+    id: str = Field(min_length=1)
+    data_tier: DataTier
+    source: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    inherited_by_locked_catalog: Literal[False]
+    telescope_pointing_claim: str = Field(min_length=1)
+    records: list[SecondaryDiscrepancyRecord] = Field(min_length=1)
+
+
+class ClaimEvidence(_Open):
+    label: str = Field(min_length=1)
+    data_tier: DataTier
+    source: str = Field(min_length=1)
+
+
+class TruthSourceSpec(_Open):
+    data_tier: DataTier
+    source: str = Field(min_length=1)
+    queried_at_utc: str = Field(min_length=1)
+    epoch: str = Field(min_length=1)
+
+
+class LockedCatalogRef(_Open):
+    path: str = Field(min_length=1)
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not _SHA256_RE.match(v):
+            raise ProvenanceError("locked_catalog.sha256 must be a 64-hex SHA-256")
+        return v
+
+
+class CatalogBandCensus(_Frozen):
+    """Expected target counts of the locked catalog in the flipped band and its mirror."""
+
+    flipped_band_deg: tuple[float, float]  # [lo, hi)
+    n_targets_in_flipped_band: int = Field(ge=0)
+    mirror_band_deg: tuple[float, float]  # [lo, hi)
+    n_targets_in_mirror_band: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _mirrored(self) -> CatalogBandCensus:
+        (lo, hi), (mlo, mhi) = self.flipped_band_deg, self.mirror_band_deg
+        if not lo < hi or (mlo, mhi) != (-hi, -lo):
+            raise SchemaValidationError(
+                "catalog_band_census: mirror_band_deg must be the sign-mirrored flipped band"
+            )
+        return self
+
+
+class PointingCorrectionsFile(_Open):
+    """``data/adversary_claims/isaacson_2017_dec_sign_flip.yaml`` (ruling v0.2.1-R5).
+
+    The single canonical table of pointing corrections. It never edits the locked primary
+    catalog: it is applied as an overlay when background cones are fetched, de-duplicated
+    and re-verified, and it is pinned by SHA-256 in the extension survey that uses it.
+    """
+
+    id: str = Field(min_length=1)
+    ruling: str = Field(min_length=1)
+    pointing_group_id: str = Field(min_length=1)
+    claim: str = Field(min_length=1)
+    locked_catalog: LockedCatalogRef
+    catalog_band_census: CatalogBandCensus
+    match_tolerance_arcsec: float = Field(gt=0)
+    evidence: list[ClaimEvidence] = Field(min_length=1)
+    truth_sources: dict[TruthSource, TruthSourceSpec]
+    pointing_corrections: list[PointingCorrection] = Field(min_length=1)
+    northern_controls: list[PointingControl] = Field(default_factory=list)
+    secondary_discrepancies: list[SecondaryDiscrepancy] = Field(default_factory=list)
+    citations: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _contract(self) -> PointingCorrectionsFile:
+        names = [c.target_name for c in self.pointing_corrections]
+        if len(set(names)) != len(names):
+            raise SchemaValidationError(f"{self.id}: a target is corrected twice")
+        both = set(names) & {c.target_name for c in self.northern_controls}
+        if both:
+            raise SchemaValidationError(
+                f"{self.id}: {sorted(both)} listed both as a correction and as a control"
+            )
+        ids = [c.gaia_dr3_source_id for c in self.pointing_corrections if c.gaia_dr3_source_id]
+        if len(set(ids)) != len(ids):
+            raise SchemaValidationError(f"{self.id}: a gaia_dr3_source_id is corrected twice")
+        used = {c.truth_source for c in self.pointing_corrections}
+        used |= {r.truth_source for d in self.secondary_discrepancies for r in d.records}
+        missing = sorted(used - set(self.truth_sources))
+        if missing:
+            raise ProvenanceError(f"{self.id}: truth sources {missing} are used but not declared")
+        return self
+
+
+class CorrectedPointing(_Frozen):
+    """A pointing whose cone was centred on the overlay's J2000 truth, not the catalog."""
+
+    target_name: str = Field(min_length=1)
+    pointing_index: int = Field(ge=0)
+    catalog_ra_deg: float
+    catalog_dec_deg: float
+    cone_ra_deg: float  # queried cone centre == primary position in the de-duplication
+    cone_dec_deg: float
+    truth_source: TruthSource
+    # From the cone cache manifest (absent in synthetic rehearsals, required when promoted).
+    adql_sha256: str | None = None
+    fetched_at_utc: str | None = None
+    code_git_sha: str | None = None
+
+
 class MergeProvenance(_Frozen):
     """Receipt record of one ``union_targets_by_pointing`` merge (star-level audit).
 
@@ -960,7 +1134,55 @@ class BackgroundSummaryFile(_Frozen):
     assembled_at_utc: str | None = None
     cone_cache_manifest_sha256: str | None = None
     cone_cache_code_git_shas: list[str] = Field(default_factory=list)
+    # Ruling v0.2.1-R5: the pointing-correction overlay this summary was built with (absent
+    # in summaries that predate it). The locked primary catalog is never edited; these
+    # pointings had their cone centre and their de-duplication position replaced.
+    pointing_corrections_path: str | None = None
+    pointing_corrections_sha256: str | None = None
+    n_corrected_pointings: int = Field(default=0, ge=0)
+    corrected_target_names: list[str] = Field(default_factory=list)
+    corrected_pointings: list[CorrectedPointing] = Field(default_factory=list)
     content_sha256: str
+
+    @model_validator(mode="after")
+    def _overlay_contract(self) -> BackgroundSummaryFile:
+        cp = self.corrected_pointings
+        if (self.pointing_corrections_path is None) != (self.pointing_corrections_sha256 is None):
+            raise ProvenanceError(
+                "pointing_corrections_path and pointing_corrections_sha256 must be given together"
+            )
+        if self.pointing_corrections_sha256 is None:
+            if self.n_corrected_pointings or self.corrected_target_names or cp:
+                raise ProvenanceError("corrected pointings recorded without a pinned overlay")
+            return self
+        if not _SHA256_RE.match(self.pointing_corrections_sha256):
+            raise ProvenanceError("pointing_corrections_sha256 must be a 64-hex SHA-256")
+        names = [c.target_name for c in cp]
+        if self.n_corrected_pointings != len(cp) or self.corrected_target_names != names:
+            raise ProvenanceError(
+                "n_corrected_pointings / corrected_target_names disagree with corrected_pointings"
+            )
+        if len(set(names)) != len(names):
+            raise ProvenanceError("a pointing is listed as corrected twice")
+        pointing_names = self.shells.pointing_names
+        for c in cp:
+            if c.pointing_index >= len(pointing_names) or (
+                pointing_names[c.pointing_index] != c.target_name
+            ):
+                raise ProvenanceError(
+                    f"corrected pointing {c.target_name!r} does not address its own beam"
+                )
+            if self.data_tier == "reproduced_archive":
+                if c.adql_sha256 is None or not _SHA256_RE.match(c.adql_sha256):
+                    raise ProvenanceError(
+                        f"corrected pointing {c.target_name!r} lacks the adql_sha256 of its cone"
+                    )
+                if c.code_git_sha is None or not _GIT_SHA_RE.match(c.code_git_sha):
+                    raise ProvenanceError(
+                        f"corrected cone of {c.target_name!r} was not fetched from a clean commit"
+                    )
+                _iso_utc(c.fetched_at_utc or "", f"corrected_pointings[{c.target_name}]")
+        return self
 
     @model_validator(mode="after")
     def _contract(self) -> BackgroundSummaryFile:

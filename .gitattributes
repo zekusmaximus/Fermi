@@ -2,3 +2,5 @@
 data/catalogs/*.csv -text
 data/catalogs/*.json -text
 data/calibrations/*.json -text
+# SHA-256-pinned pointing-correction overlay (ruling v0.2.1-R5).
+data/adversary_claims/isaacson_2017_dec_sign_flip.yaml -text

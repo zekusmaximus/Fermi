@@ -225,13 +225,19 @@ def attenuation_summary(graph: FactorGraph, field: BackgroundField) -> dict:
 def pointing_centre_audit(graph: FactorGraph, field: BackgroundField) -> dict:
     """Was each primary found inside its own cone? (offline: artifact + locked catalog)
 
-    Every cone is centred on the primary's catalog coordinates. A primary with no Gaia
+    Every cone is centred on the primary's catalog coordinates, except the pointings moved
+    by the pinned pointing-correction overlay (ruling v0.2.1-R5). A primary with no Gaia
     counterpart in its own cone either is absent from Gaia DR3 with a usable parallax
     (very bright or very high proper-motion stars) or does not lie where the catalog says.
     The audit reports the declination band holding most unfound primaries beside its mirror
     band: many targets on one side and none on the other is the signature of a declination
     sign error in the primary catalog, in which case those cones sample the wrong field.
-    Nothing is corrected here: the primary catalog is immutable (ruling v0.2.1-R3).
+
+    Two blocks separate what the overlay has fixed from what is still wrong in this
+    artifact: ``corrected_via_overlay`` (cones fetched at the overlay's J2000 centre) and
+    ``uncorrected_flipped_cones`` (overlay entries this artifact still centres on the
+    catalog declination). The primary catalog itself is immutable (rulings v0.2.1-R3 / R5)
+    and declination bands below are always the catalog's.
     """
     prim = primary_sightings(graph.surveys[field.parent_survey_id], graph.root)
     names = [str(x) for x in prim.names]
@@ -251,7 +257,55 @@ def pointing_centre_audit(graph: FactorGraph, field: BackgroundField) -> dict:
         field.shells.pointing_index, weights=field.shells.count, minlength=len(names)
     )
     no_id = [n for n, ok in zip(names, has_id, strict=True) if not ok]
+    # Ruling v0.2.1-R5: cones the pinned overlay moved, against cones it should have moved
+    # but that this artifact still centres on the catalog's (wrong) coordinates.
+    pc = field.pointing_corrections()
+    index = {n: i for i, n in enumerate(names)}
+    how = {m.primary_target_name: m.match for m in rec.validation_sample.primary_matched}
+    fixed, stale = pc["corrected_target_names"], pc["uncorrected_target_names"]
+    stale_idx = np.array([index[n] for n in stale], dtype=int)
+    overlay_ref = {
+        "overlay_path": pc["pointing_corrections_path"],
+        "overlay_sha256": pc["pointing_corrections_sha256"],
+        "claim_id": pc["claim_id"],
+        "ruling": pc["ruling"],
+        "locked_catalog_path": pc["locked_catalog_path"],
+        "locked_catalog_sha256": pc["locked_catalog_sha256"],
+        "locked_catalog_modified": False,
+    }
     out = {
+        "uncorrected_flipped_cones": {
+            "n": len(stale),
+            "targets": sorted(stale),
+            "n_background_stars_in_those_pointings": int(per_pointing[stale_idx].sum()),
+            "fraction_of_background_stars": float(
+                per_pointing[stale_idx].sum() / per_pointing.sum()
+            ),
+            "reading": (
+                "cones still centred on a catalog declination that the pinned overlay identifies "
+                "as sign-flipped: their stars are ~21 deg from the observed beam. Re-fetch and "
+                "re-promote with the overlay to clear them."
+                if stale
+                else "none: every cone the pinned overlay corrects was fetched at its corrected "
+                "centre"
+            ),
+            **overlay_ref,
+        },
+        "corrected_via_overlay": {
+            "n": len(fixed),
+            "n_pinned_corrections": pc["n_pinned_corrections"],
+            "targets": sorted(fixed),
+            "n_absorbed_by_gaia_id": sum(how.get(n) == "gaia_dr3_source_id" for n in fixed),
+            "n_absorbed_by_angular_fallback": sum(how.get(n) == "angular_fallback" for n in fixed),
+            "not_absorbed": sorted(n for n in fixed if n not in how),
+            "n_listed_as_suspected_unmatched_primary": sum(n in suspected for n in fixed),
+            "cones": pc["corrected_pointings"],
+            "policy": (
+                "non-destructive overlay: cone centres and de-duplication positions come from "
+                "the SHA-256-pinned claim file; the locked primary catalog is read, never written"
+            ),
+            **overlay_ref,
+        },
         "n_primaries": len(names),
         "n_with_gaia_id": int(has_id.sum()),
         "n_with_gaia_id_sighted_in_own_cone": sum(n in by_id for n in names),

@@ -44,8 +44,10 @@ from fermi_desk.registry import (
     MergedTargets,
     check_pointing_groups,
     load_background_summary,
+    load_pointing_overlay,
     load_targets,
     resolve_pointing_groups,
+    verify_catalog_checksum,
 )
 from fermi_desk.schemas import (
     POINTING_MERGE_POLICIES,
@@ -55,6 +57,7 @@ from fermi_desk.schemas import (
 
 HIP1692_CLAIM = "data/adversary_claims/hip_1692.yaml"
 HEPHAISTOS_DE_CLAIM = "data/adversary_claims/hephaistos_candidates_d_e.yaml"
+DEC_SIGN_FLIP_CLAIM = "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml"
 LOCAL_VALIDITY_KPC = 8.0
 
 
@@ -216,6 +219,228 @@ def audit_hip1692_distance_revision(
     f = audit_distance_revision(graph, HIP1692_CLAIM, hypothesis_ids, seed=seed, n_mc=n_mc)
     f.check = "hip1692_distance_revision"
     return f
+
+
+# ------------------------------------------------- catalog declination sign flip
+def audit_catalog_dec_sign_flip(
+    graph: FactorGraph, claim_path: str = DEC_SIGN_FLIP_CLAIM
+) -> Finding:
+    """Reproduce the Isaacson et al. (2017) declination sign flip offline (ruling v0.2.1-R5).
+
+    Reads only the locked primary catalog (checksum-verified, never written) and the claim
+    file. Recounts the flipped declination band and its mirror, and for every recorded
+    correction recomputes from the catalog row: that it sits in the flipped band, that its
+    sign-restored position ``(ra, -dec)`` lies within the claim's tolerance of the recorded
+    J2000 truth, and its angular offset from that truth. The declared northern controls must
+    be in the band and uncorrected, and the band must hold nothing else. The secondary
+    692stars.csv discrepancy is checked NOT to be inherited by the catalog.
+
+    ``finding`` when everything reproduces (a real catalog erratum is surfaced); ``fail``
+    when the claim does not reproduce against the locked catalog.
+    """
+    check = "catalog_dec_sign_audit"
+    sv = _radio_survey(graph)
+    try:
+        overlay = load_pointing_overlay(graph.root, claim_path)
+        path = verify_catalog_checksum(sv, graph.root)
+    except (FermiDeskError, ValueError, OSError) as exc:
+        return Finding(
+            check,
+            "fail",
+            "critical",
+            f"claim or locked catalog unreadable: {type(exc).__name__}: {exc}",
+            {"claim_path": claim_path, "error": f"{type(exc).__name__}: {exc}"},
+        )
+    rec = overlay.record
+    df = pd.read_csv(path, dtype={"gaia_dr3_source_id": str}).set_index("target_name")
+    problems: list[str] = []
+    if (rec.locked_catalog.path, rec.locked_catalog.sha256) != (sv.catalog_path, sv.catalog_sha256):
+        problems.append("claim is tied to a different catalog than the locked primary list")
+
+    census = rec.catalog_band_census
+    (lo, hi), (mlo, mhi) = census.flipped_band_deg, census.mirror_band_deg
+    dec = df["dec_deg"].to_numpy(dtype=float)
+    band_names = sorted(df.index[(dec >= lo) & (dec < hi)])
+    n_mirror = int(np.sum((dec >= mlo) & (dec < mhi)))
+    if len(band_names) != census.n_targets_in_flipped_band:
+        problems.append(
+            f"{len(band_names)} catalog targets in [{lo:g}, {hi:g}) deg, claim expects "
+            f"{census.n_targets_in_flipped_band}"
+        )
+    if n_mirror != census.n_targets_in_mirror_band:
+        problems.append(
+            f"{n_mirror} catalog targets in [{mlo:g}, {mhi:g}) deg, claim expects "
+            f"{census.n_targets_in_mirror_band}"
+        )
+
+    def catalog_id(name: str) -> str | None:
+        raw = df.at[name, "gaia_dr3_source_id"]
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+    tol = rec.match_tolerance_arcsec * u.arcsec
+    affected = []
+    for c in rec.pointing_corrections:
+        if c.target_name not in df.index:
+            problems.append(f"{c.target_name}: not in the locked catalog")
+            continue
+        ra, de = float(df.at[c.target_name, "ra_deg"]), float(df.at[c.target_name, "dec_deg"])
+        truth = SkyCoord(c.true_ra_deg * u.deg, c.true_dec_deg * u.deg)
+        restored_sep = SkyCoord(ra * u.deg, -de * u.deg).separation(truth).to(u.arcsec)
+        offset = SkyCoord(ra * u.deg, de * u.deg).separation(truth).to(u.deg)
+        checks = {
+            "catalog_dec_in_flipped_band": bool(lo <= de < hi),
+            "true_dec_in_mirror_band": bool(mlo <= c.true_dec_deg < mhi),
+            "catalog_coordinates_match_claim": bool(
+                math.isclose(ra, c.catalog_ra_deg, abs_tol=1e-9)
+                and math.isclose(de, c.catalog_dec_deg, abs_tol=1e-9)
+            ),
+            "gaia_dr3_source_id_matches_claim": catalog_id(c.target_name) == c.gaia_dr3_source_id,
+            "sign_restored_matches_truth": bool(restored_sep <= tol),
+            "offset_matches_claim": bool(abs(offset.to_value(u.deg) - c.offset_deg) <= 5e-4),
+        }
+        bad = sorted(k for k, ok in checks.items() if not ok)
+        if bad:
+            problems.append(f"{c.target_name}: {', '.join(bad)} failed")
+        affected.append(
+            {
+                "target_name": c.target_name,
+                "gaia_dr3_source_id": c.gaia_dr3_source_id,  # decimal string or None (R4)
+                "catalog_ra_deg": ra,
+                "catalog_dec_deg": de,
+                "true_ra_deg": c.true_ra_deg,
+                "true_dec_deg": c.true_dec_deg,
+                "truth_source": c.truth_source,
+                "truth_data_tier": rec.truth_sources[c.truth_source].data_tier,
+                "offset_deg": float(offset.to_value(u.deg)),
+                "sign_restored_separation_arcsec": float(restored_sep.to_value(u.arcsec)),
+                "raw_isaacson_dec": c.raw_isaacson_dec,
+                "raw_692stars_dec": c.raw_692stars_dec,
+                "checks": checks,
+            }
+        )
+
+    corrected = {c.target_name for c in rec.pointing_corrections}
+    controls = []
+    for k in rec.northern_controls:
+        present = k.target_name in df.index
+        de = float(df.at[k.target_name, "dec_deg"]) if present else float("nan")
+        ok = (
+            present
+            and lo <= de < hi
+            and math.isclose(de, k.catalog_dec_deg, abs_tol=1e-9)
+            and catalog_id(k.target_name) == k.gaia_dr3_source_id
+            and k.target_name not in corrected
+        )
+        if not ok:
+            problems.append(f"northern control {k.target_name} does not reproduce")
+        controls.append(
+            {
+                "target_name": k.target_name,
+                "gaia_dr3_source_id": k.gaia_dr3_source_id,
+                "catalog_dec_deg": de,
+                "raw_isaacson_dec": k.raw_isaacson_dec,
+                "raw_692stars_dec": k.raw_692stars_dec,
+                "in_flipped_band": bool(present and lo <= de < hi),
+                "corrected": k.target_name in corrected,
+            }
+        )
+    unexplained = sorted(
+        set(band_names) - corrected - {k.target_name for k in rec.northern_controls}
+    )
+    if unexplained:
+        problems.append(f"band targets neither corrected nor declared controls: {unexplained}")
+
+    secondary = []
+    for d in rec.secondary_discrepancies:
+        rows = []
+        for r in d.records:
+            present = r.target_name in df.index
+            de = float(df.at[r.target_name, "dec_deg"]) if present else float("nan")
+            agrees = present and abs(de - r.true_dec_deg) * u.deg <= tol
+            if not (agrees and math.isclose(de, r.catalog_dec_deg, abs_tol=1e-9)):
+                problems.append(
+                    f"{d.id}: {r.target_name} is inherited by, or absent from, the catalog"
+                )
+            rows.append(
+                {
+                    "target_name": r.target_name,
+                    "gaia_dr3_source_id": r.gaia_dr3_source_id,
+                    "catalog_dec_deg": de,
+                    "true_dec_deg": r.true_dec_deg,
+                    "truth_source": r.truth_source,
+                    "raw_isaacson_dec": r.raw_isaacson_dec,
+                    "raw_692stars_dec": r.raw_692stars_dec,
+                    "inherited_by_locked_catalog": not agrees,
+                }
+            )
+        secondary.append(
+            {
+                "id": d.id,
+                "data_tier": d.data_tier,
+                "source": d.source,
+                "description": " ".join(d.description.split()),
+                "inherited_by_locked_catalog": any(r["inherited_by_locked_catalog"] for r in rows),
+                "telescope_pointing_claim": d.telescope_pointing_claim,
+                "records": rows,
+            }
+        )
+
+    offsets = [a["offset_deg"] for a in affected] or [float("nan")]
+    worst = max((a["sign_restored_separation_arcsec"] for a in affected), default=float("nan"))
+    n_sec = sum(len(s["records"]) for s in secondary)
+    status = "fail" if problems else "finding"
+    summary = (
+        "; ".join(problems)
+        if problems
+        else (
+            f"{len(affected)} of {len(df)} primaries carry a sign-flipped declination (Isaacson et "
+            f"al. 2017 Table 1): {n_mirror} catalog targets in [{mlo:g}, {mhi:g}) deg, "
+            f"{len(band_names)} in [{lo:g}, {hi:g}) deg; offsets {min(offsets):.2f} - "
+            f"{max(offsets):.2f} deg; sign-restored positions match the J2000 truth within "
+            f"{worst:.2f} arcsec (tolerance {rec.match_tolerance_arcsec:g}); {len(controls)} "
+            f"northern controls untouched; {n_sec} 692stars.csv -00 deg discrepancy record(s) not "
+            f"inherited; locked catalog {str(sv.catalog_sha256)[:12]}... read-only"
+        )
+    )
+    return Finding(
+        check,
+        status,
+        "critical" if problems else "warning",
+        summary,
+        {
+            "claim_path": claim_path,
+            "claim_id": rec.id,
+            "claim_sha256": overlay.sha256,
+            "ruling": rec.ruling,
+            "claim": " ".join(rec.claim.split()),
+            "locked_catalog": {
+                "path": sv.catalog_path,
+                "sha256": sv.catalog_sha256,
+                "checksum_verified": True,
+                "modified_by_this_audit": False,
+            },
+            "band_census": {
+                "flipped_band_deg": [lo, hi],
+                "n_targets_in_flipped_band": len(band_names),
+                "expected_in_flipped_band": census.n_targets_in_flipped_band,
+                "mirror_band_deg": [mlo, mhi],
+                "n_targets_in_mirror_band": n_mirror,
+                "expected_in_mirror_band": census.n_targets_in_mirror_band,
+            },
+            "match_tolerance_arcsec": rec.match_tolerance_arcsec,
+            "n_affected_targets": len(affected),
+            "n_catalog_targets": len(df),
+            "affected_targets": affected,
+            "northern_controls": controls,
+            "secondary_discrepancies": secondary,
+            "evidence": [e.model_dump() for e in rec.evidence],
+            "correction_policy": " ".join(
+                rec.locked_catalog.model_dump().get("policy", "").split()
+            ),
+            "overlay_rule": " ".join(str(rec.model_dump().get("overlay_rule", "")).split()),
+            "problems": problems,
+        },
+    )
 
 
 # ------------------------------------------------------------- double counting
@@ -580,6 +805,7 @@ def run_adversary(
     spec = hephaistos.CutoutSpec()
     findings = [
         audit_hip1692_distance_revision(graph, pair, seed=seed, n_mc=n_mc),
+        audit_catalog_dec_sign_flip(graph),
         audit_duplicate_pointings(graph),
         audit_pointing_overlap(graph),
         audit_hephaistos_blend_anchors(graph, spec),

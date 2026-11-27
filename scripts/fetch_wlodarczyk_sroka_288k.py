@@ -36,6 +36,13 @@ cones in a row (a schema or outage error is never repeated across all 692 pointi
 ``--max-new-pointings`` caps attempted queries, failed ones included. De-duplication across overlapping cones and against the 692 primaries uses
 the shared ``union_targets_by_pointing`` kernel (minimum beam offset kept).
 
+Pointing corrections (ruling v0.2.1-R5): the locked catalog is never edited. The overlay
+``data/adversary_claims/isaacson_2017_dec_sign_flip.yaml`` (SHA-256 recorded in the summary
+and pinned in ``data/surveys/``) replaces the cone centre AND the primary position used by
+the de-duplication for the targets whose published declination lost its minus sign. A cached
+cone is reused only if it was queried at the same centre, so after an overlay change a
+``--fetch`` re-queries exactly the cones whose centre moved.
+
 Never imported or run by the offline test suite except through its offline modes
 (``--dry-run``, ``--promote-from``); TLS verification is never disabled. Usage:
     uv run python scripts/fetch_wlodarczyk_sroka_288k.py --dry-run
@@ -56,9 +63,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import astropy.units as u
 import numpy as np
@@ -71,10 +79,12 @@ from fermi_desk.models import radio
 from fermi_desk.registry import (
     MISSING_GAIA_ID,
     MergedTargets,
+    PointingOverlay,
     SightingTable,
     background_summary_bytes,
     build_background_summary,
     load_factor_graph,
+    load_pointing_overlay,
     primary_sightings,
     seal_background_summary,
     sightings_sha256,
@@ -93,6 +103,8 @@ UA = "fermi-desk-background-fetch/0.2.1 (MIT)"
 PARENT_SURVEY_ID = "bl_enriquez_2017_692"
 BACKGROUND_SURVEY_ID = "bl_gbt_lband_background_gaia_dr3"
 LOCKED_CATALOG_SHA256 = "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2"
+# Ruling v0.2.1-R5: non-destructive pointing corrections (the catalog above stays locked).
+POINTING_CORRECTIONS_PATH = "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml"
 N_POINTINGS = 692
 KIND = "bl_288k_background"
 CACHE_DIR = ROOT / "data/cache/bl_288k_background"
@@ -169,6 +181,11 @@ METHODOLOGY_NOTE = (
     "target's then-current position; for the fastest proper-motion primaries the centre is "
     "uncertain by up to ~0.5 arcmin of the 8.4 arcmin beam)."
 )
+OVERLAY_NOTE = (
+    " Exception (ruling v0.2.1-R5): {n} pointing(s) whose published declination lost its "
+    "minus sign are centred on the J2000 position recorded in {path} (sha256 {sha}); the same "
+    "position is the primary's position in the de-duplication. The locked catalog is unchanged."
+)
 ANGULAR_MATCH_EPOCH = (
     "J2000.0: Gaia DR3 (epoch 2016.0) positions are propagated back with pmra / pmdec "
     "before the 3 arcsec angular fallback against the published primary coordinates"
@@ -183,16 +200,53 @@ _NETWORK_ALLOWED = False  # set True only inside --fetch
 
 
 # -------------------------------------------------------------------- pointings
-def load_pointings(root: Path = ROOT):
-    """(graph, parent survey, primary sightings); verifies the locked catalog SHA-256 first."""
+class Pointings(NamedTuple):
+    """The 692 beams: the locked catalog, and the same table with the overlay applied.
+
+    ``catalog`` is the checksum-verified published list, untouched. ``primary`` is what the
+    cones are centred on and what the de-duplication uses: identical to ``catalog`` except
+    for the overlay's corrected targets. (A NamedTuple, not a dataclass: the offline tests
+    load this script by path without registering it in ``sys.modules``.)
+    """
+
+    graph: object
+    parent: object
+    catalog: SightingTable
+    primary: SightingTable
+    overlay: PointingOverlay | None
+
+    @property
+    def corrected_indices(self) -> list[int]:
+        if self.overlay is None:
+            return []
+        return [r["pointing_index"] for r in self.overlay.corrected_pointings(self.catalog)]
+
+
+def load_pointings(
+    root: Path = ROOT, corrections_path: str | None = POINTING_CORRECTIONS_PATH
+) -> Pointings:
+    """Locked pointings plus the pointing-correction overlay (both SHA-256 verified).
+
+    The overlay file is hashed here; if the background survey pins a SHA-256 for it, a file
+    that does not match the pin is refused. ``corrections_path=None`` skips the overlay.
+    """
     graph = load_factor_graph(root)
     parent = graph.surveys[PARENT_SURVEY_ID]
     if parent.catalog_sha256 != LOCKED_CATALOG_SHA256:
         raise SystemExit(f"{PARENT_SURVEY_ID} no longer pins the locked catalog SHA-256")
-    primary = primary_sightings(parent, root)  # raises ProvenanceError on a checksum mismatch
-    if len(primary) != N_POINTINGS or parent.pointing_group_id != BL_LBAND_POINTING_GROUP:
+    catalog = primary_sightings(parent, root)  # raises ProvenanceError on a checksum mismatch
+    if len(catalog) != N_POINTINGS or parent.pointing_group_id != BL_LBAND_POINTING_GROUP:
         raise SystemExit(f"expected {N_POINTINGS} pointings in {BL_LBAND_POINTING_GROUP}")
-    return graph, parent, primary
+    if corrections_path is None:
+        return Pointings(graph, parent, catalog, catalog, None)
+    ext = graph.surveys.get(BACKGROUND_SURVEY_ID)
+    pinned = (
+        ext.pointing_corrections_sha256
+        if ext is not None and ext.pointing_corrections_path == corrections_path
+        else None
+    )
+    overlay = load_pointing_overlay(root, corrections_path, pinned)  # ProvenanceError on mismatch
+    return Pointings(graph, parent, catalog, overlay.apply(catalog), overlay)
 
 
 def beam(parent) -> tuple[u.Quantity, u.Quantity]:
@@ -294,7 +348,12 @@ class Cache:
     """Per-pointing cone replies with a SHA-256 manifest (``manifest.json``).
 
     A cached file is reused only if its bytes still hash to the manifest entry AND the
-    entry was made with the same ADQL (so a changed query template invalidates it).
+    entry was made with the same ADQL (so a changed query template invalidates it) AND at
+    the same cone centre. The centre is part of the ADQL text, so ``adql_sha256`` alone
+    already keys a cone by ``(ra_deg, dec_deg)``; entries written from v0.2.1c on also record
+    the queried centre and are checked against it. A pointing whose centre moves (a pointing
+    correction) is therefore re-fetched, and only that pointing. Replacing a cone never
+    destroys the old reply: it is moved to ``superseded/`` and stays listed in the manifest.
     ``writable=False`` (dry run) never creates the directory or any file.
     """
 
@@ -311,10 +370,24 @@ class Cache:
     def name(index: int) -> str:
         return f"pointing_{index:03d}.csv"
 
-    def get(self, index: int, adql_sha: str) -> tuple[str, dict] | None:
+    @staticmethod
+    def centre_key(ra_deg: float, dec_deg: float) -> tuple[str, str]:
+        """A cone centre at the precision it is written into the ADQL (1e-6 deg)."""
+        return f"{float(ra_deg):.6f}", f"{float(dec_deg):.6f}"
+
+    def get(
+        self, index: int, adql_sha: str, centre: tuple[float, float] | None = None
+    ) -> tuple[str, dict] | None:
         entry = self.manifest.get(self.name(index))
         f = self.root / self.name(index)
         if not entry or entry.get("adql_sha256") != adql_sha or not f.is_file():
+            return None
+        if (
+            centre is not None
+            and "ra_deg" in entry
+            and "dec_deg" in entry
+            and self.centre_key(entry["ra_deg"], entry["dec_deg"]) != self.centre_key(*centre)
+        ):
             return None
         raw = f.read_bytes()
         if hashlib.sha256(raw).hexdigest() != entry["sha256"]:
@@ -326,8 +399,25 @@ class Cache:
             raise LiveFetchError("cache is read-only in this mode")
         raw = text.encode("utf-8")
         entry = {**entry, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
-        (self.root / self.name(index)).write_bytes(raw)
-        self.manifest[self.name(index)] = entry
+        name = self.name(index)
+        old, f = self.manifest.get(name), self.root / name
+        if (
+            old
+            and f.is_file()
+            and old.get("sha256") != entry["sha256"]
+            and hashlib.sha256(f.read_bytes()).hexdigest() == old.get("sha256")
+        ):
+            # Never destroy a superseded cone reply (e.g. the cone at an uncorrected centre).
+            kept = f"superseded/{name[:-4]}.{str(old.get('sha256'))[:12]}.csv"
+            (self.root / "superseded").mkdir(exist_ok=True)
+            f.replace(self.root / kept)
+            self.manifest[kept] = {
+                **old,
+                "superseded_by_adql_sha256": entry.get("adql_sha256"),
+                "superseded_at_utc": datetime.now(UTC).isoformat(),
+            }
+        f.write_bytes(raw)
+        self.manifest[name] = entry
         self.path.write_text(json.dumps(self.manifest, indent=1, sort_keys=True) + "\n", "utf-8")
         return entry
 
@@ -518,8 +608,33 @@ def assemble(
     background_sha256: str = "",
     binning: radio.ShellBinning = radio.DEFAULT_SHELL_BINNING,
     extra_meta: dict | None = None,
+    overlay: PointingOverlay | None = None,
+    catalog: SightingTable | None = None,
+    cone_receipts: Mapping[int, Mapping] | None = None,
 ) -> tuple[dict, MergedTargets]:
-    """Cones -> distances -> union_targets_by_pointing -> compact summary document."""
+    """Cones -> distances -> union_targets_by_pointing -> compact summary document.
+
+    ``primary`` supplies the beam centres AND the primary positions of the de-duplication.
+    With a pointing-correction ``overlay`` it must be ``overlay.apply(catalog)`` (checked),
+    where ``catalog`` is the untouched locked list; the summary then records the overlay's
+    SHA-256, the corrected pointings and - from ``cone_receipts`` (pointing index -> cone
+    cache manifest entry) - the query hash, time and commit of each corrected cone.
+    """
+    overlay_meta: dict = {}
+    note = METHODOLOGY_NOTE
+    if overlay is not None:
+        if catalog is None:
+            raise ValueError("assemble: an overlay needs the uncorrected catalog table")
+        fixed = overlay.apply(catalog)
+        if not (
+            np.array_equal(fixed.ra_deg, primary.ra_deg)
+            and np.array_equal(fixed.dec_deg, primary.dec_deg)
+        ):
+            raise ValueError("assemble: primary is not the catalog with the overlay applied")
+        overlay_meta = overlay.summary_meta(catalog, cone_receipts)
+        note += OVERLAY_NOTE.format(
+            n=overlay_meta["n_corrected_pointings"], path=overlay.path, sha=overlay.sha256
+        )
     fwhm, cone = beam(parent)
     table, extras, cuts = build_sightings(frames, primary, cone, background_sha256)
     merged = union_targets_by_pointing(BL_LBAND_POINTING_GROUP, [primary, table])
@@ -547,7 +662,7 @@ def assemble(
                 "et al. (2017) targets (cone radius FWHM/2), de-duplicated across beams and "
                 "against the primaries, binned per pointing in (distance, off-axis EIRP_min)."
             ),
-            "methodology_note": METHODOLOGY_NOTE,
+            "methodology_note": note,
             "code_git_sha": code_git_sha,
             "fetched_at_utc": window[1],
             "query_window_utc": list(window),
@@ -556,6 +671,7 @@ def assemble(
             "primary_catalog_path": parent.catalog_path,
             "n_pointings_completed": n_completed,
             "angular_match_epoch": ANGULAR_MATCH_EPOCH,
+            **overlay_meta,
             **(extra_meta or {}),
         },
         rng_seed=rng_seed,
@@ -705,8 +821,15 @@ def synthetic_cone_frames(
     return frames
 
 
-def rehearsal_pointings(primary: SightingTable, cone_radius: u.Quantity) -> list[int]:
-    """A beam-sharing pair, one primary with a Gaia id and one without (deterministic)."""
+def rehearsal_pointings(
+    primary: SightingTable, cone_radius: u.Quantity, corrected: Sequence[int] = ()
+) -> list[int]:
+    """A beam-sharing pair, one primary with a Gaia id and one without (deterministic).
+
+    ``corrected`` (pointing indices moved by the overlay) adds the first corrected primary
+    with a Gaia id and the first without, so the rehearsal exercises both de-duplication
+    keys at corrected positions.
+    """
     sky = SkyCoord(primary.ra_deg * u.deg, primary.dec_deg * u.deg)
     i1, i2, sep, _ = sky.search_around_sky(sky, cone_radius)
     pairs = sorted(
@@ -716,19 +839,29 @@ def rehearsal_pointings(primary: SightingTable, cone_radius: u.Quantity) -> list
     has_id = primary.gaia_dr3_source_id != MISSING_GAIA_ID
     for want in (True, False):
         chosen.append(next(int(i) for i in np.flatnonzero(has_id == want) if i not in chosen))
+        first = next((int(i) for i in sorted(corrected) if bool(has_id[i]) == want), None)
+        if first is not None:
+            chosen.append(first)
     return sorted(set(chosen))
 
 
 # --------------------------------------------------------------------- dry run
 def dry_run(args: argparse.Namespace) -> int:
     started = datetime.now(UTC).isoformat()
-    _graph, parent, primary = load_pointings()
+    pts = load_pointings()
+    parent, primary, overlay = pts.parent, pts.primary, pts.overlay
     fwhm, cone = beam(parent)
     print(
         f"[1/5] Locked pointings: {len(primary)} targets from {parent.catalog_path} "
         f"(sha256 {LOCKED_CATALOG_SHA256[:16]}... verified); beam FWHM "
         f"{fwhm.to_value(u.arcmin):g} arcmin, cone radius {cone.to_value(u.arcmin):g} arcmin"
     )
+    if overlay is not None:
+        print(
+            f"      Pointing-correction overlay {overlay.path} (sha256 {overlay.sha256[:16]}...): "
+            f"{len(pts.corrected_indices)} cone centre(s) and de-duplication position(s) "
+            f"corrected ({overlay.record.ruling}); the locked catalog is not modified"
+        )
     queries = [
         cone_adql(args.endpoint, float(primary.ra_deg[i]), float(primary.dec_deg[i]), cone)
         for i in range(len(primary))
@@ -741,18 +874,26 @@ def dry_run(args: argparse.Namespace) -> int:
     )
     print(f"      {queries[0]}")
     cache = Cache(args.cache_dir, writable=False)
-    done = sum(
-        cache.get(i, hashlib.sha256(q.encode()).hexdigest()) is not None
+    hits = [
+        cache.get(
+            i,
+            hashlib.sha256(q.encode()).hexdigest(),
+            (float(primary.ra_deg[i]), float(primary.dec_deg[i])),
+        )
+        is not None
         for i, q in enumerate(queries)
-    )
+    ]
+    done = sum(hits)
+    stale_corrected = [i for i in pts.corrected_indices if not hits[i]]
     print(
         f"[3/5] Cache {args.cache_dir.as_posix()} "
         f"({'exists' if args.cache_dir.is_dir() else 'not created yet'}; gitignored): "
-        f"{done}/{len(queries)} pointings complete for this ADQL; files pointing_000.csv .. "
-        f"pointing_{len(queries) - 1:03d}.csv + manifest.json; a live --fetch would query "
-        f"{len(queries) - done} pointing(s)"
+        f"{done}/{len(queries)} pointings complete for this ADQL and cone centre; files "
+        f"pointing_000.csv .. pointing_{len(queries) - 1:03d}.csv + manifest.json; a live "
+        f"--fetch would query {len(queries) - done} pointing(s), {len(stale_corrected)} of "
+        f"them corrected cone(s)"
     )
-    picks = rehearsal_pointings(primary, cone)
+    picks = rehearsal_pointings(primary, cone, pts.corrected_indices)
     rng = np.random.default_rng(np.random.SeedSequence([args.seed, 0x53594E]))
     frames = synthetic_cone_frames(primary, picks, cone, rng)
     doc, merged = assemble(
@@ -768,9 +909,26 @@ def dry_run(args: argparse.Namespace) -> int:
         rng_seed=args.seed,
         n_validation=args.n_validation,
         binning=shell_binning(args.bin_dex),
+        overlay=overlay,
+        catalog=pts.catalog,
     )
     p = merged.provenance
     dups = merged.duplicate_gaia_ids()
+    # Every rehearsed corrected primary must absorb its own sighting at the corrected
+    # position: by Gaia id, or by the 3 arcsec fallback when the catalog has no id.
+    absorbed_by = {
+        m["primary_target_name"]: m["match"] for m in doc["validation_sample"]["primary_matched"]
+    }
+    corrected_picks = [i for i in picks if i in set(pts.corrected_indices)]
+    corrected_ok = all(
+        absorbed_by.get(str(primary.names[i]))
+        == (
+            "gaia_dr3_source_id"
+            if primary.gaia_dr3_source_id[i] != MISSING_GAIA_ID
+            else "angular_fallback"
+        )
+        for i in corrected_picks
+    )
     print(
         f"[4/5] De-duplication rehearsal on SYNTHETIC cones (synthetic_proxy, in memory) for "
         f"pointings {[str(primary.names[i]) for i in picks]}: {p.n_raw_targets} raw rows -> "
@@ -780,6 +938,11 @@ def dry_run(args: argparse.Namespace) -> int:
         f"{p.n_background_absorbed_by_primary} background sightings absorbed by primaries, "
         f"{len(dups)} duplicated Gaia ids"
     )
+    if corrected_picks:
+        print(
+            f"      Corrected primaries rehearsed at their overlay position: "
+            f"{[(str(primary.names[i]), absorbed_by.get(str(primary.names[i]))) for i in corrected_picks]}"
+        )
     BackgroundSummaryFile.model_validate(doc)
     size = len(background_summary_bytes(doc))
     cuts = doc["distance_cuts"]
@@ -789,6 +952,7 @@ def dry_run(args: argparse.Namespace) -> int:
         and p.n_multi_beam_resolved > 0
         and p.n_dedup_angular_fallback > 0
         and size < BACKGROUND_SUMMARY_MAX_BYTES
+        and corrected_ok
     )
     print(
         f"[5/5] Summary schema valid: {doc['shells']['n_stars']} background stars in "
@@ -818,7 +982,9 @@ def live_fetch(args: argparse.Namespace) -> int:
         )
         return 2
     started = datetime.now(UTC).isoformat()
-    _graph, parent, primary = load_pointings()
+    pts = load_pointings()
+    parent, primary, overlay = pts.parent, pts.primary, pts.overlay
+    corrected = set(pts.corrected_indices)
     _fwhm, cone = beam(parent)
     ep = ENDPOINTS[args.endpoint]
     cache = Cache(args.cache_dir, writable=True)
@@ -826,16 +992,22 @@ def live_fetch(args: argparse.Namespace) -> int:
         f"[1/3] {len(primary)} locked pointings (git_sha={git_sha}); cones of "
         f"{cone.to_value(u.arcmin):g} arcmin against {ep['label']}; cache {args.cache_dir}"
     )
+    if overlay is not None:
+        print(
+            f"      Pointing-correction overlay {overlay.path} (sha256 {overlay.sha256[:16]}...): "
+            f"{len(corrected)} cone centre(s) corrected; the locked catalog is not modified"
+        )
     _NETWORK_ALLOWED = True
     frames: dict[int, pd.DataFrame] = {}
     per_pointing, failures, n_new = [], [], 0
-    n_attempted = consecutive_failures = 0
+    n_attempted = consecutive_failures = n_cache_hits = 0
+    fetched_indices: list[int] = []
     aborted = False
     try:
         for i in range(len(primary)):
             ra, dec = float(primary.ra_deg[i]), float(primary.dec_deg[i])
             adql_sha = hashlib.sha256(cone_adql(args.endpoint, ra, dec, cone).encode()).hexdigest()
-            hit = cache.get(i, adql_sha)
+            hit = cache.get(i, adql_sha, (ra, dec))
             if hit is None:
                 capped = (
                     args.max_new_pointings is not None and n_attempted >= args.max_new_pointings
@@ -868,25 +1040,36 @@ def live_fetch(args: argparse.Namespace) -> int:
                         "target_name": str(primary.names[i]),
                         "endpoint": ep["url"],
                         "adql_sha256": adql_sha,
+                        # The queried cone centre, at the precision written into the ADQL.
+                        "ra_deg": float(f"{ra:.6f}"),
+                        "dec_deg": float(f"{dec:.6f}"),
+                        "pointing_corrected": i in corrected,
                         "n_rows": n_rows,
                         "code_git_sha": git_sha,
                         "fetched_at_utc": datetime.now(UTC).isoformat(),
                     },
                 )
                 n_new += 1
+                fetched_indices.append(i)
                 time.sleep(args.sleep)
             else:
                 text, entry = hit
+                n_cache_hits += 1
             frames[i] = parse_cone_csv(text)
             per_pointing.append({k: entry[k] for k in sorted(entry)})
             if (i + 1) % 50 == 0 or hit is None:
-                print(f"      [{i:3d}] {primary.names[i]}: {entry['n_rows']} rows")
+                tag = " (corrected centre)" if i in corrected else ""
+                print(f"      [{i:3d}] {primary.names[i]}{tag}: {entry['n_rows']} rows")
     finally:
         _NETWORK_ALLOWED = False
     finished = datetime.now(UTC).isoformat()
     n_done = len(frames)
     complete = n_done == len(primary) == N_POINTINGS
-    print(f"[2/3] {n_done}/{len(primary)} pointings available ({n_new} fetched this run)")
+    print(
+        f"[2/3] {n_done}/{len(primary)} pointings available: {n_cache_hits} cache hit(s), "
+        f"{n_new} fetched this run ({sum(i in corrected for i in fetched_indices)} at a corrected "
+        f"centre), {len(failures)} failure(s)"
+    )
     manifest_digest = canonical_sha256(
         {str(r["pointing_index"]): r["sha256"] for r in per_pointing}
     )
@@ -909,6 +1092,9 @@ def live_fetch(args: argparse.Namespace) -> int:
             n_validation=args.n_validation,
             binning=shell_binning(args.bin_dex),
             background_sha256=manifest_digest,
+            overlay=overlay,
+            catalog=pts.catalog,
+            cone_receipts={int(r["pointing_index"]): r for r in per_pointing},
             extra_meta={
                 # The artifact must describe itself without the gitignored receipt: when
                 # it was assembled, from which raw cone bytes, fetched by which commits.
@@ -932,6 +1118,13 @@ def live_fetch(args: argparse.Namespace) -> int:
         "locked_inputs": {
             "primary_catalog_path": parent.catalog_path,
             "primary_catalog_sha256": primary.sha256,
+            "pointing_corrections_path": overlay.path if overlay else None,
+            "pointing_corrections_sha256": overlay.sha256 if overlay else None,
+        },
+        "pointing_corrections": {
+            "n_corrected_pointings": len(corrected),
+            "corrected_pointing_indices": sorted(corrected),
+            "corrected_target_names": [str(primary.names[i]) for i in sorted(corrected)],
         },
         "pointing_coverage": {
             "n_pointings": len(primary),
@@ -942,6 +1135,8 @@ def live_fetch(args: argparse.Namespace) -> int:
             "dir": args.cache_dir.as_posix(),
             "manifest_digest_sha256": manifest_digest,
             "n_fetched_this_run": n_new,
+            "n_cache_hits_this_run": n_cache_hits,
+            "fetched_pointing_indices_this_run": fetched_indices,
             "n_attempted_this_run": n_attempted,
             "aborted_after_consecutive_failures": aborted,
             "code_git_shas": cache_shas,
@@ -990,6 +1185,19 @@ def promote(receipt_path: Path, out_file: Path = OUT_FILE, root: Path = ROOT) ->
                 f"summary data_tier {summary.get('data_tier')!r} is not reproduced_archive "
                 "(synthetic rehearsal output can never be promoted)"
             )
+        ov_path, ov_sha = (
+            summary.get("pointing_corrections_path"),
+            summary.get("pointing_corrections_sha256"),
+        )
+        if ov_path is not None:
+            # The overlay the cones were fetched with must be the file in the tree now.
+            f = root / str(ov_path)
+            now = hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else "missing"
+            if now != ov_sha:
+                problems.append(
+                    f"pointing corrections {ov_path} changed since the fetch "
+                    f"(receipt {str(ov_sha)[:12]}..., file {now[:12]}...)"
+                )
         try:
             rel = receipt_path.resolve().relative_to(root.resolve()).as_posix()
         except ValueError:
@@ -1024,6 +1232,13 @@ def promote(receipt_path: Path, out_file: Path = OUT_FILE, root: Path = ROOT) ->
     print(f"  parent_pointing_survey_id: {PARENT_SURVEY_ID}")
     print(f'  background_summary_path: "{BACKGROUND_SUMMARY_PATH}"')
     print(f'  background_summary_sha256: "{sha}"')
+    if doc.get("pointing_corrections_path") is not None:
+        print(f'  pointing_corrections_path: "{doc["pointing_corrections_path"]}"')
+        print(f'  pointing_corrections_sha256: "{doc["pointing_corrections_sha256"]}"')
+        print(
+            f"  ({doc['n_corrected_pointings']} corrected cone centre(s): "
+            f"{', '.join(doc['corrected_target_names'])})"
+        )
     return 0
 
 

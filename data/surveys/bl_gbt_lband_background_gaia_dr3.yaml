@@ -27,6 +27,12 @@ sefd_jy: 10.0
 # the validation sample (beam offsets, off-axis EIRP_min, shell bins) offline.
 background_summary_path: "data/catalogs/bl_gbt_lband_background_summary.json"
 background_summary_sha256: "0d205838e4b65148e3c5e3878c1cf52f1e238a7df5aea47944bf0a7e988ca6e1"
+# Ruling v0.2.1-R5: non-destructive pointing-correction overlay. Isaacson et al. (2017)
+# Table 1 prints 14 of these targets at +10 deg instead of -10 deg; data/catalogs/
+# bl_692_targets.csv keeps the published values (immutable), and the background cones and
+# their de-duplication use the J2000 positions of this SHA-256-pinned claim file instead.
+pointing_corrections_path: "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml"
+pointing_corrections_sha256: "7d976fe57e93ca1f38020529ae7e7f2fe106074576223c914547568b35027e74"
 # On-axis radiometer of the parent pointings (identical values by construction: the
 # background stars are attenuated per star by the Gaussian primary beam, B(theta)).
 radio_sensitivity:

@@ -29,9 +29,11 @@ Exactly one mode must be chosen:
     SHA-256 pin for ``data/surveys/``.
 
 Distances: inverse parallax for ``parallax_over_error >= 5``; Bailer-Jones et al. (2021)
-geometric distances (``gedr3dist.main``; identical source ids in EDR3 and DR3) for
-``1 < parallax_over_error < 5``; everything else, and every star beyond 10 kpc, is dropped
-and counted. De-duplication across overlapping cones and against the 692 primaries uses
+geometric distances (ARI: ``gaiaedr3_complements.distances``; identical source ids in EDR3
+and DR3) for ``1 < parallax_over_error < 5``; everything else, and every star beyond 10 kpc,
+is dropped and counted. A live run stops querying after ``MAX_CONSECUTIVE_FAILURES`` failed
+cones in a row (a schema or outage error is never repeated across all 692 pointings), and
+``--max-new-pointings`` caps attempted queries, failed ones included. De-duplication across overlapping cones and against the 692 primaries uses
 the shared ``union_targets_by_pointing`` kernel (minimum beam offset kept).
 
 Never imported or run by the offline test suite except through its offline modes
@@ -102,6 +104,7 @@ SNR_BAILER_JONES = 1.0  # 1 < parallax_over_error < 5: Bailer-Jones geometric di
 GAIA_DR3_EPOCH = 2016.0
 MATCH_EPOCH = 2000.0
 MAXREC = 2_000_000
+MAX_CONSECUTIVE_FAILURES = 3  # stop querying: a schema / outage error will not fix itself
 SYNTHETIC_ID_BASE = 9_000_000_000_000_000_000  # above every real Gaia DR3 source_id
 SUSPECT_RADIUS = 120.0 * u.arcsec
 SUSPECT_DISTANCE_TOLERANCE = 0.30
@@ -110,7 +113,10 @@ ENDPOINTS = {
         "url": "https://gaia.ari.uni-heidelberg.de/tap/sync",
         "label": "ARI Heidelberg Gaia TAP (gaia.ari.uni-heidelberg.de)",
         "gaia_source": "gaiadr3.gaia_source",
-        "distance_table": "gedr3dist.main",
+        # Bailer-Jones et al. (2021) EDR3 distances as served by ARI (verified live
+        # 2026-11-27 via TAP_SCHEMA). `gedr3dist.main` is the GAVO data-centre name of the
+        # same catalogue and does NOT exist on this service (HTTP 400, unknown table).
+        "distance_table": "gaiaedr3_complements.distances",
     },
     "esa": {
         "url": "https://gea.esac.esa.int/tap-server/tap/sync",
@@ -801,20 +807,37 @@ def live_fetch(args: argparse.Namespace) -> int:
     _NETWORK_ALLOWED = True
     frames: dict[int, pd.DataFrame] = {}
     per_pointing, failures, n_new = [], [], 0
+    n_attempted = consecutive_failures = 0
+    aborted = False
     try:
         for i in range(len(primary)):
             ra, dec = float(primary.ra_deg[i]), float(primary.dec_deg[i])
             adql_sha = hashlib.sha256(cone_adql(args.endpoint, ra, dec, cone).encode()).hexdigest()
             hit = cache.get(i, adql_sha)
             if hit is None:
-                if args.max_new_pointings is not None and n_new >= args.max_new_pointings:
+                capped = (
+                    args.max_new_pointings is not None and n_attempted >= args.max_new_pointings
+                )
+                if aborted or capped:
                     continue
+                n_attempted += 1
                 try:
                     text, n_rows = fetch_cone(args.endpoint, ra, dec, cone)
                 except LiveFetchError as exc:
-                    failures.append({"pointing_index": i, "reason": str(exc)[:300]})
-                    print(f"      [{i:3d}] {primary.names[i]}: FAILED {exc}")
+                    reason = " ".join(str(exc).split())[:600]
+                    failures.append({"pointing_index": i, "reason": reason})
+                    print(f"      [{i:3d}] {primary.names[i]}: FAILED {reason}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        aborted = True
+                        print(
+                            f"      {consecutive_failures} consecutive failures: no further "
+                            "pointings are queried in this run (fix the cause, then re-run; "
+                            "finished pointings stay cached)",
+                            file=sys.stderr,
+                        )
                     continue
+                consecutive_failures = 0
                 entry = cache.put(
                     i,
                     text,
@@ -886,6 +909,8 @@ def live_fetch(args: argparse.Namespace) -> int:
             "dir": args.cache_dir.as_posix(),
             "manifest_digest_sha256": manifest_digest,
             "n_fetched_this_run": n_new,
+            "n_attempted_this_run": n_attempted,
+            "aborted_after_consecutive_failures": aborted,
             "code_git_shas": sorted({str(r.get("code_git_sha")) for r in per_pointing}),
         },
         "failures": failures,
@@ -983,7 +1008,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache-dir", type=Path, default=CACHE_DIR)
     ap.add_argument("--out", type=Path, default=OUT_DIR, help="receipt directory")
     ap.add_argument("--out-file", type=Path, default=OUT_FILE, help="promoted artifact path")
-    ap.add_argument("--max-new-pointings", type=int, default=None, help="cap live queries per run")
+    ap.add_argument(
+        "--max-new-pointings",
+        type=int,
+        default=None,
+        help="cap pointings queried live per run (failed attempts count)",
+    )
     ap.add_argument("--sleep", type=float, default=0.25, help="pause between live queries [s]")
     ap.add_argument("--allow-dirty", action="store_true", help="smoke test; never promotable")
     return ap

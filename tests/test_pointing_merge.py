@@ -819,7 +819,10 @@ def test_distance_rules_count_every_cut(script):
 
 def test_fetch_script_adql_cache_paths_and_gaia_ids_stay_exact(script, synthetic, tmp_path):
     q = script.cone_adql("ari", 1.6825, -7.539444, 4.2 * u.arcmin)
-    assert "gaiadr3.gaia_source" in q and "gedr3dist.main" in q
+    # ARI serves the Bailer-Jones (2021) distances as gaiaedr3_complements.distances; the
+    # GAVO name gedr3dist.main does not exist there (live HTTP 400 on 2026-11-27).
+    assert "gaiadr3.gaia_source" in q and "gaiaedr3_complements.distances AS d" in q
+    assert "gedr3dist" not in q
     assert "CIRCLE('ICRS', 1.682500, -7.539444, 0.07000000)" in q
     assert "external.gaiaedr3_distance" in script.cone_adql("esa", 1.0, 2.0, 4.2 * u.arcmin)
     assert script.N_POINTINGS == 692 and script.D_MAX_PC == 10000.0
@@ -884,6 +887,44 @@ def test_live_fetch_refuses_a_dirty_tree_before_any_request(script, tmp_path, mo
     rc = script.main(["--fetch", "--cache-dir", str(tmp_path / "c"), "--out", str(tmp_path / "o")])
     assert rc == 2 and "clean committed code_git_sha" in capsys.readouterr().err
     assert not (tmp_path / "c").exists() and not (tmp_path / "o").exists()
+
+
+def test_live_fetch_stops_after_consecutive_failures_and_caps_attempts(
+    script, tmp_path, monkeypatch, capsys
+):
+    """A schema / outage error is never repeated across all 692 pointings (offline: the
+    cone query itself is stubbed to fail, so no request leaves the process)."""
+    calls: list[tuple] = []
+
+    def failing_cone(endpoint, ra, dec, radius):
+        calls.append((endpoint, ra, dec))
+        raise script.LiveFetchError("HTTP 400: Unknown table")
+
+    monkeypatch.setattr(script, "git_state", lambda root: ("d" * 40, "d" * 40))
+    monkeypatch.setattr(script, "fetch_cone", failing_cone)
+    monkeypatch.setattr(script, "_post", lambda *a, **k: pytest.fail("network attempted"))
+
+    def run(*extra):
+        calls.clear()
+        out = tmp_path / f"o{len(extra)}"
+        argv = ["--fetch", "--cache-dir", str(tmp_path / "c"), "--out", str(out), *extra]
+        rc = script.main(argv)
+        (receipt,) = out.glob("*.json")
+        return rc, json.loads(receipt.read_text("utf-8"))
+
+    rc, rec = run()
+    assert rc == 1 and len(calls) == script.MAX_CONSECUTIVE_FAILURES == 3
+    assert rec["status"] == "incomplete" and rec["summary"] is None
+    assert rec["cache"]["aborted_after_consecutive_failures"] is True
+    assert rec["cache"]["n_attempted_this_run"] == 3 and rec["cache"]["n_fetched_this_run"] == 0
+    assert [f["pointing_index"] for f in rec["failures"]] == [0, 1, 2]
+    assert "consecutive failures" in capsys.readouterr().err
+    # --max-new-pointings counts failed attempts too: a 2-pointing smoke test sends 2 queries.
+    rc, rec = run("--max-new-pointings", "2")
+    assert rc == 1 and len(calls) == 2
+    assert rec["cache"]["n_attempted_this_run"] == 2
+    assert rec["cache"]["aborted_after_consecutive_failures"] is False
+    assert script._NETWORK_ALLOWED is False  # the guard is restored after the run
 
 
 def _receipt(script, **over):

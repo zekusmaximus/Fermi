@@ -6,9 +6,27 @@ import {
   type CompareResponse,
   type DiskProfile,
   type Geometry,
+  type PointingMergePolicy,
   type RadioMode,
 } from "../api";
-import { ErrorBox, Hash, Loading, Panel, TierBadge, TierSetBadge, useApi } from "../components/ui";
+import { ErrorBox, Hash, HelpPopover, Loading, Panel, TierBadge, TierSetBadge, useApi } from "../components/ui";
+import { fmtCount } from "../lib/background";
+import {
+  CORRELATION_CAVEAT,
+  DEFAULT_MERGE_POLICY,
+  EARTH_UNREACHED_HELP,
+  MERGE_POLICY_CONTROL_LABEL,
+  MERGE_POLICY_HELP,
+  MERGE_POLICY_LABELS,
+  MERGE_POLICY_OPTIONS,
+  earthUnreachedNote,
+  flatBackgroundGuardActive,
+  isEarthTerm,
+  mergePolicyCaption,
+  mergePolicyRequest,
+  mergeProvenanceRows,
+  noteRulingTag,
+} from "../lib/merge";
 import {
   ILLUSTRATIVE_BANNER,
   fmtLog10,
@@ -50,6 +68,7 @@ export function MacroDesk({
   const [diskProfile, setDiskProfile] = useState<DiskProfile>("uniform");
   const [marginalize, setMarginalize] = useState(false);
   const [radioMode, setRadioMode] = useState<RadioMode>("flat_probability");
+  const [mergePolicy, setMergePolicy] = useState<PointingMergePolicy>(DEFAULT_MERGE_POLICY);
   const [earth, setEarth] = useState(true);
   const [channels, setChannels] = useState<Channel[]>(["radio", "infrared", "solar_system"]);
   const [illustrative, setIllustrative] = useState(false);
@@ -64,10 +83,11 @@ export function MacroDesk({
     channels,
     include_illustrative: illustrative,
     seed,
+    ...mergePolicyRequest(mergePolicy),
   };
   const { data, error, loading } = useApi(
     () => post<CompareResponse>("/api/compare", req),
-    [geometry, geo.disk_profile, marginalize, radioMode, earth, channels.join(","), illustrative, seed],
+    [geometry, geo.disk_profile, marginalize, radioMode, mergePolicy, earth, channels.join(","), illustrative, seed],
   );
 
   const toggleChannel = (c: Channel) =>
@@ -89,6 +109,22 @@ export function MacroDesk({
   const present = COMPONENT_ORDER.filter((c) => hyps.some((h) => c in h.components));
   const colTiers = (c: string) =>
     [...new Set(hyps.flatMap((h) => h.components[c]?.data_tiers ?? []))].sort();
+  // Merge-policy read-outs come from the receipt (what the server actually did), never
+  // from the selected option alone.
+  const radioOn = channels.includes("radio");
+  const mergeProv = data?.receipt.merge_provenance ?? null;
+  const bgField = data?.receipt.background_field ?? null;
+  const heldOut = data?.receipt.held_out_extension_surveys ?? [];
+  const mergeCaption = mergePolicyCaption({
+    policy: mergePolicy,
+    radioMode,
+    radioOn,
+    nBackground: bgField?.n_background_stars ?? null,
+    heldOutSurveys: heldOut.map((h) => h.survey_id),
+  });
+  const guardActive = flatBackgroundGuardActive(mergePolicy, radioMode, radioOn);
+  const earthNote = earthUnreachedNote({ geometry, diskProfile, marginalized: marg !== null });
+  const bgHyps = hyps.filter((h) => h.radio?.background);
 
   return (
     <div className="view">
@@ -132,6 +168,29 @@ export function MacroDesk({
           onChange={(v) => setRadioMode(v as RadioMode)}
           warn={radioMode === "distance_scaled_eirp" ? "luminosity function is illustrative" : undefined}
         />
+        <div className="ctl ctl-wide">
+          <span className="ctl-label">
+            {MERGE_POLICY_CONTROL_LABEL}{" "}
+            <HelpPopover label={MERGE_POLICY_CONTROL_LABEL} {...MERGE_POLICY_HELP} />
+          </span>
+          <div className="seg seg-tall" role="radiogroup" aria-label={MERGE_POLICY_CONTROL_LABEL}>
+            {MERGE_POLICY_OPTIONS.map((o) => (
+              <button
+                key={o}
+                role="radio"
+                aria-checked={o === mergePolicy}
+                className={o === mergePolicy ? "on" : ""}
+                onClick={() => setMergePolicy(o)}
+              >
+                <span className="seg-plain">{MERGE_POLICY_LABELS[o]}</span>
+                <span className="seg-enum">{o}</span>
+              </button>
+            ))}
+          </div>
+          <span className={guardActive ? "ctl-caption ctl-caption-warn" : "ctl-caption"} aria-live="polite">
+            {mergeCaption}
+          </span>
+        </div>
         <div className="ctl">
           <span className="ctl-label">Conditioning &amp; channels</span>
           <div className="checks">
@@ -229,6 +288,16 @@ export function MacroDesk({
                 {n.log10_bf_term !== null ? (
                   <span className="muted num"> (its term: {fmtLog10(n.log10_bf_term)})</span>
                 ) : null}
+                {noteRulingTag(n) ? <span className="ruling-tag"> ruling {noteRulingTag(n)}</span> : null}
+                {n.merged_background ? (
+                  <span className="muted small num">
+                    {" "}
+                    · {fmtCount(n.merged_background.n_primary_targets)} primaries (exact MC){" "}
+                    {fmtLog10(n.merged_background.log10_bf_primary_targets_exact_mc)} +{" "}
+                    {fmtCount(n.merged_background.n_background_stars)} background stars (FKG product){" "}
+                    {fmtLog10(n.merged_background.log10_bf_background_shells_fkg_product)}
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>
@@ -251,7 +320,18 @@ export function MacroDesk({
                 const tiers = hl.term_data_tiers[t] ?? [];
                 return (
                   <tr key={t} className={isIllustrative(tiers) ? "row-illustrative" : ""}>
-                    <td>{t}</td>
+                    <td>
+                      {t}
+                      {isEarthTerm(t) ? (
+                        <>
+                          {" "}
+                          <HelpPopover label="earth_unreached model term" {...EARTH_UNREACHED_HELP} />
+                          <span className="term-caption" aria-live="polite">
+                            {earthNote}
+                          </span>
+                        </>
+                      ) : null}
+                    </td>
                     <td>
                       <TierSetBadge tiers={tiers} />
                     </td>
@@ -263,6 +343,73 @@ export function MacroDesk({
             </tbody>
           </table>
         </Panel>
+      ) : null}
+
+      {mergeProv && bgField ? (
+        <Panel
+          className="panel-archive"
+          title={`Merged radio targets — ${mergeProv.policy}`}
+          aside={
+            <span className="legend">
+              <TierBadge tier={bgField.data_tier} /> background field <Hash sha={bgField.file_sha256} /> · git{" "}
+              <Hash sha={bgField.code_git_sha} />
+            </span>
+          }
+        >
+          <div className="cards2">
+            <table className="tbl tbl-compact">
+              <tbody>
+                {mergeProvenanceRows(mergeProv, bgField.dedup_audit.n_suspected_unmatched_primary_stars).map((r) => (
+                  <tr key={r.label} className={r.flag ? "row-flag" : ""}>
+                    <td>{r.label}</td>
+                    <td className="r num">{fmtCount(r.value)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div>
+              <table className="tbl tbl-compact">
+                <thead>
+                  <tr>
+                    <th>background shells · hypothesis</th>
+                    <th className="r">E[N reached]</th>
+                    <th className="r">E[detections]</th>
+                    <th className="r">P0 Harris–FKG lower</th>
+                    <th className="r">P0 Fréchet upper</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bgHyps.map((h) => (
+                    <tr key={h.hypothesis_id} className={guardActive || radioMode === "distance_scaled_eirp" ? "row-illustrative" : ""}>
+                      <td>{h.hypothesis_id}</td>
+                      <td className="r num">{fmtNum(h.radio?.background?.expected_reached)}</td>
+                      <td className="r num">{fmtNum(h.radio?.background?.expected_detections)}</td>
+                      <td className="r num">{fmtNum(h.radio?.background?.p_zero_independent_fkg_lower, 8)}</td>
+                      <td className="r num">{fmtNum(h.radio?.background?.p_zero_frechet_upper, 8)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="muted small">{CORRELATION_CAVEAT}</p>
+            </div>
+          </div>
+          <p className="muted small">{bgField.scope.statement}</p>
+          <p className="caveat small">
+            <b>suspected_unmatched_primary:</b> {bgField.dedup_audit.n_suspected_unmatched_primary} row(s),{" "}
+            {bgField.dedup_audit.n_suspected_unmatched_primary_stars} distinct stars —{" "}
+            {bgField.dedup_audit.suspected_unmatched_primary_policy}. Details in the Radio drill-down.
+          </p>
+        </Panel>
+      ) : heldOut.length > 0 && radioOn ? (
+        <p className="muted small held-out">
+          Held out of this run:{" "}
+          {heldOut.map((h) => (
+            <span key={h.survey_id}>
+              <code>{h.survey_id}</code> (extension of <code>{h.parent_pointing_survey_id}</code>){" "}
+            </span>
+          ))}
+          — its stars are not in the radio term. Select “{MERGE_POLICY_LABELS.union_targets_by_pointing}” to merge them.
+        </p>
       ) : null}
 
       <Panel

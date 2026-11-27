@@ -13,6 +13,8 @@ to one and the result is the exact MI of that (slightly coarsened) variable.
 
 from __future__ import annotations
 
+import itertools
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -69,6 +71,65 @@ def binomial_count_outcomes(
         pmf = binom.pmf(k, n, r)
         out[h] = np.append(pmf, max(0.0, 1.0 - pmf.sum()))
     return out
+
+
+def posterior(prior: Mapping[str, float], likelihood: Mapping[str, float]) -> dict[str, float]:
+    """Posterior over hypotheses after one observed outcome with ``likelihood[h] = p(y | h)``."""
+    if set(prior) != set(likelihood):
+        raise ValueError("prior and likelihood keys differ")
+    joint = {h: prior[h] * float(likelihood[h]) for h in prior}
+    z = sum(joint.values())
+    if not z > 0:
+        raise ValueError("the observed outcome has zero probability under every hypothesis")
+    return {h: v / z for h, v in joint.items()}
+
+
+def realized_information_bits(prior: Mapping[str, float], likelihood: Mapping[str, float]) -> float:
+    """Information actually gained from ONE observed outcome: KL(posterior || prior) in bits.
+
+    The expected value of this quantity over the outcome distribution is the EIG
+    (``mutual_information_bits``); a single realisation can be smaller or larger than it.
+    """
+    post = posterior(prior, likelihood)
+    return float(sum(p * (math.log2(p) - math.log2(prior[h])) for h, p in post.items() if p > 0))
+
+
+def binary_eig_range(
+    prior: Mapping[str, float], p_zero_bounds: Mapping[str, tuple[float, float]]
+) -> tuple[float, float]:
+    """(min, max) of the binary-outcome EIG when each hypothesis's P(no detection) may lie
+    anywhere in its own interval ``[lower, upper]``.
+
+    Used with the Harris-FKG lower and Frechet upper bounds on P(no detection): the exact
+    value under the model's positive spatial correlation lies between them, so the EIG lies
+    in the returned range.
+
+    The EIG is convex in the likelihoods and zero exactly where all hypotheses predict the
+    outcome equally. Its maximum over the box of intervals is therefore attained at a
+    corner (exact). Its minimum is 0 when the intervals share a common point; otherwise,
+    for two hypotheses, it is attained at the corner where the two intervals are closest
+    (exact). For more than two hypotheses the corner minimum is an upper bound on the true
+    minimum.
+    """
+    keys = sorted(prior)
+    if set(keys) != set(p_zero_bounds):
+        raise ValueError("prior and bound keys differ")
+    if len(keys) > 16:
+        raise ValueError("too many hypotheses for a corner scan")
+    bounds = []
+    for k in keys:
+        lo, hi = (float(x) for x in p_zero_bounds[k])
+        if not 0.0 <= lo <= hi <= 1.0:
+            raise ValueError(f"bounds for {k} must satisfy 0 <= lower <= upper <= 1")
+        bounds.append((lo, hi))
+    corners = [
+        mutual_information_bits(
+            prior, {k: binary_outcome(p) for k, p in zip(keys, combo, strict=True)}
+        )
+        for combo in itertools.product(*bounds)
+    ]
+    overlap = max(lo for lo, _ in bounds) <= min(hi for _, hi in bounds)
+    return (0.0 if overlap else float(min(corners))), float(max(corners))
 
 
 def utility_bits_per_hour(bits: float, cpu_seconds: float, reviewer_minutes: float) -> float:

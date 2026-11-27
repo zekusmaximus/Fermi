@@ -152,6 +152,34 @@ def _print_lookback_nodes(res: dict, pair: tuple[str, str]) -> None:
             )
 
 
+def _print_background_field(bf: dict | None) -> None:
+    """Provenance, exact N_bg and de-duplication counters of a merged background field."""
+    if not bf:
+        return
+    da, cuts = bf["dedup_audit"], bf["distance_cuts"]
+    console.print(
+        escape(
+            f"  background field {bf['survey_id']} [{bf['data_tier']}]: N_bg = "
+            f"{bf['n_background_stars']} stars in {bf['n_cells']} shell cells over "
+            f"{bf['n_pointings']} pointings (cone {bf['cone_radius_arcmin']:g} arcmin = FWHM/2, "
+            f"d <= {cuts['d_max_pc']:g} pc); sha256 {bf['file_sha256']}; git "
+            f"{bf['code_git_sha'][:12]}; fetched {bf['query_window_utc'][0][:19]}Z .. "
+            f"{bf['query_window_utc'][1][:19]}Z"
+        )
+    )
+    console.print(
+        "[yellow]  suspected_unmatched_primary[/] "
+        + escape(
+            f"= {da['n_suspected_unmatched_primary']} row(s), "
+            f"{da['n_suspected_unmatched_primary_stars']} distinct stars beside "
+            f"{da['n_primaries_with_a_suspected_counterpart']} of the "
+            f"{da['n_primary_without_gaia_id']} primaries without a Gaia id: "
+            f"{da['suspected_unmatched_primary_policy']}"
+        )
+    )
+    console.print(escape(f"  scope: {bf['scope']['statement']}"))
+
+
 def _tier_tag(tiers: list[str]) -> str:
     bad = sorted(t for t in tiers if t in ILLUSTRATIVE_TIERS)
     return ", ".join(bad) if bad else "verified (" + (", ".join(tiers) or "model term") + ")"
@@ -413,6 +441,7 @@ def compare(
                         f"{bg['p_zero_frechet_upper']:.8f} [{bg['data_tier']}]"
                     )
                 )
+        _print_background_field(receipt.get("background_field"))
 
     names = ("earth_unreached", "radio", "solar_system", "radio+solar_system", "infrared")
     present = [c for c in names if any(c in h["components"] for _, h in rows)]
@@ -750,6 +779,257 @@ def ir_drilldown(
     )
 
 
+# ------------------------------------------------------------ background-field
+@app.command("background-field")
+def background_field_cmd(
+    pair: Annotated[str, typer.Option(help="EIG prior 'A,B' (uniform).")] = PAIR_DEFAULT,
+    out_dir: Annotated[
+        Path | None, typer.Option(help="Receipt dir (default runs/background_field).")
+    ] = None,
+    root: Root = None,
+) -> None:
+    """Promoted Gaia DR3 background field: provenance, de-duplication, realized vs predicted EIG."""
+    from fermi_desk.inference.background_field import (
+        attenuation_summary,
+        bounds_table,
+        load_background_field,
+        pointing_centre_audit,
+        shell_summary,
+    )
+    from fermi_desk.inference.engine import canonical_sha256, git_state
+    from fermi_desk.queue import runners
+    from fermi_desk.queue.store import JOB_DEFINITIONS
+
+    graph = load_factor_graph(root)
+    try:
+        field = load_background_field(graph)
+    except FermiDeskError as exc:
+        _fail(exc)
+    if field is None:
+        console.print(
+            "[yellow]No background field is promoted: no survey pins a background summary "
+            "(scripts/fetch_wlodarczyk_sroka_288k.py --fetch, then --promote-from).[/]"
+        )
+        raise typer.Exit(code=1)
+    job = next(j for j in JOB_DEFINITIONS if j.job_id == runners.BACKGROUND_JOB_ID)
+    params = {**job.parameters, "pair": list(_pair(pair))}
+    ev = runners.background_extension_evidence(graph, params)
+    assert ev is not None
+    prov, shells, att = field.summary(), shell_summary(field), attenuation_summary(graph, field)
+    da, cuts, mp = prov["dedup_audit"], prov["distance_cuts"], prov["merge_provenance"]
+    console.rule(
+        f"fermi-desk background-field | {prov['survey_id']} | tier={prov['data_tier']} | "
+        f"N_bg={prov['n_background_stars']}"
+    )
+    t = _table("Provenance (reproduced_archive; verified offline on load)", ("field", "value"))
+    for k, v in (
+        ("artifact", prov["path"]),
+        ("file sha256 (pinned)", prov["file_sha256"]),
+        ("content_sha256", prov["content_sha256"]),
+        ("code_git_sha (assembled)", prov["code_git_sha"]),
+        ("cone-fetch commits", ", ".join(prov["cone_cache_code_git_shas"])),
+        ("cone cache manifest sha256", prov["cone_cache_manifest_sha256"]),
+        ("archive query window (UTC)", " .. ".join(prov["query_window_utc"])),
+        ("assembled (UTC)", prov["assembled_at_utc"]),
+        ("source service", prov["source_service"]),
+        (
+            "pointings / beam",
+            f"{prov['n_pointings']} pointings; FWHM {prov['beam_fwhm_arcmin']:g} arcmin, cone "
+            f"radius {prov['cone_radius_arcmin']:g} arcmin (FWHM/2)",
+        ),
+    ):
+        t.add_row(k, escape(str(v)))
+    console.print(t)
+    t = _table("Live fetch counts (exact)", ("stage", "count"))
+    for k, v in (
+        ("raw Gaia DR3 cone sightings", cuts["n_cone_sightings_raw"]),
+        ("  dropped: parallax_over_error <= 1 or no parallax", cuts["n_dropped_invalid_parallax"]),
+        (
+            "  dropped: 1 < S/N < 5 without a Bailer-Jones distance",
+            cuts["n_dropped_no_bailer_jones"],
+        ),
+        (f"  dropped: beyond {cuts['d_max_pc']:g} pc", cuts["n_dropped_beyond_d_max"]),
+        ("  dropped: outside the cone on recheck", cuts["n_dropped_outside_cone_recheck"]),
+        ("sightings with a distance", cuts["n_sightings_with_distance"]),
+        ("    inverse parallax (S/N >= 5)", cuts["n_sightings_inverse_parallax"]),
+        ("    Bailer-Jones 2021 geometric", cuts["n_sightings_bailer_jones_geo"]),
+        ("raw rows merged (692 primaries + sightings)", mp["n_raw_targets"]),
+        ("  de-duplicated by Gaia DR3 source_id", mp["n_dedup_gaia_id"]),
+        (
+            f"  de-duplicated by < {mp['angular_fallback_arcsec']:g} arcsec fallback",
+            mp["n_dedup_angular_fallback"],
+        ),
+        ("  multi-beam stars kept at minimum theta", mp["n_multi_beam_resolved"]),
+        ("  background sightings absorbed by primaries", mp["n_background_absorbed_by_primary"]),
+        ("    matched by Gaia id", da["n_background_sightings_matched_to_primary_gaia_id"]),
+        (
+            "    matched by angular fallback",
+            da["n_background_sightings_matched_to_primary_angular"],
+        ),
+        ("  angular links refused (two ids / two primaries)", mp["n_angular_links_refused"]),
+        ("duplicate Gaia ids vs bl_692_targets.csv", da["n_duplicate_gaia_ids_vs_primary"]),
+        ("duplicate Gaia ids within the background", da["n_duplicate_gaia_ids_within_background"]),
+        ("unique background stars N_bg", prov["n_background_stars"]),
+        ("shell cells", prov["n_cells"]),
+        ("suspected_unmatched_primary rows", da["n_suspected_unmatched_primary"]),
+        ("  distinct suspected stars (kept in shells)", da["n_suspected_unmatched_primary_stars"]),
+        (
+            "  primaries with a suspected counterpart",
+            da["n_primaries_with_a_suspected_counterpart"],
+        ),
+        ("  primaries without a Gaia id", da["n_primary_without_gaia_id"]),
+    ):
+        t.add_row(k, str(v))
+    console.print(t)
+    console.print(
+        "[yellow]  suspected_unmatched_primary[/] "
+        + escape(da["suspected_unmatched_primary_policy"])
+    )
+    console.print(escape(f"  scope: {prov['scope']['statement']}"))
+    pub = prov["scope"]["published"]
+    lband = pub["n_stars_gbt_l_band"]
+    console.print(
+        escape(
+            f"  published scope ({pub['citation']}): {pub['pointings']}; "
+            f"{pub['n_stars_total']} stars; {pub['gaia_release']}; {pub['distances']}. GBT L+S "
+            f"stars (Table 2): {pub['n_stars_gbt_l_plus_s_band']['value']}. GBT L-band only: "
+            f"{lband['value']} ({'verified' if lband['verified_against_paper'] else 'UNVERIFIED'}: "
+            f"{lband['source']})"
+        )
+    )
+    audit = pointing_centre_audit(graph, field)
+    dense = audit["densest_band_of_unfound_primaries"]
+    line = (
+        f"{audit['n_with_gaia_id_sighted_in_own_cone']} of {audit['n_with_gaia_id']} primaries "
+        "with a Gaia id were sighted in their own cone; "
+        f"{audit['n_no_counterpart_in_own_cone']} of {audit['n_primaries']} primaries have no "
+        "Gaia counterpart there at all."
+    )
+    if dense:
+        lo, hi = dense["declination_band_deg"]
+        line += (
+            f" {dense['n_no_counterpart']} of them lie in catalog Dec [{lo:+d}, {hi:+d}) deg "
+            f"({dense['n_targets']} targets there, {dense['n_targets_in_mirror_band']} in the "
+            f"mirror band; {dense['n_background_stars_in_those_pointings']} background stars = "
+            f"{100 * dense['fraction_of_background_stars']:.2f}% of N_bg): {dense['reading']} "
+            f"Targets: {', '.join(dense['targets_no_counterpart'])}. {audit['policy']}"
+        )
+    console.print("[yellow]  pointing-centre audit[/] " + escape(line))
+    dq, eq = shells["distance_quantiles_pc"], shells["eirp_min_quantiles_w"]
+    v = att["validation_sample"]
+    console.print(
+        escape(
+            f"  shells: distance p05/p50/p95 = {dq['p05']:.0f} / {dq['p50']:.0f} / {dq['p95']:.0f} "
+            f"pc; off-axis EIRP_min p05/p50/p95 = {eq['p05']:.2e} / {eq['p50']:.2e} / "
+            f"{eq['p95']:.2e} W (primaries, on-axis: median "
+            f"{att['primary_eirp_min_w']['p50']:.2e} W, max {att['primary_eirp_min_w']['max']:.2e} W)"
+        )
+    )
+    dec = att["decomposition_of_the_median_ratio"]
+    console.print(
+        escape(
+            f"  off-axis attenuation: median EIRP_min is "
+            f"{att['median_eirp_min_ratio_background_over_primary']:.3g}x the primaries' "
+            f"(distance term {dec['distance_term']:.3g}x, beam term {dec['beam_term']:.3g}x; "
+            f"validation sample of {v['n_stars']}: median B(theta) = "
+            f"{v['beam_response']['median']:.3f}, min {v['beam_response']['min']:.3f})"
+        )
+    )
+    t = _table(
+        "Realized vs predicted EIG [bits] (uniform prior over the pair; "
+        f"{ev['definition']['geometry']}; ILLUSTRATIVE inputs in both modes - not a verified bound)",
+        (
+            "radio mode",
+            "predicted (synthetic_proxy)",
+            "realized (Gaia DR3 shells)",
+            "realized / predicted",
+            "range FKG..Frechet",
+            "realized w/o suspected",
+            "info from observed null",
+        ),
+    )
+    for r in ev["comparison"]:
+        lo, hi = r["realized_eig_bits_range_fkg_to_frechet"]
+        t.add_row(
+            f"{r['radio_mode']} ({r['label']})",
+            f"{r['predicted_eig_bits']:.5g}",
+            f"{r['realized_eig_bits']:.5g}",
+            _fmt(r["realized_over_predicted"], ".3f"),
+            f"{lo:.4g} .. {hi:.4g}",
+            f"{r['realized_eig_bits_excluding_suspected_unmatched_primary']:.5g}",
+            f"{r['realized_information_bits_from_observed_null']:.4g}",
+        )
+    console.print(t)
+    console.print(escape(f"  {ev['tier_note']}"))
+    t = _table(
+        "Bounds on P(no detection among the background stars | H), given Earth unreached",
+        (
+            "radio mode",
+            "hypothesis",
+            "E[N reached]",
+            "E[detections]",
+            "Markov lower",
+            "Harris-FKG lower (used)",
+            "Frechet upper",
+        ),
+    )
+    bounds = bounds_table(ev["realized"])
+    for b in bounds:
+        t.add_row(
+            f"{b['radio_mode']} ({b['radio_mode_label']})",
+            b["hypothesis_id"],
+            f"{b['expected_reached']:.5g}",
+            f"{b['expected_detections']:.5g}",
+            f"{b['p_zero_markov_lower']:.8f}",
+            f"{b['p_zero_fkg_lower']:.8f}",
+            f"{b['p_zero_frechet_upper']:.10f}",
+        )
+    console.print(t)
+    console.print(
+        "  The exact P(no detection) lies between the Harris-FKG product and the Frechet upper "
+        "bound; the sign of the effect on a Bayes factor is not fixed by the bounds."
+    )
+    git_sha, git_head = git_state(graph.root)
+    results = {
+        "provenance": prov,
+        "shells": shells,
+        "attenuation": att,
+        "pointing_centre_audit": audit,
+        "eig": ev,
+        "bounds": bounds,
+        "suspected_unmatched_primary": [
+            r.model_dump() for r in field.record.dedup_audit.suspected_unmatched_primary
+        ],
+    }
+    out_dir = out_dir or graph.root / "runs" / "background_field"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sha = canonical_sha256(results)
+    out = out_dir / f"background_field-{sha[:10]}.json"
+    out.write_text(
+        json.dumps(
+            {
+                "kind": "background_field",
+                "git_sha": git_sha,
+                "git_head": git_head,
+                "rng_seed": None,
+                "deterministic": "no RNG: analytic reach probabilities over the pinned shells",
+                "data_tier": prov["data_tier"],
+                "results": results,
+                "results_sha256": sha,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    console.print(
+        escape(
+            f"Receipt: {_rel(out, graph.root)} | rng_seed=none (deterministic) | git_sha={git_sha} "
+            f"| results_sha256={sha}"
+        )
+    )
+
+
 # ---------------------------------------------------------------------- serve
 @app.command()
 def serve(
@@ -919,8 +1199,17 @@ def _fail(exc: Exception) -> None:
 def queue_seed(db: DbOpt = None, root: Root = None) -> None:
     """Register all job definitions (idempotent) with their EIG and cost."""
     graph, store = _store(db, root)
+    before = {r["job_id"]: r["status"] for r in store.list()}
     added = store.seed(graph)
     console.print(escape(f"Registered {len(added)} new job(s): {added}"))
+    for r in store.list_archival():
+        if r["status"] == "completed" and before.get(r["job_id"]) != "completed":
+            console.print(
+                escape(
+                    f"Completed by promoted artifact: {r['job_id']} -> {r['output_path']} "
+                    f"(output_sha256 {r['output_sha256']}, code_git_sha {r['code_git_sha']})"
+                )
+            )
     console.print(f"Queue: {_rel(store.path, graph.root)} ({len(store.list())} jobs total)")
     store.close()
 
@@ -928,7 +1217,7 @@ def queue_seed(db: DbOpt = None, root: Root = None) -> None:
 @queue_app.command("list")
 def queue_list(db: DbOpt = None, root: Root = None) -> None:
     """List the Tier-1 archival queue (by EIG bits/hr) and Tier-0 compute queue (by priority)."""
-    _, store = _store(db, root)
+    graph, store = _store(db, root)
     archival, compute = store.list_archival(), store.list_compute()
     t = _table(
         "Tier-1 Archival Queue (ranked by EIG bits / (cpu hours + reviewer hours))",
@@ -959,6 +1248,25 @@ def queue_list(db: DbOpt = None, root: Root = None) -> None:
     console.print(t)
     for r in archival:
         console.print(escape(f"  {r['job_id']}: prior={r['eig_prior_json']} | {r['eig_basis']}"))
+        if r["output_sha256"]:
+            console.print(
+                escape(
+                    f"  {r['job_id']}: completed by {r['output_path']} "
+                    f"(output_sha256 {r['output_sha256']}, code_git_sha {r['code_git_sha']})"
+                )
+            )
+    from fermi_desk.queue import runners
+
+    job = next((r for r in archival if r["job_id"] == runners.BACKGROUND_JOB_ID), None)
+    if job is not None and runners.ARCHIVAL_COMPLETIONS[job["job_id"]](graph) is not None:
+        console.print(
+            "[cyan]  linked evidence[/] "
+            + escape(
+                f"({job['job_id']}): the background field is promoted; EIG [bits] above stays "
+                "the registered synthetic-proxy prediction. Realized vs predicted EIG, exact "
+                "N_bg and the published-scope contrast: `uv run fermi-desk background-field`"
+            )
+        )
     t = _table(
         "Tier-0 Compute Queue (ranked by diagnostic priority; EIG = 0 bits by construction)",
         (

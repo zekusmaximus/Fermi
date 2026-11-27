@@ -72,6 +72,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   │   └── solar_system.py         # Local Solar System / ISO null-bound forward model
 │   ├── inference/
 │   │   ├── engine.py               # Joint likelihood engine + separate Earth-unreached conditioning
+│   │   ├── background_field.py     # Promoted background-field report: shells, attenuation, realized EIG (v0.2.1b)
 │   │   └── eig.py                  # Expected Information Gain (bits) & cost/time utility scorer
 │   ├── adversary/
 │   │   └── checks.py               # Automated physical, catalog, and contradiction audits
@@ -253,7 +254,7 @@ illustrative` (default off) folds them into the headline and is labelled loudly.
 Both IR contamination conventions (Suazo 2024 subsample, Zackrisson 2026 full
 sample) stay side-by-side in `ir-drilldown`; no winner is picked.
 
-**Lookback-window marginalisation (v0.2.0; proposed for planning ratification).** With
+**Lookback-window marginalisation (v0.2.0; ratified, rulings v0.2.0-R1 and v0.2.0-R3).** With
 `marginalize_lookback` (CLI `--marginalize-lookback`, default off) the lookback window `T`
 is integrated over the registry's log-uniform prior on a deterministic Gauss-Legendre grid
 in `ln T`. Marginalisation is in **likelihood space**:
@@ -265,7 +266,7 @@ data alone: an `illustrative_calibration` term can never re-weight the lookback 
 behind it. Receipts record the prior bounds, grid, weights and per-node diagnostics; fixed-`T`
 receipts gain no keys and keep their `results_sha256`.
 
-**Pointing merge policy (v0.2.1a; proposed for planning ratification).** A run states one
+**Pointing merge policy (v0.2.1a; ratified, ruling v0.2.1-R1).** A run states one
 `pointing_merge_policy` (CLI `--pointing-merge-policy`, API `pointing_merge_policy`):
 
 - `reject_duplicate_pointing_group` (default): two surveys sharing a `pointing_group_id`
@@ -286,7 +287,42 @@ receipts gain no keys and keep their `results_sha256`.
 - `keep_first` is **forbidden**: schema, registry, engine, CLI and API raise
   `MergePolicyError` (a `DoubleCountingError`); it is never accepted or aliased.
 
-**Off-axis sensitivity and background shells (v0.2.1a; proposed).** A star at offset
+**Ruling v0.2.1-R1 (default policy holds extensions out).** Under the default
+`reject_duplicate_pointing_group` a declared pointing extension is held out of the run and
+recorded in `held_out_extension_surveys`; default single-survey CLI calls and every canonical
+`v0.1.x` / `v0.2.0` `results_sha256` stay byte-identical. Unconfigured or unrelated duplicate
+pointing groups still raise `DoubleCountingError` under every policy.
+
+**Ruling v0.2.1-R2 (flat-mode merged-background headline guard).** When
+`union_targets_by_pointing` merges a background field under `radio_mode: flat_probability`,
+the merged radio term is held **out of the `verified_channels_only` headline**, whatever the
+data tier of the star catalogue: one distance- and beam-invariant detection probability applied
+to off-axis stars out to 10 kpc ignores the `d^2 / B(theta)` attenuation of `EIRP_min` and is
+an illustrative sensitivity check, not an observational bound. The radio component carries the
+illustrative input `flat_probability_on_merged_background_field` (tier
+`illustrative_calibration`), the receipt carries one structured `headline_exclusion_note`
+(`channel`, `illustrative_inputs`, `reasons`, `rulings: ["v0.2.1-R2"]`, `log10_bf_term`, and
+a `merged_background` split into the primaries' exact Monte Carlo term and the shells'
+Harris-FKG product), the term stays in every component table, and `--include-illustrative`
+folds it into the headline under the loud `including_illustrative_channels` policy. Under
+`distance_scaled_eirp` radio is already excluded (ruling M2-R2). Notes of single-survey runs
+gain no keys, so their `results_sha256` is unchanged.
+
+**Ruling v0.2.1-R3 (locked primaries, reported suspects).** `data/catalogs/bl_692_targets.csv`
+stays immutable. A surviving background star within 120 arcsec (J2000) of a primary without a
+Gaia id and within 30% of its distance is listed in the artifact as
+`suspected_unmatched_primary` with the `pointing_index`, distance and beam offset that address
+its shell cell. Suspects are never removed from the shells; the count is reported in the
+artifact, `fermi-desk validate`, `fermi-desk compare`, `fermi-desk background-field`, the API
+and the Radio drill-down, and every EIG is reported with and without them.
+
+**Ruling v0.2.1-R4 (Gaia ids are strings).** Gaia DR3 `source_id` values exceed 2^53. Every
+`gaia_dr3_source_id` written into an artifact from v0.2.1 on, and every one in an API
+response (including ids read from locked `v0.1.x` artifacts, which keep their integer form on
+disk), is a decimal JSON string; in the background summary a JSON number is a schema error.
+The API also stringifies any other integer beyond +-(2^53 - 1).
+
+**Off-axis sensitivity and background shells (v0.2.1a; ratified in v0.2.1b).** A star at offset
 `theta` from a beam centre has `EIRP_min(d, theta) = 4 pi d^2 F_min / B(theta)` with
 `B(theta) = exp(-4 ln2 (theta / FWHM)^2)` (GBT L-band `FWHM = 8.4 arcmin`; `B(0) = 1`,
 `B(FWHM/2) = 1/2`). Background-field stars enter as a compact, SHA-256-pinned summary
@@ -297,6 +333,18 @@ independent conditional-reach shell product `prod (1 - p_c q_c)^N_c`, which by H
 is a **lower bound** on `P(no detection | H)` (it can only overstate the null's
 constraining power); the Frechet upper bound is reported beside it. A `synthetic_proxy`
 background is illustrative and leaves the verified headline.
+
+**Promoted background field (v0.2.1b).** `data/surveys/bl_gbt_lband_background_gaia_dr3.yaml`
+declares the extension (`parent_pointing_survey_id: bl_enriquez_2017_692`,
+`pointing_merge_policy: union_targets_by_pointing`, `data_tier: reproduced_archive`) and pins
+the summary by SHA-256. The summary reproduces the *method* of Wlodarczyk-Sroka et al. (2020)
+on the 692 Enriquez et al. (2017) GBT L-band pointings with Gaia DR3 (120,176 stars); it is not
+their catalogue (1,327 Price et al. 2020 multi-band pointings, Gaia DR2, 288,315 stars). A
+`reproduced_archive` summary must carry a clean `code_git_sha`, all 692 pointings, the true
+archive query window (`query_window_utc`, when cones were fetched) beside `assembled_at_utc`,
+`cone_cache_manifest_sha256` (the raw cone bytes) and `cone_cache_code_git_shas` (every commit
+that queried the archive, all clean). `fermi-desk validate` re-checks the pin, the schema, the
+seal and recomputes the validation sample and every suspected star's shell cell offline.
 
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
@@ -314,11 +362,22 @@ Every queued or executed job records:
   plus a rank among compute jobs (1 = first). Tier-1 archival jobs leave both NULL and are ranked
   by EIG bits/hr. `fermi-desk queue list` renders the two tiers as separate tables.
 
-**Run receipt schema v5 (v0.2.1a; proposed for planning ratification).** Comparison receipts
+**Run receipt schema v5 (v0.2.1a; ratified in v0.2.1b).** Comparison receipts
 carry `pointing_merge_policy` (default `reject_duplicate_pointing_group`), `merge_provenance`
-(`null` unless a union merge happened) and `held_out_extension_surveys`; `config.merge_policies`
+(`null` unless a union merge happened), `background_field` (`null` unless merged: pinned
+SHA-256, tier, clean `code_git_sha`, exact `N_bg`, de-duplication counters including
+`suspected_unmatched_primary`, and the retrieved-vs-published scope) and
+`held_out_extension_surveys`; `config.merge_policies`
 is replaced by `config.pointing_merge_policy`. `results_sha256` still hashes the numerical
 `results` block only, so every single-survey `v0.1.x` / `v0.2.0` hash is unchanged.
+
+**Tier-1 completion by promoted artifact (v0.2.1b).** A Tier-1 archival job is never run by
+the queue. When its opt-in script has promoted a SHA-256-pinned artifact that passes the full
+offline verification, `fermi-desk queue seed` records the job `completed` with
+`output_sha256` = the artifact's file hash and `code_git_sha` = the commit that built it. The
+transition is non-destructive: only `open` / `claimed` rows move (a claim keeps its
+`claimed_by`), and `expected_eig_bits` stays the registered prediction; the realized value is
+linked evidence (`fermi-desk background-field`, `GET /api/queue`).
 
 ---
 
@@ -363,8 +422,12 @@ is replaced by `config.pointing_merge_policy`. `results_sha256` still hashes the
    once, attach per-star sensitivity (off-axis beam attenuation for background stars), and
    record the merge (input checksums, duplicate count) in the run receipt.
    **Implemented offline in v0.2.1a** (Sec. 4.3 "Pointing merge policy"): `keep_first` no
-   longer exists and raises `MergePolicyError`; the live Gaia DR3 ingestion
-   (`scripts/fetch_wlodarczyk_sroka_288k.py --fetch`, then `--promote-from`) is v0.2.1b.
+   longer exists and raises `MergePolicyError`. **Executed live in v0.2.1b**
+   (`scripts/fetch_wlodarczyk_sroka_288k.py --fetch`, then `--promote-from`): 120,176 Gaia DR3
+   background stars over the 692 Enriquez (2017) L-band pointings, promoted to
+   `data/catalogs/bl_gbt_lband_background_summary.json` (`reproduced_archive`). Realized EIG:
+   0.00235 bits in `distance_scaled_eirp` (predicted 0.01452) and 0.651 bits in the unphysical
+   `flat_probability` mode (predicted 0.827): a null-strength result.
 2. **Finite-Galaxy disk geometry (`R_gal = 15 kpc`).** The expansion kernel is a local
    infinite-disk approximation valid only while `v_exp * T <= 8 kpc`; for
    `rare_fast_expanders` (`v_exp = 0.5 c`) this gives `T_valid = 52.2 kyr`, so receipts at

@@ -1,7 +1,22 @@
 import { useMemo, useState } from "react";
-import { get, type BeamPair, type RadioDrill, type Target } from "../api";
-import { ErrorBox, Hash, Loading, Panel, TierBadge, useApi } from "../components/ui";
-import { decadeTicks, fmtNum } from "../lib/format";
+import { get, type BackgroundFieldBlock, type BeamPair, type RadioDrill, type Target } from "../api";
+import { Command, ErrorBox, Hash, Loading, Panel, TierBadge, useApi } from "../components/ui";
+import {
+  attenuationHeadline,
+  auditCaveat,
+  coneLabel,
+  dedupCloses,
+  dedupRows,
+  distanceCutRows,
+  eigRows,
+  eigVerdict,
+  fmtCount,
+  fmtWatts,
+  gaiaIdText,
+  scopeRows,
+  utcWindow,
+} from "../lib/background";
+import { decadeTicks, fmtNum, isCleanGitSha } from "../lib/format";
 
 const SOURCE_TIER: Record<string, string> = {
   gaia_dr3_parallax: "reproduced_archive",
@@ -36,7 +51,318 @@ export function RadioDrilldown() {
         <Scatter targets={data.targets} fmin={data.f_min_w_m2} />
       </Panel>
       <Pairs pairs={data.beam_sharing_pairs} fwhm={data.beam_fwhm_arcmin} note={data.beam_sharing_interpretation} />
+      <BackgroundField block={data.background_field} />
     </div>
+  );
+}
+
+/**
+ * v0.2.1b: the promoted Gaia DR3 background-field extension. Tier discipline (DESIGN.md
+ * Sec. 1): provenance, counts and de-duplication are reproduced_archive (cyan); every EIG
+ * and P(no detection) also depends on an illustrative input and is drawn amber / hatched.
+ */
+function BackgroundField({ block }: { block: BackgroundFieldBlock }) {
+  if (!block.promoted) {
+    return (
+      <Panel title="Background Field Extension — not promoted">
+        <p className="muted">{block.reason}</p>
+      </Panel>
+    );
+  }
+  const p = block.provenance;
+  const d = p.dedup_audit;
+  const mp = p.merge_provenance;
+  const att = block.attenuation;
+  const caveat = auditCaveat(block.pointing_centre_audit);
+  const band = block.pointing_centre_audit.densest_band_of_unfound_primaries;
+  const kindClass = (k: string | undefined) => (k === "flag" ? "row-flag" : k === "total" ? "row-total" : "");
+  return (
+    <>
+      <Panel
+        className="panel-archive"
+        title={`Background Field Extension (${p.data_tier})`}
+        aside={
+          <span className="legend">
+            <TierBadge tier={p.data_tier} /> {p.survey_id}
+          </span>
+        }
+      >
+        <div className="cards3">
+          <div className="stat-card stat-canonical">
+            <p className="eyebrow">background stars N_bg</p>
+            <p className="stat-big num">{fmtCount(p.n_background_stars)}</p>
+            <p className="num">
+              {fmtCount(p.n_pointings)} pointings · cone {coneLabel(p.cone_radius_arcmin, p.beam_fwhm_arcmin)}
+            </p>
+            <p className="num">
+              {fmtCount(p.n_cells)} shell cells · d ≤ {fmtCount(p.distance_cuts.d_max_pc)} pc
+            </p>
+          </div>
+          <div className="stat-card">
+            <p className="eyebrow">provenance</p>
+            <p>
+              pinned SHA-256 <Hash sha={p.file_sha256} n={16} />
+            </p>
+            <p>
+              code_git_sha{" "}
+              <span className={isCleanGitSha(p.code_git_sha) ? "ok" : "bad"}>
+                <Hash sha={p.code_git_sha} n={12} /> {isCleanGitSha(p.code_git_sha) ? "clean" : "NOT CLEAN"}
+              </span>
+            </p>
+            <p>
+              cone fetch by{" "}
+              {p.cone_cache_code_git_shas.map((s) => (
+                <Hash key={s} sha={s} n={12} />
+              ))}{" "}
+              · cache <Hash sha={p.cone_cache_manifest_sha256} />
+            </p>
+            <p className="num small">{utcWindow(p.query_window_utc)}</p>
+          </div>
+          <div className="stat-card">
+            <p className="eyebrow">source</p>
+            <p className="small">{p.source_service}</p>
+            <p className="small muted">{block.validation_detail}</p>
+          </div>
+        </div>
+
+        <div className="cards2">
+          <div>
+            <p className="eyebrow">distance cuts (every sighting counted)</p>
+            <table className="tbl tbl-compact">
+              <tbody>
+                {distanceCutRows(p.distance_cuts).map((r) => (
+                  <tr key={r.label} className={kindClass(r.kind)}>
+                    <td className={r.kind === "drop" || r.kind === "keep" ? "indent" : ""}>{r.label}</td>
+                    <td className="r num">{fmtCount(r.value)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <p className="eyebrow">
+              de-duplication against the 692 primaries {dedupCloses(mp) ? <span className="ok">✓ arithmetic closes</span> : <span className="bad">COUNTS DO NOT CLOSE</span>}
+            </p>
+            <table className="tbl tbl-compact">
+              <tbody>
+                {dedupRows(mp, d).map((r) => (
+                  <tr key={r.label} className={kindClass(r.kind)}>
+                    <td className={r.kind === "drop" || r.kind === "keep" ? "indent" : ""}>{r.label}</td>
+                    <td className="r num">{fmtCount(r.value)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="caveat">
+          <b>suspected_unmatched_primary = {d.n_suspected_unmatched_primary}</b> rows ({d.n_suspected_unmatched_primary_stars} distinct stars beside{" "}
+          {d.n_primaries_with_a_suspected_counterpart} of the {d.n_primary_without_gaia_id} primaries without a Gaia id;{" "}
+          {d.n_suspected_primaries_that_absorbed_nothing} of those primaries absorbed no sighting at all). {d.suspected_unmatched_primary_policy}.
+          <details>
+            <summary>list the {block.suspected_unmatched_primary.length} rows</summary>
+            <div className="scroll-x">
+              <table className="tbl tbl-compact">
+                <thead>
+                  <tr>
+                    <th>primary (no Gaia id)</th>
+                    <th>Gaia DR3 source_id</th>
+                    <th className="r">separation [″]</th>
+                    <th className="r">distance [pc]</th>
+                    <th className="r">primary distance [pc]</th>
+                    <th className="r">θ [′]</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.suspected_unmatched_primary.map((s) => (
+                    <tr key={`${s.primary_target_name}-${s.gaia_dr3_source_id}`}>
+                      <td>{s.primary_target_name}</td>
+                      <td className="num">{gaiaIdText(s.gaia_dr3_source_id)}</td>
+                      <td className="r num">{s.separation_arcsec.toFixed(2)}</td>
+                      <td className="r num">{s.distance_pc.toFixed(2)}</td>
+                      <td className="r num">{s.primary_distance_pc.toFixed(2)}</td>
+                      <td className="r num">{s.theta_arcmin.toFixed(3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+        {caveat ? (
+          <div className="caveat">
+            <b>Pointing-centre audit:</b> {caveat} {band?.reading} {block.pointing_centre_audit.policy}.
+            {band ? <span className="muted small"> Targets: {band.targets_no_counterpart.join(", ")}.</span> : null}
+          </div>
+        ) : null}
+
+        <p className="eyebrow">scope — this is the method of Wlodarczyk-Sroka et al. (2020), not their catalogue</p>
+        <div className="scroll-x">
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th></th>
+                <th>
+                  retrieved here <TierBadge tier={p.scope.retrieved.data_tier} />
+                </th>
+                <th>
+                  Wlodarczyk-Sroka et al. (2020) <TierBadge tier={p.scope.published.data_tier} />
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {scopeRows(p.scope).map((r) => (
+                <tr key={r.field}>
+                  <td className="muted">{r.field}</td>
+                  <td className="num">{r.retrieved}</td>
+                  <td className="num">
+                    {r.published}
+                    {r.caveat ? <span className="warn small"> ({r.caveat})</span> : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted small">
+          {p.scope.statement} {p.scope.published.citation}.
+        </p>
+      </Panel>
+
+      <Panel
+        className="panel-illustrative"
+        title="Realized vs predicted EIG of the background-field null"
+        aside={<TierBadge tier="illustrative_calibration" label="ILLUSTRATIVE inputs in both modes" />}
+      >
+        <div className="scroll-x">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>radio mode</th>
+                <th className="r">
+                  predicted [bits] <TierBadge tier={block.eig.predicted.data_tier} />
+                </th>
+                <th className="r">realized [bits]</th>
+                <th className="r">realized / predicted</th>
+                <th className="r">range FKG – Fréchet</th>
+                <th className="r">without suspected primaries</th>
+                <th className="r">gained from the observed null</th>
+              </tr>
+            </thead>
+            <tbody>
+              {eigRows(block.eig.comparison).map((r) => (
+                <tr key={r.mode} className={r.illustrative ? "row-illustrative" : ""}>
+                  <td>
+                    {r.mode} <span className={r.physical ? "mode-tag mode-physical" : "mode-tag mode-unphysical"}>{r.label}</span>
+                  </td>
+                  <td className="r num">{r.predicted}</td>
+                  <td className="r num">
+                    <b>{r.realized}</b>
+                  </td>
+                  <td className="r num">{r.ratio}</td>
+                  <td className="r num">{r.range}</td>
+                  <td className="r num">{r.withoutSuspected}</td>
+                  <td className="r num">{r.observedNull}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="statement">{eigVerdict(block.eig.comparison)}</p>
+        <p className="muted small">
+          Uniform prior over {block.eig.definition.prior.over.join(" / ")}; {block.eig.definition.geometry}; {block.eig.definition.outcome}. Predicted:{" "}
+          {block.eig.predicted.population} ({fmtCount(block.eig.predicted.n_stars)} stars). Realized: {fmtCount(block.eig.n_background_stars)} Gaia DR3
+          stars; “without suspected primaries” removes {block.eig.realized_excluding_suspected_unmatched_primary.n_stars_removed} stars as a diagnostic only.
+        </p>
+        <p className="caveat small">{block.eig.tier_note}</p>
+
+        <p className="eyebrow">Harris–FKG / Fréchet bounds on P(no detection among the background stars | H)</p>
+        <div className="scroll-x">
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>radio mode</th>
+                <th>hypothesis</th>
+                <th className="r">E[N reached]</th>
+                <th className="r">E[detections]</th>
+                <th className="r">Markov lower</th>
+                <th className="r">Harris–FKG lower (used)</th>
+                <th className="r">Fréchet upper</th>
+              </tr>
+            </thead>
+            <tbody>
+              {block.bounds.map((b) => (
+                <tr key={`${b.radio_mode}-${b.hypothesis_id}`} className="row-illustrative">
+                  <td>
+                    {b.radio_mode} <span className={b.radio_mode_label === "physical" ? "mode-tag mode-physical" : "mode-tag mode-unphysical"}>{b.radio_mode_label}</span>
+                  </td>
+                  <td>{b.hypothesis_id}</td>
+                  <td className="r num">{fmtNum(b.expected_reached, 5)}</td>
+                  <td className="r num">{fmtNum(b.expected_detections, 5)}</td>
+                  <td className="r num">{b.p_zero_markov_lower.toFixed(8)}</td>
+                  <td className="r num">{b.p_zero_fkg_lower.toFixed(8)}</td>
+                  <td className="r num">{b.p_zero_frechet_upper.toFixed(10)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted small">{block.correlation_assumption}</p>
+      </Panel>
+
+      <Panel className="panel-archive" title="Off-axis EIRP_min attenuation" aside={<code className="small">{att.formula}</code>}>
+        <p className="statement num">
+          Background {attenuationHeadline(att)}. Beam response B(θ): median {att.validation_sample.beam_response.median.toFixed(3)}, minimum{" "}
+          {att.validation_sample.beam_response.min.toFixed(3)} (cone edge = {att.beam_response_at_cone_edge}), from the exact validation sample of{" "}
+          {fmtCount(att.validation_sample.n_stars)} stars.
+        </p>
+        <div className="cards2">
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>quantile</th>
+                <th className="r">background distance [pc]</th>
+                <th className="r">background EIRP_min</th>
+                <th className="r">primary EIRP_min (on-axis)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(["p05", "p25", "p50", "p75", "p95"] as const).map((q) => (
+                <tr key={q}>
+                  <td className="num">{q}</td>
+                  <td className="r num">{fmtCount(att.background_distance_pc[q])}</td>
+                  <td className="r num">{fmtWatts(att.background_eirp_min_w[q])}</td>
+                  <td className="r num">{fmtWatts(att.primary_eirp_min_w[q])}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>EIRP_min at or below</th>
+                <th className="r">background stars (cumulative)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {block.shells.eirp_min_cumulative_by_decade.map((s) => (
+                <tr key={s.eirp_min_max_w}>
+                  <td className="num">{s.eirp_min_max_w.toExponential(0)} W</td>
+                  <td className="r num">{fmtCount(s.n_stars)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p className="muted small">
+          {att.decomposition_of_the_median_ratio.note}. Shells exclude the 692 primaries (they are de-duplicated before binning), so the lowest-EIRP_min
+          shells are nearly empty: the nearby, sensitive stars are the primaries themselves.
+        </p>
+        <Command text={block.commands.report} />
+        <Command text={block.commands.merged_physical} />
+      </Panel>
+    </>
   );
 }
 

@@ -46,8 +46,16 @@ export interface Health {
   calibration_data_tier: string | null;
   fits_gate2_sha256: string | null;
   fits_gate2_data_tier: string | null;
+  /** v0.2.1b: promoted Gaia DR3 background-field extension (null until a survey pins one). */
+  background_survey_id: string | null;
+  background_summary_sha256: string | null;
+  background_summary_data_tier: string | null;
+  background_summary_code_git_sha: string | null;
+  n_background_stars: number | null;
+  n_suspected_unmatched_primary: number | null;
   receipt_schema_version: number;
   read_only: boolean;
+  version: string;
 }
 
 export interface MonocultureAudit {
@@ -70,13 +78,23 @@ export interface HypothesisDef {
 export interface Registry {
   parameters: { id: string; symbol: string; unit: string; default: number | null }[];
   hypotheses: { tier_1: HypothesisDef[]; tier_2: HypothesisDef[]; tier_3: HypothesisDef[] };
-  surveys: { id: string; name: string; channel: string; data_tier: string; n_targets: number }[];
+  surveys: {
+    id: string;
+    name: string;
+    channel: string;
+    data_tier: string;
+    n_targets: number;
+    /** v0.2.1: set on a declared pointing extension (e.g. the Gaia DR3 background field). */
+    parent_pointing_survey_id?: string | null;
+  }[];
 }
 
 export type Geometry = "thin_disk_2d" | "thick_disk_3d" | "finite_disk_3d";
 export type DiskProfile = "uniform" | "exponential";
 export type RadioMode = "flat_probability" | "distance_scaled_eirp";
 export type Channel = "radio" | "infrared" | "solar_system";
+/** v0.2.1: how surveys sharing a pointing group are combined ("keep_first" is refused). */
+export type PointingMergePolicy = "reject_duplicate_pointing_group" | "union_targets_by_pointing";
 
 export interface CompareRequest {
   geometry_mode: Geometry;
@@ -89,6 +107,132 @@ export interface CompareRequest {
   disk_profile: DiskProfile;
   /** v0.2.0: integrate the lookback window T over its log-uniform prior (default false). */
   marginalize_lookback: boolean;
+  /** v0.2.1: default holds declared background extensions out of the run. */
+  pointing_merge_policy: PointingMergePolicy;
+}
+
+/** v0.2.1: star-level audit of one union_targets_by_pointing merge. */
+export interface MergeProvenance {
+  pointing_group_id: string;
+  policy: string;
+  input_surveys: string[];
+  input_sha256s: string[];
+  n_raw_targets: number;
+  n_merged_targets: number;
+  n_dedup_gaia_id: number;
+  n_dedup_angular_fallback: number;
+  n_multi_beam_resolved: number;
+  angular_fallback_arcsec: number;
+  n_raw_by_survey: Record<string, number>;
+  n_merged_by_role: Record<string, number>;
+  n_background_absorbed_by_primary: number;
+  n_angular_links_refused: number;
+  n_duplicate_gaia_ids_post_merge: number;
+}
+
+export interface BackgroundDistanceCuts {
+  d_max_pc: number;
+  inverse_parallax_min_snr: number;
+  bailer_jones_min_snr_exclusive: number;
+  n_cone_sightings_raw: number;
+  n_dropped_invalid_parallax: number;
+  n_dropped_no_bailer_jones: number;
+  n_dropped_beyond_d_max: number;
+  n_dropped_outside_cone_recheck: number;
+  n_sightings_with_distance: number;
+  n_sightings_inverse_parallax: number;
+  n_sightings_bailer_jones_geo: number;
+  n_background_stars: number;
+  n_background_inverse_parallax: number;
+  n_background_bailer_jones_geo: number;
+}
+
+/** De-duplication counters, including the reported (never removed) suspected primaries. */
+export interface BackgroundDedup {
+  n_primary_targets: number;
+  n_primary_with_gaia_id: number;
+  n_primary_without_gaia_id: number;
+  n_background_sightings_matched_to_primary_gaia_id: number;
+  n_background_sightings_matched_to_primary_angular: number;
+  n_duplicate_gaia_ids_vs_primary: number;
+  n_duplicate_gaia_ids_within_background: number;
+  angular_fallback_arcsec: number;
+  angular_match_epoch: string;
+  n_suspected_unmatched_primary: number;
+  n_suspected_unmatched_primary_stars: number;
+  n_primaries_with_a_suspected_counterpart: number;
+  n_suspected_primaries_that_absorbed_a_sighting: number;
+  n_suspected_primaries_that_absorbed_nothing: number;
+  suspected_unmatched_primary_policy: string;
+}
+
+export interface PublishedCount {
+  value: number;
+  verified_against_paper: boolean;
+  source: string;
+}
+
+export interface BackgroundScope {
+  retrieved: {
+    survey_id: string;
+    data_tier: string;
+    pointings: string;
+    n_pointings: number;
+    n_background_stars: number;
+    gaia_release: string;
+    distances: string;
+    selection: string;
+    source_service: string;
+  };
+  published: {
+    citation: string;
+    data_tier: string;
+    pointings: string;
+    n_pointings: number;
+    n_stars_total: number;
+    n_stars_gbt_l_plus_s_band: PublishedCount;
+    n_stars_gbt_l_band: PublishedCount;
+    gaia_release: string;
+    distances: string;
+    selection: string;
+  };
+  comparable: boolean;
+  statement: string;
+}
+
+/** Verified provenance of the promoted background summary (reproduced_archive). */
+export interface BackgroundProvenance {
+  id: string;
+  survey_id: string;
+  parent_survey_id: string;
+  path: string;
+  file_sha256: string;
+  content_sha256: string;
+  data_tier: string;
+  code_git_sha: string;
+  fetched_at_utc: string;
+  query_window_utc: string[];
+  assembled_at_utc: string | null;
+  cone_cache_manifest_sha256: string | null;
+  cone_cache_code_git_shas: string[];
+  source_service: string;
+  n_pointings: number;
+  n_background_stars: number;
+  n_cells: number;
+  beam_fwhm_arcmin: number;
+  cone_radius_arcmin: number;
+  distance_cuts: BackgroundDistanceCuts;
+  merge_provenance: MergeProvenance;
+  dedup_audit: BackgroundDedup;
+  scope: BackgroundScope;
+  methodology_note: string;
+}
+
+export interface HeldOutSurvey {
+  survey_id: string;
+  pointing_group_id: string;
+  parent_pointing_survey_id: string;
+  reason: string;
 }
 
 /** v0.2.0: prior and grid of a lookback-marginalised run (absent on fixed-T receipts). */
@@ -108,9 +252,36 @@ export interface Component {
 export interface ExclusionNote {
   channel: string;
   held_out_of_reported_headline: boolean;
+  illustrative_inputs?: string[];
   reasons: string[];
   data_tiers: string[];
   log10_bf_term: number | null;
+  /** v0.2.1b: planning ruling(s) behind the exclusion (e.g. ["v0.2.1-R2"]); merged runs only. */
+  rulings?: string[];
+  /** v0.2.1b: where a merged radio term comes from; merged runs only. */
+  merged_background?: {
+    survey_id: string;
+    data_tier: string;
+    summary_sha256: string;
+    n_background_stars: number;
+    n_primary_targets: number;
+    log10_bf_primary_targets_exact_mc?: number | null;
+    log10_bf_background_shells_fkg_product?: number | null;
+  };
+}
+
+/** v0.2.1: zero-detection term of the merged background shells (merged runs only). */
+export interface RadioBackgroundTerm {
+  survey_id: string;
+  data_tier: string;
+  n_stars: number;
+  n_cells: number;
+  expected_reached: number | null;
+  expected_detections: number | null;
+  log10_p_zero_independent_fkg_lower: number | null;
+  p_zero_independent_fkg_lower: number | null;
+  p_zero_markov_lower: number | null;
+  p_zero_frechet_upper: number | null;
 }
 
 export interface ScoredHypothesis {
@@ -131,6 +302,8 @@ export interface ScoredHypothesis {
     expected_reached_unconditional: number | null;
     p_zero_exact_mc: number | null;
     p_zero_exact_mc_se: number | null;
+    background?: RadioBackgroundTerm;
+    n_targets_merged?: number;
   };
   infrared?: { p_star_reached?: number | null };
   components: Record<string, Component>;
@@ -168,6 +341,11 @@ export interface CompareResponse {
     geometry_mode?: string;
     disk_profile?: string;
     lookback_marginalization?: LookbackMarginalization;
+    /** Receipt schema v5 (v0.2.1). */
+    pointing_merge_policy: string;
+    merge_provenance: MergeProvenance | null;
+    background_field: BackgroundProvenance | null;
+    held_out_extension_surveys: HeldOutSurvey[];
     results: {
       hypotheses: Record<string, ScoredHypothesis>;
       tier3_quarantine: {
@@ -226,7 +404,128 @@ export interface RadioDrill {
   hip1692_citations: string[];
   beam_sharing_pairs: BeamPair[];
   beam_sharing_interpretation: string;
+  /** v0.2.1b: promoted Gaia DR3 background-field extension. */
+  background_field: BackgroundFieldBlock;
 }
+
+/** One suspected unmatched primary (ruling v0.2.1-R3: listed, never removed). */
+export interface SuspectedPrimary {
+  primary_target_name: string;
+  /** Always a decimal STRING (ruling v0.2.1-R4): 64-bit ids exceed 2^53. Never Number() it. */
+  gaia_dr3_source_id: string;
+  separation_arcsec: number;
+  distance_pc: number;
+  primary_distance_pc: number;
+  pointing_index: number;
+  theta_arcmin: number;
+}
+
+export type Quantiles = Record<"p05" | "p25" | "p50" | "p75" | "p95", number>;
+
+export interface EigComparisonRow {
+  radio_mode: RadioMode;
+  label: string;
+  physical: boolean;
+  predicted_eig_bits: number;
+  realized_eig_bits: number;
+  realized_over_predicted: number | null;
+  realized_eig_bits_range_fkg_to_frechet: [number, number];
+  realized_eig_bits_excluding_suspected_unmatched_primary: number;
+  realized_information_bits_from_observed_null: number;
+  data_tiers: string[];
+}
+
+export interface BackgroundEig {
+  job_id: string;
+  summary_sha256: string;
+  n_background_stars: number;
+  definition: { prior: { type: string; over: string[] }; geometry: string; outcome: string };
+  predicted: { data_tier: string; population: string; n_stars: number };
+  realized_excluding_suspected_unmatched_primary: { n_stars_removed: number; n_stars: number; policy: string };
+  comparison: EigComparisonRow[];
+  scope: BackgroundScope;
+  statement: string;
+  tier_note: string;
+}
+
+export interface BoundsRow {
+  radio_mode: RadioMode;
+  radio_mode_label: string;
+  hypothesis_id: string;
+  expected_reached: number;
+  expected_detections: number;
+  p_zero_markov_lower: number;
+  p_zero_fkg_lower: number;
+  p_zero_frechet_upper: number;
+  data_tiers: string[];
+}
+
+export interface PointingCentreAudit {
+  n_primaries: number;
+  n_with_gaia_id: number;
+  n_with_gaia_id_sighted_in_own_cone: number;
+  with_gaia_id_not_sighted_in_own_cone: string[];
+  n_without_gaia_id: number;
+  n_no_counterpart_in_own_cone: number;
+  densest_band_of_unfound_primaries: {
+    declination_band_deg: [number, number];
+    mirror_band_deg: [number, number];
+    n_targets: number;
+    n_targets_in_mirror_band: number;
+    n_no_counterpart: number;
+    targets_no_counterpart: string[];
+    n_background_stars_in_those_pointings: number;
+    fraction_of_background_stars: number;
+    reading: string;
+  } | null;
+  policy: string;
+}
+
+export interface BackgroundAttenuation {
+  formula: string;
+  f_min_w_m2: number;
+  beam_fwhm_arcmin: number;
+  cone_radius_arcmin: number;
+  beam_response_at_cone_edge: number;
+  validation_sample: {
+    n_stars: number;
+    theta_arcmin: { median: number; max: number };
+    beam_response: { min: number; median: number; mean: number };
+    beam_attenuation_factor: { median: number; mean: number; max: number };
+  };
+  background_eirp_min_w: Quantiles;
+  background_distance_pc: Quantiles;
+  primary_eirp_min_w: Quantiles & { max: number; n_targets: number };
+  primary_median_distance_pc: number;
+  median_eirp_min_ratio_background_over_primary: number;
+  decomposition_of_the_median_ratio: { distance_term: number; beam_term: number; note: string };
+}
+
+export interface BackgroundShellSummary {
+  n_cells: number;
+  n_stars: number;
+  stars_per_pointing: { min: number; median: number; max: number; n_pointings: number; n_pointings_with_stars: number };
+  distance_cumulative: { d_max_pc: number; n_stars: number }[];
+  distance_quantiles_pc: Quantiles;
+  eirp_min_cumulative_by_decade: { eirp_min_max_w: number; n_stars: number }[];
+  eirp_min_quantiles_w: Quantiles;
+}
+
+export interface BackgroundFieldPromoted {
+  promoted: true;
+  provenance: BackgroundProvenance;
+  validation_detail: string;
+  shells: BackgroundShellSummary;
+  attenuation: BackgroundAttenuation;
+  pointing_centre_audit: PointingCentreAudit;
+  suspected_unmatched_primary: SuspectedPrimary[];
+  eig: BackgroundEig;
+  bounds: BoundsRow[];
+  correlation_assumption: string;
+  commands: { report: string; merged_physical: string; validate: string };
+}
+
+export type BackgroundFieldBlock = BackgroundFieldPromoted | { promoted: false; reason: string };
 
 export interface Grid {
   separations_arcsec: number[];
@@ -276,7 +575,8 @@ export interface RegistrationFloor {
 
 export interface AnchorBenchmark {
   candidate: string;
-  gaia_dr3_source_id: number;
+  /** Decimal string (ruling v0.2.1-R4): Gaia DR3 ids exceed 2^53. */
+  gaia_dr3_source_id: string;
   measured_w3_offset_arcsec: number;
   measured_err_arcsec: number;
   predicted_photocentre_shift_arcsec: [number, number];
@@ -468,8 +768,23 @@ export interface Tier1Job extends JobCore {
   eig_basis: string;
   eig_details: Record<string, unknown>;
   archival_script: string | null;
-  commands: { claim: string; script: string | null };
-  linked_evidence: SmallSampleBounds | null;
+  commands: { claim: string; script: string | null; report?: string | null };
+  linked_evidence: SmallSampleBounds | BackgroundLinkedEvidence | null;
+}
+
+/** v0.2.1b: realized-vs-predicted EIG linked to the completed background-field job. */
+export interface BackgroundLinkedEvidence {
+  kind: "background_field_eig";
+  linked_archival_job: string;
+  statement: string;
+  tier_note: string;
+  summary_path: string;
+  summary_sha256: string;
+  summary_data_tier: string;
+  summary_code_git_sha: string;
+  n_background_stars: number;
+  comparison: EigComparisonRow[];
+  scope: BackgroundScope;
 }
 
 export interface Tier0Job extends JobCore {

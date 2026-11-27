@@ -11,7 +11,9 @@ Design rules:
 * **Strict inputs.** Pydantic v2 models with literal enums, strict types and bounded
   seeds; job ids must be registered queue ids; no path parameters reach the
   filesystem; no shell execution.
-* **JSON-safe.** Non-finite floats (``inf`` / ``nan``) are emitted as ``null``.
+* **JSON-safe.** Non-finite floats (``inf`` / ``nan``) are emitted as ``null``; every
+  ``gaia_dr3_source_id`` (and any integer beyond +-(2^53 - 1)) is emitted as a decimal
+  string, because JavaScript rounds larger JSON numbers silently (ruling v0.2.1-R4).
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_
 
 from fermi_desk import __version__
 from fermi_desk.errors import FermiDeskError, QueueStateError
+from fermi_desk.inference import background_field
 from fermi_desk.inference.engine import (
     CHANNELS,
     RECEIPT_SCHEMA_VERSION,
@@ -47,6 +50,7 @@ from fermi_desk.inference.engine import (
 )
 from fermi_desk.models import radio
 from fermi_desk.models.expansion import C_KPC_PER_GYR, FINITE_DISK
+from fermi_desk.queue import runners
 from fermi_desk.queue.store import JOB_DEFINITIONS, JobDefinition, JobStore
 from fermi_desk.registry import (
     FactorGraph,
@@ -86,18 +90,36 @@ def is_loopback_host(host: str) -> bool:
 
 
 # ------------------------------------------------------------------- JSON safety
-def json_safe(obj: Any) -> Any:
-    """Recursively convert numpy scalars / arrays and map non-finite floats to None."""
+MAX_SAFE_JSON_INT = 2**53 - 1  # JavaScript's Number.MAX_SAFE_INTEGER
+_ID_KEY_SUFFIXES = ("source_id", "star_id", "star_ids")
+
+
+def _is_id_key(key: str | None) -> bool:
+    """Keys that carry catalogue source identifiers (Gaia DR3 ``source_id`` and lists of them)."""
+    return key is not None and key.endswith(_ID_KEY_SUFFIXES)
+
+
+def json_safe(obj: Any, _key: str | None = None) -> Any:
+    """Recursively make a payload safe for JSON and for JavaScript consumers.
+
+    * numpy scalars / arrays become plain Python values;
+    * non-finite floats become ``None``;
+    * ruling v0.2.1-R4: an integer under a source-identifier key (``gaia_dr3_source_id``,
+      ``star_ids`` ...) is ALWAYS a decimal string, and so is any other integer whose
+      magnitude exceeds 2^53 - 1. Gaia DR3 ids reach ~6.9e18; as JSON numbers they would be
+      rounded by ``JSON.parse`` without any error.
+    """
     if isinstance(obj, dict):
-        return {str(k): json_safe(v) for k, v in obj.items()}
+        return {str(k): json_safe(v, str(k)) for k, v in obj.items()}
     if isinstance(obj, list | tuple):
-        return [json_safe(v) for v in obj]
+        return [json_safe(v, _key) for v in obj]
     if isinstance(obj, np.ndarray):
-        return [json_safe(v) for v in obj.tolist()]
-    if isinstance(obj, np.bool_):
+        return [json_safe(v, _key) for v in obj.tolist()]
+    if isinstance(obj, bool | np.bool_):
         return bool(obj)
-    if isinstance(obj, np.integer):
-        return int(obj)
+    if isinstance(obj, int | np.integer):
+        i = int(obj)
+        return str(i) if _is_id_key(_key) or abs(i) > MAX_SAFE_JSON_INT else i
     if isinstance(obj, float | np.floating):
         f = float(obj)
         return f if math.isfinite(f) else None
@@ -166,6 +188,13 @@ class HealthOut(_Out):
     calibration_data_tier: str | None
     fits_gate2_sha256: str | None
     fits_gate2_data_tier: str | None
+    # v0.2.1b: the promoted Gaia DR3 background-field extension (None until a survey pins one)
+    background_survey_id: str | None
+    background_summary_sha256: str | None
+    background_summary_data_tier: str | None
+    background_summary_code_git_sha: str | None
+    n_background_stars: int | None
+    n_suspected_unmatched_primary: int | None
     receipt_schema_version: int
     read_only: bool
     version: str  # fermi_desk.__version__ (single source: pyproject.toml)
@@ -313,8 +342,29 @@ def create_app(
                 "calibration_data_tier",
                 "fits_gate2_sha256",
                 "fits_gate2_data_tier",
+                "background_survey_id",
+                "background_summary_sha256",
+                "background_summary_data_tier",
+                "background_summary_code_git_sha",
+                "n_background_stars",
+                "n_suspected_unmatched_primary",
             )
         )
+        try:  # the background field is verified on load (pin, schema, offline recomputation)
+            field = background_field.load_background_field(graph)
+        except (FermiDeskError, FileNotFoundError, KeyError, ValueError):
+            field = None  # validation (health.validation_failures) reports the reason
+        if field is not None:
+            out.update(
+                background_survey_id=field.survey_id,
+                background_summary_sha256=field.file_sha256,
+                background_summary_data_tier=field.record.data_tier,
+                background_summary_code_git_sha=field.record.code_git_sha,
+                n_background_stars=field.shells.n_stars,
+                n_suspected_unmatched_primary=(
+                    field.record.dedup_audit.n_suspected_unmatched_primary
+                ),
+            )
         try:
             cal = load_sigma_sys_calibration(ir_survey, root)
             gate = load_fits_gate2(ir_survey, root)
@@ -395,6 +445,55 @@ def create_app(
         return json_safe(rec)
 
     @lru_cache(maxsize=2)
+    def background_cached(sha: str) -> dict:
+        """Background-field extension block of the radio drill-down (v0.2.1b).
+
+        Built only from the SHA-256-pinned artifact, which is re-verified on load. Star
+        counts and de-duplication are reproduced_archive; every EIG / P(no detection)
+        carries its illustrative input in ``data_tiers`` and is never a verified bound.
+        """
+        field = background_field.load_background_field(graph)
+        if field is None:
+            return {
+                "promoted": False,
+                "reason": (
+                    "no survey pins a background summary; run "
+                    "scripts/fetch_wlodarczyk_sroka_288k.py --fetch, then --promote-from"
+                ),
+            }
+        job = next(
+            (j for j in (*jobs, *JOB_DEFINITIONS) if j.job_id == runners.BACKGROUND_JOB_ID), None
+        )
+        assert job is not None
+        ev = runners.background_extension_evidence(graph, job.parameters)
+        assert ev is not None
+        return json_safe(
+            {
+                "promoted": True,
+                "provenance": field.summary(),
+                "validation_detail": field.detail,
+                "shells": background_field.shell_summary(field),
+                "attenuation": background_field.attenuation_summary(graph, field),
+                "pointing_centre_audit": background_field.pointing_centre_audit(graph, field),
+                "suspected_unmatched_primary": [
+                    r.model_dump() for r in field.record.dedup_audit.suspected_unmatched_primary
+                ],
+                "eig": ev,
+                "bounds": background_field.bounds_table(ev["realized"]),
+                "correlation_assumption": radio.SHELL_CORRELATION_ASSUMPTION,
+                "commands": {
+                    "report": "uv run fermi-desk background-field",
+                    "merged_physical": (
+                        "uv run fermi-desk compare --geometry thin_disk_2d --radio-mode "
+                        "distance_scaled_eirp --pointing-merge-policy union_targets_by_pointing "
+                        "--seed 42"
+                    ),
+                    "validate": "uv run fermi-desk validate",
+                },
+            }
+        )
+
+    @lru_cache(maxsize=2)
     def radio_cached(sha: str) -> dict:
         from fermi_desk.adversary.checks import (
             audit_duplicate_pointings,
@@ -424,6 +523,7 @@ def create_app(
                 ).get("citations", []),
                 "beam_sharing_pairs": dup.details["beam_sharing_pairs"],
                 "beam_sharing_interpretation": dup.details["interpretation"],
+                "background_field": background_cached(sha),
             }
         )
 
@@ -439,6 +539,11 @@ def create_app(
         s = JobStore(queue_path)
         if not s.list():
             s.seed(graph, jobs)
+        elif not read_only:
+            # Record a Tier-1 job completed by its promoted, pinned artifact (a no-op once
+            # recorded). A read-only server never writes: the linked evidence below still
+            # shows the promoted artifact.
+            s.sync_archival_completions(graph, jobs)
         return s
 
     # ------------------------------------------------------------------ routes
@@ -524,6 +629,25 @@ def create_app(
             from fermi_desk.inference.ir_drilldown import LINKED_ARCHIVAL_JOB, small_sample_bounds
 
             evidence = {LINKED_ARCHIVAL_JOB: small_sample_bounds(cal.summary())}
+        bg = background_cached(sha())
+        if bg["promoted"]:
+            ev = bg["eig"]
+            evidence = {
+                **(evidence or {}),
+                runners.BACKGROUND_JOB_ID: {
+                    "kind": "background_field_eig",
+                    "linked_archival_job": runners.BACKGROUND_JOB_ID,
+                    "statement": ev["statement"],
+                    "tier_note": ev["tier_note"],
+                    "summary_path": ev["summary_path"],
+                    "summary_sha256": ev["summary_sha256"],
+                    "summary_data_tier": ev["summary_data_tier"],
+                    "summary_code_git_sha": ev["summary_code_git_sha"],
+                    "n_background_stars": ev["n_background_stars"],
+                    "comparison": ev["comparison"],
+                    "scope": ev["scope"],
+                },
+            }
         t1 = []
         for r in arch:
             script = r["archival_script"] or ""
@@ -543,10 +667,14 @@ def create_app(
                             if r["job_id"] == "wise_independent_control_fields"
                             # Offline rehearsal only: the live fetch needs an explicit --fetch.
                             else f"uv run python {script} --dry-run"
-                            if r["job_id"] == "wlodarczyk_sroka_288k_background_extension"
+                            if r["job_id"] == runners.BACKGROUND_JOB_ID
                             else f"uv run python {script}"
                         )
                         if runnable
+                        else None,
+                        # Offline report of a completed archival job (None otherwise).
+                        "report": bg["commands"]["report"]
+                        if r["job_id"] == runners.BACKGROUND_JOB_ID and bg["promoted"]
                         else None,
                     },
                     "linked_evidence": (evidence or {}).get(r["job_id"]),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
 import { ApiError } from "../api";
 import { shortSha, tierClass, worstTier, type TierClass } from "../lib/format";
 
@@ -85,6 +85,76 @@ export function Panel({
       </header>
       <div className="panel-body">{children}</div>
     </section>
+  );
+}
+
+/**
+ * Inline `?` explanation (DESIGN.md Sec. 2): the physical trade-off, the invariant or
+ * citation behind a control, and its CLI equivalent, at the point of interaction. Plain
+ * text children only (no raw-HTML injection); closes on Escape, on the close button, or on a
+ * second click of the trigger; no animation, so it is motion-safe by construction.
+ */
+export function HelpPopover({
+  label,
+  title,
+  tradeoff,
+  invariant,
+  cli,
+}: {
+  /** What the popover explains (used for the accessible name). */
+  label: string;
+  title: string;
+  tradeoff: string;
+  invariant: string;
+  cli: readonly string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const id = useId();
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+  return (
+    <span className="help">
+      <button
+        type="button"
+        className={open ? "help-btn on" : "help-btn"}
+        aria-label={`Explain: ${label}`}
+        aria-expanded={open}
+        aria-controls={id}
+        onClick={() => setOpen((o) => !o)}
+      >
+        ?
+      </button>
+      {open ? (
+        <span role="dialog" id={id} className="help-pop" aria-label={title}>
+          <span className="help-title">{title}</span>
+          <span className="help-block">
+            <span className="help-key">Trade-off</span>
+            {tradeoff}
+          </span>
+          <span className="help-block">
+            <span className="help-key">Invariant / source</span>
+            {invariant}
+          </span>
+          <span className="help-block">
+            <span className="help-key">CLI</span>
+            {cli.map((c) => (
+              <code key={c} className="help-cli">
+                {c}
+              </code>
+            ))}
+          </span>
+          <button type="button" className="btn btn-ghost btn-xs help-close" onClick={() => setOpen(false)}>
+            close (Esc)
+          </button>
+        </span>
+      ) : null}
+    </span>
   );
 }
 

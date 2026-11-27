@@ -990,8 +990,174 @@ class BackgroundField:
             "cone_radius_arcmin": r.cone_radius_arcmin,
             "distance_cuts": r.distance_cuts.model_dump(),
             "merge_provenance": r.merge_provenance.model_dump(),
+            "dedup_audit": self.dedup_counts(),
+            "scope": self.scope(),
             "methodology_note": r.methodology_note,
         }
+
+    def dedup_counts(self) -> dict:
+        """De-duplication counters of the artifact (ruling v0.2.1-R3: reported, never hidden).
+
+        ``n_suspected_unmatched_primary`` counts review ROWS; one star beside two primaries
+        (e.g. a visual binary published as two targets) is listed twice, so the number of
+        distinct stars still sitting in the shells is reported separately.
+        """
+        da = self.record.dedup_audit
+        rows = da.suspected_unmatched_primary
+        return {
+            **{k: v for k, v in da.model_dump().items() if k != "suspected_unmatched_primary"},
+            "n_primary_without_gaia_id": da.n_primary_targets - da.n_primary_with_gaia_id,
+            "n_suspected_unmatched_primary_stars": len({r.gaia_dr3_source_id for r in rows}),
+            "n_primaries_with_a_suspected_counterpart": len({r.primary_target_name for r in rows}),
+            # A primary that already absorbed a Gaia sighting and still has a suspected star
+            # beside it has a SECOND nearby Gaia source (typically a resolved companion);
+            # one that absorbed nothing is the likelier case of a primary counted twice.
+            "n_suspected_primaries_that_absorbed_a_sighting": len(
+                {r.primary_target_name for r in rows} & self.absorbing_primaries()
+            ),
+            "n_suspected_primaries_that_absorbed_nothing": len(
+                {r.primary_target_name for r in rows} - self.absorbing_primaries()
+            ),
+            "suspected_unmatched_primary_policy": SUSPECTED_PRIMARY_POLICY,
+        }
+
+    def absorbing_primaries(self) -> set[str]:
+        """Primaries that absorbed at least one background sighting (Gaia id or 3 arcsec)."""
+        return {m.primary_target_name for m in self.record.validation_sample.primary_matched}
+
+    def scope(self) -> dict:
+        """What was retrieved here, beside the published catalogue whose method it follows."""
+        r = self.record
+        return {
+            "retrieved": {
+                "survey_id": self.survey_id,
+                "data_tier": r.data_tier,
+                "pointings": (
+                    f"{r.n_pointings} Enriquez et al. (2017) GBT L-band pointings "
+                    f"({r.primary_catalog_path})"
+                ),
+                "n_pointings": r.n_pointings,
+                "n_background_stars": r.shells.n_stars,
+                "gaia_release": "Gaia DR3",
+                "distances": (
+                    f"inverse parallax for parallax_over_error >= "
+                    f"{r.distance_cuts.inverse_parallax_min_snr:g} "
+                    f"({r.distance_cuts.n_background_inverse_parallax} stars); Bailer-Jones et al. "
+                    f"(2021) geometric distances above "
+                    f"{r.distance_cuts.bailer_jones_min_snr_exclusive:g} "
+                    f"({r.distance_cuts.n_background_bailer_jones_geo} stars); d <= "
+                    f"{r.distance_cuts.d_max_pc:g} pc"
+                ),
+                "selection": (
+                    f"inside the {r.beam_fwhm_arcmin:g} arcmin FWHM beam (cone radius "
+                    f"{r.cone_radius_arcmin:g} arcmin = FWHM / 2)"
+                ),
+                "source_service": r.source_service,
+            },
+            "published": dict(PUBLISHED_BACKGROUND_SCOPE),
+            "comparable": False,
+            "statement": (
+                f"N_bg = {r.shells.n_stars:,} background stars retrieved over {r.n_pointings} "
+                "Enriquez et al. (2017) GBT L-band pointings with Gaia DR3. Wlodarczyk-Sroka et al. "
+                f"(2020) report {PUBLISHED_BACKGROUND_SCOPE['n_stars_total']:,} stars over "
+                f"{PUBLISHED_BACKGROUND_SCOPE['n_pointings']:,} Price et al. (2020) multi-band "
+                "pointings with Gaia DR2: a different pointing set, receiver set and Gaia release, "
+                "so the two counts are not expected to agree. This artifact reproduces the method, "
+                "not the catalogue."
+            ),
+        }
+
+    def suspected_star_cells(self) -> dict[str, tuple[int, int, int]]:
+        """Shell cell ``(pointing, distance_bin, eirp_min_bin)`` of each suspected star."""
+        r = self.record
+        f_q = r.f_min_w_m2 * u.W / u.m**2
+        fwhm = r.beam_fwhm_arcmin * u.arcmin
+        b = self.shells.binning
+        cells = {}
+        for sp in r.dedup_audit.suspected_unmatched_primary:
+            eirp = radio.min_detectable_eirp_off_axis(
+                sp.distance_pc * u.pc, sp.theta_arcmin * u.arcmin, f_q, fwhm
+            )
+            cells[sp.gaia_dr3_source_id] = (
+                sp.pointing_index,
+                int(b.distance_bin(sp.distance_pc * u.pc)[0]),
+                int(b.eirp_bin(eirp)[0]),
+            )
+        return cells
+
+    def shells_excluding_suspected(self) -> radio.BackgroundShells:
+        """DIAGNOSTIC view: the shells without the suspected unmatched primaries.
+
+        Never used for a likelihood that enters a headline: ruling v0.2.1-R3 keeps every
+        suspected star in the promoted shells. This view exists only so a result can be
+        reported with and without them, bounding the effect of a primary being counted
+        twice (once on-axis, once here).
+        """
+        sh = self.shells
+        drop: dict[tuple[int, int, int], int] = {}
+        for cell in self.suspected_star_cells().values():
+            drop[cell] = drop.get(cell, 0) + 1
+        count = sh.count.copy()
+        keys = zip(
+            sh.pointing_index.tolist(),
+            sh.distance_bin.tolist(),
+            sh.eirp_min_bin.tolist(),
+            strict=True,
+        )
+        for i, key in enumerate(keys):
+            if key in drop:
+                count[i] -= drop.pop(key)
+        if drop or np.any(count < 0):
+            raise ProvenanceError("suspected unmatched primaries do not address stored shell cells")
+        keep = count > 0
+        return replace(
+            sh,
+            pointing_index=sh.pointing_index[keep],
+            distance_bin=sh.distance_bin[keep],
+            eirp_min_bin=sh.eirp_min_bin[keep],
+            count=count[keep],
+        )
+
+
+# Ruling v0.2.1-R3, stated once and surfaced wherever the count is shown.
+SUSPECTED_PRIMARY_POLICY = (
+    "listed for review and kept in the shells, never removed (ruling v0.2.1-R3): the only "
+    "de-duplication keys are the Gaia DR3 source_id and, when an id is missing, a 3 arcsec "
+    "match at J2000. A suspected star that really is its primary is counted twice in a merged "
+    "run (once on-axis as the primary, once off-axis in a shell)"
+)
+# Scope of the published catalogue whose METHOD the background field reproduces. Every
+# entry was checked against the paper text (arXiv:2006.09756v2) on 2026-11-27 except the
+# one flagged `verified_against_paper: False`.
+PUBLISHED_BACKGROUND_SCOPE: dict = {
+    "citation": "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720 (arXiv:2006.09756)",
+    "data_tier": "published_catalog",
+    "pointings": (
+        "1,327 Price et al. (2020) primary targets: 882 with GBT L-band, 1,005 with GBT S-band, "
+        "189 with Parkes 10 cm"
+    ),
+    "n_pointings": 1327,
+    "n_stars_total": 288315,
+    "n_stars_gbt_l_plus_s_band": {
+        "value": 249990,
+        "verified_against_paper": True,
+        "source": "Table 2, WG&S GBT cumulative N at EIRP_min <= 1e18 W",
+    },
+    "n_stars_gbt_l_band": {
+        "value": 251983,
+        "verified_against_paper": False,
+        "source": (
+            "v0.2.1b planning brief; not stated in the paper text, whose Table 2 gives 249,990 "
+            "stars for GBT L- and S-band together"
+        ),
+    },
+    "gaia_release": "Gaia DR2",
+    "distances": "Bailer-Jones et al. (2018) geometric distances, d < 10 kpc",
+    "selection": (
+        "inside the primary-beam FWHM of each receiver (GBT L-band 8.4 arcmin, GBT S-band "
+        "5.5 arcmin, Parkes 10 cm 6.4 arcmin)"
+    ),
+}
 
 
 def _recompute_background_summary(
@@ -1655,7 +1821,8 @@ def _check_background_promotion(graph: FactorGraph) -> str:
     if not pinned:
         return (
             f"not promoted yet: no survey pins a background summary and {BACKGROUND_SUMMARY_PATH} "
-            "is absent (live fetch + --promote-from belong to v0.2.1b); once pinned, SHA-256, "
+            "is absent (scripts/fetch_wlodarczyk_sroka_288k.py --fetch, then --promote-from); "
+            "once pinned, SHA-256, "
             "schema and offline recomputation are enforced automatically"
         )
     return "pinned by " + ", ".join(f"{s.id} -> {s.background_summary_path}" for s in pinned)

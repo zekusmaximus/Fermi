@@ -1,0 +1,47 @@
+id: bl_gbt_lband_background_gaia_dr3
+name: "Gaia DR3 Background-Field Stars Inside the 692 BL GBT L-Band Beams"
+channel: radio
+# A declared pointing EXTENSION, never an independent survey: these stars were observed in
+# the same 692 GBT L-band pointings as the Enriquez et al. (2017) primaries. Under the
+# default run policy (reject_duplicate_pointing_group) it stays out of the run and is
+# listed in the receipt's held_out_extension_surveys; it only enters the likelihood through
+# union_targets_by_pointing (per-star Gaia DR3 de-duplication against the primaries).
+pointing_group_id: bl_gbt_lband_2017
+parent_pointing_survey_id: bl_enriquez_2017_692
+pointing_merge_policy: union_targets_by_pointing
+data_tier: reproduced_archive
+# 120,176 unique background stars (d <= 10 kpc) after de-duplication, in 46,913 shell cells.
+# This reproduces the METHOD of Wlodarczyk-Sroka, Garrett & Siemion (2020) on the 692
+# Enriquez (2017) L-band pointings with Gaia DR3. It is NOT their catalogue (1,327 Price et
+# al. 2020 multi-band pointings, Gaia DR2, 288,315 stars); the counts are not comparable.
+n_targets: 120176
+frequency_ghz: [1.1, 1.9]
+# Same observations as the parent: no narrowband detection in any of the 692 ON-target
+# beams (Enriquez et al. 2017), which bounds every star inside each beam, off-axis included.
+observed_detections: 0
+minimum_flux_limit_jy: 17.0
+sefd_jy: 10.0
+# Promoted by `scripts/fetch_wlodarczyk_sroka_288k.py --promote-from` from clean commit
+# 6eca7217acf0 (cones fetched live from the ARI Heidelberg Gaia TAP on 2026-11-27 by clean
+# commit 9f3740ee71b0). `fermi-desk validate` re-checks this pin, the schema, and recomputes
+# the validation sample (beam offsets, off-axis EIRP_min, shell bins) offline.
+background_summary_path: "data/catalogs/bl_gbt_lband_background_summary.json"
+background_summary_sha256: "0d205838e4b65148e3c5e3878c1cf52f1e238a7df5aea47944bf0a7e988ca6e1"
+# On-axis radiometer of the parent pointings (identical values by construction: the
+# background stars are attenuated per star by the Gaussian primary beam, B(theta)).
+radio_sensitivity:
+  data_tier: published_catalog
+  sefd_jy: 10.0
+  snr_threshold: 25.0
+  channel_bandwidth_hz: 3.0
+  integration_time_s: 300.0
+  n_pol: 2
+  reference_eirp_w: 5.2e12
+  reference_distance_pc: 50.0
+  beam_fwhm_arcmin: 8.4             # GBT L-band FWHM, Wlodarczyk-Sroka et al. 2020 Sec. 2
+  citation: "Enriquez et al. 2017, arXiv:1709.03491v2, Sec. 5.1 eqs. 2-5 and Table 3 (verified 2026-11-25)"
+citations:
+  - "Enriquez et al. 2017, ApJ 849, 104 (arXiv:1709.03491): the 692 GBT L-band pointings and their null result"
+  - "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720 (arXiv:2006.09756): method (stars inside the primary beam, Gaussian off-axis attenuation, d < 10 kpc)"
+  - "Gaia Collaboration 2023, A&A 674, A1 (Gaia DR3): gaiadr3.gaia_source via the ARI Heidelberg TAP"
+  - "Bailer-Jones et al. 2021, AJ 161, 147: geometric distances for 1 < parallax_over_error < 5 (gaiaedr3_complements.distances)"

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ApiError, get, post, type Queue, type ReplayResult, type RunResult, type RunSummary, type Tier0Job } from "../api";
-import { Command, ErrorBox, Hash, Loading, Panel, StatusPill, useApi } from "../components/ui";
+import { Command, ErrorBox, Hash, Loading, Panel, StatusPill, TierBadge, useApi } from "../components/ui";
 import { fmtLog10, fmtNum, isCleanGitSha, longRunLabel, tier0Gate } from "../lib/format";
 
 /** `readOnly` is /api/health's flag; null while health is still loading. */
@@ -96,10 +96,26 @@ function Tier1({ q }: { q: Queue }) {
             <p className="muted small">{j.eig_basis}</p>
             {j.linked_evidence ? (
               <div className="linked">
-                <p className="eyebrow">linked small-sample evidence (Launch Gate #1)</p>
-                <p className="small">{j.linked_evidence.statement}</p>
+                {"kind" in j.linked_evidence ? (
+                  <>
+                    <p className="eyebrow">
+                      linked evidence — completed by the promoted artifact <TierBadge tier={j.linked_evidence.summary_data_tier} />{" "}
+                      <Hash sha={j.linked_evidence.summary_sha256} n={16} />
+                    </p>
+                    <p className="small">{j.linked_evidence.statement}</p>
+                    <p className="small muted">
+                      EIG above stays the registered prediction. {j.linked_evidence.tier_note}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="eyebrow">linked small-sample evidence (Launch Gate #1)</p>
+                    <p className="small">{j.linked_evidence.statement}</p>
+                  </>
+                )}
               </div>
             ) : null}
+            {j.commands.report ? <Command text={j.commands.report} /> : null}
             <Command text={j.commands.claim} />
             {j.commands.script ? <Command text={j.commands.script} /> : <p className="muted small">script: {j.archival_script}</p>}
           </article>

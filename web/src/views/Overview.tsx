@@ -16,6 +16,7 @@ const DEFAULT_COMPARE: CompareRequest = {
   seed: OVERVIEW_SEED,
   disk_profile: "uniform",
   marginalize_lookback: false,
+  pointing_merge_policy: "reject_duplicate_pointing_group",
 };
 
 const dash = "—";
@@ -26,7 +27,8 @@ export function Overview({ health, go }: { health: Health | null; go: (v: View) 
   const queue = useApi(() => get<Queue>("/api/queue"), []);
   const reg = useApi(() => get<Registry>("/api/registry"), []);
 
-  const radioSurvey = reg.data?.surveys.find((s) => s.channel === "radio");
+  // The primary radio survey, not a declared pointing extension of it (v0.2.1b).
+  const radioSurvey = reg.data?.surveys.find((s) => s.channel === "radio" && !s.parent_pointing_survey_id);
   // Live provenance straight from /api/health (read from the verified calibration file).
   const nControls = health?.n_controls ?? null;
   const facts = adversaryFacts(adv.data);

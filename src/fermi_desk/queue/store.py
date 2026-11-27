@@ -53,7 +53,10 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
     JobDefinition(
         job_id="wlodarczyk_sroka_288k_background_extension",
         tier="1_archival",
-        title="Condition on the published 288,315-star BL background-field null",
+        title=(
+            "Condition on the background-field null inside the BL L-band beams "
+            "(Wlodarczyk-Sroka 2020 method)"
+        ),
         target_module="fermi_desk.models.radio",
         parameters={
             "pair": PAIR,
@@ -71,8 +74,11 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         notes=(
             "Shares pointing_group_id bl_gbt_lband_2017 with BL 692: enters only through "
             "union_targets_by_pointing (v0.2.1). The script reproduces the Wlodarczyk-Sroka "
-            "2020 method with Gaia DR3 cones on the 692 Enriquez 2017 pointings; the live "
-            "fetch is opt-in (--fetch) and belongs to v0.2.1b."
+            "2020 method with Gaia DR3 cones on the 692 Enriquez 2017 pointings (not their "
+            "288,315-star catalogue, which covers 1,327 Price 2020 pointings with Gaia DR2). "
+            "Executed live in v0.2.1b: the job is completed by the SHA-256-pinned artifact "
+            "data/catalogs/bl_gbt_lband_background_summary.json; expected_eig_bits stays the "
+            "registered synthetic-proxy prediction and the realized value is linked evidence."
         ),
     ),
     JobDefinition(
@@ -270,16 +276,17 @@ class JobStore:
             if self.get(job.job_id) is not None:
                 # Refresh registration metadata on existing rows (diagnostic fields added in
                 # Milestone 2.5; cost estimates revised in v0.1.1; archival script pointer
-                # in v0.2.1). The stored EIG is reused for the utility score; status, seeds
-                # and output hashes are never touched.
+                # in v0.2.1; title wording in v0.2.1b). The stored EIG is reused for the
+                # utility score; status, seeds and output hashes are never touched.
                 impact, priority = compute_job_diagnostic(graph, job)
                 self.conn.execute(
-                    "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, source=?, "
+                    "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, title=?, source=?, "
                     "archival_script=?, est_cpu_seconds=?, est_reviewer_minutes=?, "
                     "utility_bits_per_hour=? WHERE job_id=?",
                     (
                         impact,
                         priority,
+                        job.title,
                         job.source,
                         job.archival_script,
                         job.est_cpu_seconds,
@@ -323,7 +330,46 @@ class JobStore:
             )
             inserted.append(job.job_id)
         self.conn.commit()
+        self.sync_archival_completions(graph, jobs)
         return inserted
+
+    def sync_archival_completions(
+        self, graph: FactorGraph, jobs: Iterable[JobDefinition] = JOB_DEFINITIONS
+    ) -> list[str]:
+        """Mark Tier-1 archival jobs completed by their promoted, SHA-256-pinned artifact.
+
+        A Tier-1 job is never run by the queue: its opt-in script fetches live data and
+        promotes a pinned artifact. When that artifact exists and passes the full offline
+        verification, the job's row records it (``output_sha256`` = artifact file hash,
+        ``code_git_sha`` = the commit that built it). Non-destructive: only ``open`` or
+        ``claimed`` rows move to ``completed`` (a claim keeps its ``claimed_by``); rejected
+        rows, existing completions, the registered EIG prediction, seeds of other jobs and
+        the ``executions`` log are never touched.
+        """
+        done = []
+        for job in jobs:
+            resolver = runners.ARCHIVAL_COMPLETIONS.get(job.job_id)
+            row = self.get(job.job_id)
+            if resolver is None or row is None or row["status"] not in ("open", "claimed"):
+                continue
+            evidence = resolver(graph)
+            if evidence is None:
+                continue
+            self.conn.execute(
+                """UPDATE jobs SET status='completed', code_git_sha=?, rng_seed=?,
+                output_sha256=?, output_path=?, completed_at=? WHERE job_id=?""",
+                (
+                    evidence["code_git_sha"],
+                    evidence["rng_seed"],
+                    evidence["output_sha256"],
+                    evidence["output_path"],
+                    evidence["completed_at"],
+                    job.job_id,
+                ),
+            )
+            done.append(job.job_id)
+        self.conn.commit()
+        return done
 
     # ---------------------------------------------------------------- reads
     def get(self, job_id: str) -> dict | None:

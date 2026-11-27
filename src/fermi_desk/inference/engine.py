@@ -84,12 +84,29 @@ RECEIPT_SCHEMA_VERSION = 5
 # Reach nodes of the background shells are evaluated in blocks: the finite-disk importance
 # sampler shares its sample budget across one target set, so each block keeps its own.
 BACKGROUND_REACH_CHUNK = 512
+# Ruling v0.2.1-R2: a flat detection probability on merged background stars is illustrative
+# whatever the tier of the star catalogue behind it.
+FLAT_BACKGROUND_INPUT = "flat_probability_on_merged_background_field"
+# Planning rulings behind an illustrative input. A note gains a `rulings` key only when one
+# of its inputs is listed here, so notes of earlier releases keep their exact shape (and
+# every single-survey results_sha256 is unchanged).
+ILLUSTRATIVE_INPUT_RULINGS = {FLAT_BACKGROUND_INPUT: "v0.2.1-R2"}
 # Why each illustrative input is illustrative (surfaced as headline_exclusion_notes).
 ILLUSTRATIVE_INPUT_REASONS = {
     "synthetic_background_field": (
         "the merged background-field shells are a synthetic_proxy population (offline test "
         "or dry-run fixture), not archive stars, so the radio term is held out of the "
         "verified headline"
+    ),
+    FLAT_BACKGROUND_INPUT: (
+        "flat_probability mode with union_targets_by_pointing: one distance- and "
+        "beam-invariant detection probability p_radio is applied to every merged "
+        "background-field star, off-axis and out to 10 kpc, which ignores the d^2 / B(theta) "
+        "attenuation of EIRP_min. The merged radio term is therefore an illustrative "
+        "sensitivity check, not an observational bound, and is held out of the verified "
+        "headline (ruling v0.2.1-R2). distance_scaled_eirp carries the physical off-axis "
+        "sensitivity; the default reject_duplicate_pointing_group policy keeps the verified "
+        "692-primary radio term"
     ),
     "transmitter_eirp_luminosity_function": (
         "distance_scaled_eirp mode: the log-normal transmitter EIRP luminosity function "
@@ -651,6 +668,12 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             radio_tiers.append(ctx.background.data_tier)
             if ctx.background.data_tier in ILLUSTRATIVE_TIERS:
                 radio_illustrative.append("synthetic_background_field")
+            if cfg.radio_mode == "flat_probability":
+                # Ruling v0.2.1-R2: a sensitivity-blind p_radio on off-axis stars out to
+                # 10 kpc is an illustrative model input, exactly like the transmitter
+                # luminosity function above. The term stays in the component tables.
+                radio_tiers.append("illustrative_calibration")
+                radio_illustrative.append(FLAT_BACKGROUND_INPUT)
         comps["radio"] = _component(
             ln_radio,
             0.0,
@@ -1086,6 +1109,30 @@ def _is_illustrative(tiers: Sequence[str]) -> bool:
     return any(t in ILLUSTRATIVE_TIERS for t in tiers)
 
 
+def _merged_background_breakdown(a: dict, b: dict) -> dict | None:
+    """Where a merged radio Bayes-factor term comes from: primaries vs background shells.
+
+    Present only when both hypotheses carry a merged background. The split into the
+    primaries' exact Monte Carlo term and the shells' independent-product term exists for
+    fixed-T runs; a lookback-marginalised run reports the star counts and tier only.
+    """
+    bgs = [(h.get("radio") or {}).get("background") for h in (a, b)]
+    if not all(bgs):
+        return None
+    out = {
+        "survey_id": bgs[0]["survey_id"],
+        "data_tier": bgs[0]["data_tier"],
+        "summary_sha256": bgs[0]["summary_sha256"],
+        "n_background_stars": bgs[0]["n_stars"],
+        "n_primary_targets": a["radio"]["n_targets"],
+    }
+    keys = ("log10_p_zero_primary_mc", "log10_p_zero_independent_fkg_lower")
+    if all(k in bg for bg in bgs for k in keys):
+        out["log10_bf_primary_targets_exact_mc"] = bgs[0][keys[0]] - bgs[1][keys[0]]
+        out["log10_bf_background_shells_fkg_product"] = bgs[0][keys[1]] - bgs[1][keys[1]]
+    return out
+
+
 def _pair_terms(a: dict, b: dict, channels: set[str], earth: bool) -> list[str]:
     ta = select_terms(a["components"], channels, earth)
     tb = select_terms(b["components"], channels, earth)
@@ -1160,18 +1207,26 @@ def compare_pair(a: dict, b: dict) -> dict:
     for c in illustrative_channels:
         comp = [h["components"].get(c, {}) for h in (a, b)]
         inputs = sorted({x for k in comp for x in k.get("illustrative_inputs", [])})
-        notes.append(
-            {
-                "channel": c,
-                "active_in_run": True,
-                "held_out_of_verified_headline": True,
-                "illustrative_inputs": inputs,
-                "reasons": [ILLUSTRATIVE_INPUT_REASONS[x] for x in inputs]
-                or ["component carries an illustrative / synthetic data tier"],
-                "data_tiers": sorted({x for k in comp for x in k.get("data_tiers", [])}),
-                "log10_bf_term": bf(c) if c in a["components"] and c in b["components"] else None,
-            }
+        note = {
+            "channel": c,
+            "active_in_run": True,
+            "held_out_of_verified_headline": True,
+            "illustrative_inputs": inputs,
+            "reasons": [ILLUSTRATIVE_INPUT_REASONS[x] for x in inputs]
+            or ["component carries an illustrative / synthetic data tier"],
+            "data_tiers": sorted({x for k in comp for x in k.get("data_tiers", [])}),
+            "log10_bf_term": bf(c) if c in a["components"] and c in b["components"] else None,
+        }
+        # Keys below exist only in merged (union_targets_by_pointing) runs.
+        rulings = sorted(
+            {ILLUSTRATIVE_INPUT_RULINGS[x] for x in inputs if x in ILLUSTRATIVE_INPUT_RULINGS}
         )
+        if rulings:
+            note["rulings"] = rulings
+        merged = _merged_background_breakdown(a, b) if c == "radio" else None
+        if merged:
+            note["merged_background"] = merged
+        notes.append(note)
     tv = _pair_terms(a, b, set(verified_channels), earth)
     per_v = chain_bf(tv) if marginal else {t: bf(t) for t in tv}
     verified = {
@@ -1307,6 +1362,8 @@ def _data_tiers(ctx: RunContext) -> list[str]:
         tiers.add("illustrative_calibration")  # transmitter luminosity function
     if ctx.background is not None:
         tiers.add(ctx.background.data_tier)
+        if "radio" in ctx.surveys and ctx.config.radio_mode == "flat_probability":
+            tiers.add("illustrative_calibration")  # v0.2.1-R2: flat p_radio on background stars
     return sorted(tiers)
 
 
@@ -1441,6 +1498,10 @@ def run_comparison(
         # union_targets_by_pointing actually merged an extension into its parent.
         "pointing_merge_policy": cfg.pointing_merge_policy,
         "merge_provenance": ctx.merge_provenance.model_dump() if ctx.merge_provenance else None,
+        # v0.2.1b: provenance of the merged background field (None unless merged): pinned
+        # SHA-256, tier, clean code_git_sha, exact N_bg, de-duplication counters including
+        # suspected_unmatched_primary (ruling v0.2.1-R3) and the retrieved-vs-published scope.
+        "background_field": ctx.background_field.summary() if ctx.background_field else None,
         "held_out_extension_surveys": list(ctx.held_out_surveys),
         "data_tiers_used": _data_tiers(ctx),
         "headline_policy": HEADLINE_WITH_ILLUSTRATIVE

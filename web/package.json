@@ -1,7 +1,7 @@
 {
   "name": "fermi-desk-web",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.2.1",
   "description": "Offline interactive desk UI for the Fermi paradox constraint engine (Milestone 3).",
   "type": "module",
   "engines": {

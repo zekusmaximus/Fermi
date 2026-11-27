@@ -240,7 +240,21 @@ def test_queue_lists_split_tiers(client):
     bg = next(j for j in t1 if j["job_id"] == "wlodarczyk_sroka_288k_background_extension")
     assert bg["archival_script"] == "scripts/fetch_wlodarczyk_sroka_288k.py"
     assert bg["commands"]["script"].endswith("fetch_wlodarczyk_sroka_288k.py --dry-run")
-    assert bg["status"] == "open" and bg["output_sha256"] is None  # not executed in v0.2.1a
+    # v0.2.1b: executed live and promoted, so the job is completed BY its pinned artifact;
+    # the registered synthetic-proxy prediction stays in expected_eig_bits.
+    pin = _ok(client, "/api/health")["background_summary_sha256"]
+    assert bg["status"] == "completed" and bg["output_sha256"] == pin and len(pin) == 64
+    assert len(bg["code_git_sha"]) == 40 and bg["commands"]["report"].endswith("background-field")
+    assert bg["expected_eig_bits"] == pytest.approx(0.0145226, rel=1e-4)
+    ev = bg["linked_evidence"]
+    assert ev["kind"] == "background_field_eig" and ev["summary_sha256"] == pin
+    assert ev["summary_data_tier"] == "reproduced_archive" and ev["n_background_stars"] == 120176
+    assert {r["radio_mode"] for r in ev["comparison"]} == {
+        "distance_scaled_eirp",
+        "flat_probability",
+    }
+    assert "692" in ev["statement"] and "1,327" in ev["statement"] and "288,315" in ev["statement"]
+    assert t1[0]["commands"]["report"] is None  # the WISE job has no promoted large-N artifact
     assert all(j["expected_eig_bits"] == 0.0 and j["diagnostic_impact"] for j in t0)
     assert [j["diagnostic_priority"] for j in t0] == sorted(j["diagnostic_priority"] for j in t0)
     assert "queue.sqlite" in q["queue_path"]
@@ -425,7 +439,10 @@ def test_reseed_refreshes_stale_cpu_estimate_without_touching_state(tmp_path):
         assert row["status"] == "claimed" and row["claimed_by"] == "x"
         bg = s.get("wlodarczyk_sroka_288k_background_extension")
         assert bg["archival_script"] == "scripts/fetch_wlodarczyk_sroka_288k.py"
-        assert bg["status"] == "open" and bg["output_sha256"] is None
+        # v0.2.1b: the promoted, pinned artifact completes the job; its registered EIG
+        # prediction is untouched (tests/test_background_field.py covers the transitions).
+        assert bg["status"] == "completed" and len(bg["output_sha256"]) == 64
+        assert bg["expected_eig_bits"] == pytest.approx(0.0145226, rel=1e-4)
     finally:
         s.close()
 
@@ -641,3 +658,213 @@ def test_version_is_synchronised_across_pyproject_package_and_api(client, env):
     for path in (ROOT / "src" / "fermi_desk").rglob("*.py"):
         text = path.read_text("utf-8")
         assert 'version="0.' not in text and '__version__ = "' not in text, path
+
+
+# ----------------------------- v0.2.1b: promoted background field, R2 guard, string Gaia ids
+MAX_SAFE_JSON_INT = 2**53 - 1
+BG_JOB = "wlodarczyk_sroka_288k_background_extension"
+
+
+def _walk(obj, key=None):
+    """Yield (key, scalar) for every scalar in a JSON payload (lists inherit their key)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _walk(v, k)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v, key)
+    else:
+        yield key, obj
+
+
+def test_health_exposes_the_promoted_background_sha_and_tier(client):
+    from fermi_desk.registry import load_factor_graph
+
+    h = _ok(client, "/api/health")
+    survey = load_factor_graph(ROOT).surveys["bl_gbt_lband_background_gaia_dr3"]
+    assert h["background_survey_id"] == survey.id
+    assert h["background_summary_sha256"] == survey.background_summary_sha256
+    assert h["background_summary_data_tier"] == "reproduced_archive"
+    assert len(h["background_summary_code_git_sha"]) == 40
+    assert (h["n_background_stars"], h["n_suspected_unmatched_primary"]) == (120176, 49)
+    assert h["status"] == "ok" and h["validation_checks_total"] >= 40
+    assert h["catalog_sha256"].startswith("c299d61d")  # the locked primaries are untouched
+
+
+def test_radio_drilldown_exposes_the_background_field_extension(client):
+    r = client.get("/api/radio/drilldown")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["n_targets"] == 692  # the primary drill-down is unchanged
+    bf = d["background_field"]
+    assert bf["promoted"] is True
+    prov = bf["provenance"]
+    health = _ok(client, "/api/health")
+    assert prov["file_sha256"] == health["background_summary_sha256"]
+    assert prov["data_tier"] == "reproduced_archive" and len(prov["code_git_sha"]) == 40
+    assert all(len(s) == 40 for s in prov["cone_cache_code_git_shas"])
+    assert (prov["n_pointings"], prov["beam_fwhm_arcmin"], prov["cone_radius_arcmin"]) == (
+        692,
+        8.4,
+        4.2,
+    )
+    assert (prov["n_background_stars"], prov["n_cells"]) == (120176, 46913)
+    assert prov["query_window_utc"][0] < prov["query_window_utc"][1] < prov["assembled_at_utc"]
+    # Distance cuts and de-duplication counters, including the reported suspected primaries.
+    cuts, mp, da = prov["distance_cuts"], prov["merge_provenance"], prov["dedup_audit"]
+    assert (cuts["n_cone_sightings_raw"], cuts["n_dropped_beyond_d_max"]) == (259285, 133)
+    assert (mp["n_dedup_gaia_id"], mp["n_dedup_angular_fallback"]) == (4270, 105)
+    assert (mp["n_multi_beam_resolved"], mp["n_background_absorbed_by_primary"]) == (3764, 635)
+    assert da["n_duplicate_gaia_ids_vs_primary"] == 0
+    assert (da["n_suspected_unmatched_primary"], da["n_suspected_unmatched_primary_stars"]) == (
+        49,
+        47,
+    )
+    assert "ruling v0.2.1-R3" in da["suspected_unmatched_primary_policy"]
+    assert len(bf["suspected_unmatched_primary"]) == 49
+    # Scope contrast against the published catalogue.
+    pub, got = prov["scope"]["published"], prov["scope"]["retrieved"]
+    assert (pub["n_pointings"], pub["n_stars_total"], pub["gaia_release"]) == (
+        1327,
+        288315,
+        "Gaia DR2",
+    )
+    assert pub["n_stars_gbt_l_band"]["verified_against_paper"] is False
+    assert (got["n_pointings"], got["n_background_stars"], got["gaia_release"]) == (
+        692,
+        120176,
+        "Gaia DR3",
+    )
+    # Realized vs predicted EIG, both radio modes, never labelled as verified.
+    rows = {x["radio_mode"]: x for x in bf["eig"]["comparison"]}
+    assert rows["distance_scaled_eirp"]["label"] == "physical"
+    assert rows["flat_probability"]["label"] == "unphysical"
+    assert rows["distance_scaled_eirp"]["predicted_eig_bits"] == pytest.approx(0.01452, abs=5e-6)
+    assert rows["distance_scaled_eirp"]["realized_eig_bits"] == pytest.approx(0.00235113, rel=1e-5)
+    assert rows["flat_probability"]["predicted_eig_bits"] == pytest.approx(0.827, abs=5e-4)
+    assert rows["flat_probability"]["realized_eig_bits"] == pytest.approx(0.651404, rel=1e-5)
+    for row in rows.values():
+        assert row["data_tiers"] == ["illustrative_calibration", "reproduced_archive"]
+    # Harris-FKG / Frechet bounds, shell summary, off-axis attenuation, pointing-centre audit.
+    assert len(bf["bounds"]) == 4
+    for b in bf["bounds"]:
+        assert b["p_zero_markov_lower"] <= b["p_zero_fkg_lower"] <= b["p_zero_frechet_upper"]
+    assert "LOWER bound" in bf["correlation_assumption"]
+    assert bf["shells"]["n_stars"] == 120176 and bf["shells"]["eirp_min_cumulative_by_decade"]
+    assert bf["attenuation"]["median_eirp_min_ratio_background_over_primary"] > 1e3
+    assert (
+        bf["pointing_centre_audit"]["densest_band_of_unfound_primaries"]["n_no_counterpart"] == 14
+    )
+    assert bf["commands"]["report"] == "uv run fermi-desk background-field"
+    # Ruling v0.2.1-R4: every Gaia id in the response is a string, never a JSON number.
+    ids = [v for k, v in _walk(bf) if k == "gaia_dr3_source_id"]
+    assert len(ids) == 49 and all(isinstance(v, str) and v.isdigit() for v in ids)
+    assert any(int(v) > MAX_SAFE_JSON_INT for v in ids)
+    import re
+
+    assert re.search(r'"gaia_dr3_source_id":\s*[0-9-]', r.text) is None
+
+
+def test_no_api_payload_carries_a_gaia_id_or_integer_javascript_would_round(client):
+    """Ruling v0.2.1-R4 across the API, including ids read from the locked v0.1.x
+    artifacts (which keep their integer form on disk and are stringified at the boundary)."""
+    n_ids = 0
+    for path in (
+        "/api/health",
+        "/api/registry",
+        "/api/radio/drilldown",
+        "/api/infrared/drilldown?seed=42",
+        "/api/adversary?seed=42",
+        "/api/queue",
+        "/api/runs",
+    ):
+        for key, value in _walk(_ok(client, path)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                if key == "gaia_dr3_source_id":
+                    assert isinstance(value, str) and value.isdigit(), (path, value)
+                    n_ids += 1
+                continue
+            assert abs(value) <= MAX_SAFE_JSON_INT, (path, key, value)
+            assert key != "gaia_dr3_source_id", (path, value)
+    assert n_ids >= 49 + 2  # background suspects + the Hephaistos D / E anchors
+
+
+def test_json_safe_stringifies_source_ids_and_unsafe_integers():
+    import numpy as np
+
+    big = 6898272528885931234
+    out = json_safe(
+        {
+            "gaia_dr3_source_id": big,
+            "nested": [{"gaia_dr3_source_id": np.int64(5)}],  # ALWAYS a string under an id key
+            "star_ids": [big, 7],
+            "psf_star_ids": np.array([big]),
+            "rng_seed": 42,
+            "n_stars": np.int64(120176),
+            "survey_id": "bl",
+            "flag": True,
+            "unsafe": 2**53,
+            "safe": 2**53 - 1,
+            "negative_unsafe": -(2**60),
+        }
+    )
+    assert out == {
+        "gaia_dr3_source_id": str(big),
+        "nested": [{"gaia_dr3_source_id": "5"}],
+        "star_ids": [str(big), "7"],
+        "psf_star_ids": [str(big)],
+        "rng_seed": 42,
+        "n_stars": 120176,
+        "survey_id": "bl",
+        "flag": True,
+        "unsafe": str(2**53),
+        "safe": 2**53 - 1,
+        "negative_unsafe": str(-(2**60)),
+    }
+    assert int(float(big)) != big  # what a JavaScript number would have done to it
+
+
+def test_compare_union_flat_holds_radio_out_and_carries_background_provenance(client):
+    base = {
+        "channels": ["radio"],
+        "seed": 7,
+        "pointing_merge_policy": "union_targets_by_pointing",
+        "radio_mode": "flat_probability",
+    }
+    d = _post(client, base)
+    rec = d["receipt"]
+    assert d["headline_policy"] == "verified_channels_only"
+    (note,) = d["headline_exclusion_notes"]
+    assert note["channel"] == "radio" and note["rulings"] == ["v0.2.1-R2"]
+    assert note["held_out_of_reported_headline"] is True
+    assert "d^2 / B(theta)" in note["reasons"][0]
+    assert note["merged_background"]["n_background_stars"] == 120176
+    head = rec["results"]["headline"]["headline"]
+    assert head["terms"] == ["earth_unreached"]
+    assert "radio" in rec["results"]["headline"]["log10_bf_by_term"]  # still in the table
+    assert abs(d["headline_log10_bf"]) < 1e-9 and note["log10_bf_term"] < -0.5
+    bf = rec["background_field"]
+    assert bf["data_tier"] == "reproduced_archive" and bf["n_background_stars"] == 120176
+    assert bf["dedup_audit"]["n_suspected_unmatched_primary"] == 49
+    assert rec["merge_provenance"]["n_merged_targets"] == 692 + 120176
+    assert rec["held_out_extension_surveys"] == []
+    # Opt-in: the term enters the headline under the loud policy.
+    loud = _post(client, {**base, "include_illustrative": True})
+    assert loud["headline_policy"] == "including_illustrative_channels"
+    assert loud["headline_log10_bf"] == pytest.approx(note["log10_bf_term"], abs=1e-6)
+    assert loud["headline_exclusion_notes"][0]["held_out_of_reported_headline"] is False
+    # Default policy: 692 primaries only, the extension listed as held out.
+    plain = _post(client, {"channels": ["radio"], "seed": 7})["receipt"]
+    assert plain["background_field"] is None and plain["merge_provenance"] is None
+    assert [h["survey_id"] for h in plain["held_out_extension_surveys"]] == [
+        "bl_gbt_lband_background_gaia_dr3"
+    ]
+    assert plain["results"]["headline"]["headline"]["terms"] == ["earth_unreached", "radio"]
+
+
+def test_read_only_server_shows_the_promoted_evidence_without_writing(ro_env):
+    client, _ = ro_env
+    q = _ok(client, "/api/queue")
+    bg = next(j for j in q["tier1_archival"] if j["job_id"] == BG_JOB)
+    assert bg["linked_evidence"]["kind"] == "background_field_eig"
+    assert bg["status"] == "completed"  # seeded by this server from the pinned artifact

@@ -13,7 +13,7 @@ import astropy.units as u
 import numpy as np
 import yaml
 
-from fermi_desk.inference import eig
+from fermi_desk.inference import background_field, eig
 from fermi_desk.inference.engine import (
     RunConfig,
     build_context,
@@ -334,6 +334,150 @@ def eig_background_extension(graph: FactorGraph, p: Mapping) -> eig.EIGResult:
             "proxy_data_tier": "synthetic_proxy",
         },
     )
+
+
+BACKGROUND_JOB_ID = "wlodarczyk_sroka_288k_background_extension"
+
+
+def background_extension_evidence(graph: FactorGraph, p: Mapping) -> dict | None:
+    """Realized-vs-predicted EIG of the background-field job, from the promoted artifact.
+
+    ``None`` until a survey pins a background summary. The prediction is the Milestone 2
+    synthetic-proxy number stored when the job was registered (recomputed here from the same
+    published shell table); the realized value uses the SHA-256-pinned Gaia DR3 shells with
+    the identical definition (prior, outcome, geometry, independent-product P0). Both are
+    reported in both radio modes, and again without the suspected unmatched primaries, which
+    ruling v0.2.1-R3 keeps in the shells.
+    """
+    field = background_field.load_background_field(graph)
+    if field is None:
+        return None
+    pair, geometry = list(p["pair"]), p["geometry"]
+    predicted = eig_background_extension(graph, p)
+    realized = background_field.realized_eig(graph, field, pair, geometry)
+    without = background_field.realized_eig(
+        graph, field, pair, geometry, field.shells_excluding_suspected()
+    )
+    n_removed = field.shells.n_stars - without["n_stars"]
+    rows = []
+    for mode, meta in background_field.RADIO_MODE_LABELS.items():
+        pred = predicted.details["by_radio_mode"][mode]["eig_bits"]
+        real = realized["by_radio_mode"][mode]
+        rows.append(
+            {
+                "radio_mode": mode,
+                "label": meta["label"],
+                "physical": meta["physical"],
+                "predicted_eig_bits": pred,
+                "realized_eig_bits": real["eig_bits"],
+                "realized_over_predicted": real["eig_bits"] / pred if pred > 0 else None,
+                "realized_eig_bits_range_fkg_to_frechet": real["eig_bits_range_fkg_to_frechet"],
+                "realized_eig_bits_excluding_suspected_unmatched_primary": without["by_radio_mode"][
+                    mode
+                ]["eig_bits"],
+                "realized_information_bits_from_observed_null": real["realized_information_bits"],
+                "data_tiers": real["data_tiers"],
+            }
+        )
+    scope = field.scope()
+    return {
+        "job_id": BACKGROUND_JOB_ID,
+        "summary_path": field.path,
+        "summary_sha256": field.file_sha256,
+        "summary_data_tier": field.record.data_tier,
+        "summary_code_git_sha": field.record.code_git_sha,
+        "fetched_at_utc": field.record.fetched_at_utc,
+        "n_background_stars": field.shells.n_stars,
+        "definition": {
+            "prior": realized["prior"],
+            "geometry": geometry,
+            "condition_on_earth_unreached": True,
+            "outcome": background_field.EIG_OUTCOME,
+            "primary_radio_mode_of_the_job": p["radio_mode"],
+        },
+        "predicted": {
+            "data_tier": predicted.details["proxy_data_tier"],
+            "population": (
+                "64 x 8 proxy points drawn from the published Wlodarczyk-Sroka et al. (2020) "
+                "Table 2 GBT EIRP_min shell CDF, each placed at its on-axis-equivalent distance"
+            ),
+            "n_stars": predicted.details["n_stars_gbt"],
+            "by_radio_mode": predicted.details["by_radio_mode"],
+        },
+        "realized": realized,
+        "realized_excluding_suspected_unmatched_primary": {
+            "diagnostic_only": True,
+            "n_stars_removed": n_removed,
+            "n_stars": without["n_stars"],
+            "policy": field.dedup_counts()["suspected_unmatched_primary_policy"],
+            "by_radio_mode": {
+                mode: {
+                    k: m[k]
+                    for k in (
+                        "eig_bits",
+                        "p_zero_fkg_lower",
+                        "expected_detections",
+                        "realized_information_bits",
+                        "log10_bf_fkg",
+                    )
+                }
+                for mode, m in without["by_radio_mode"].items()
+            },
+        },
+        "comparison": rows,
+        "scope": scope,
+        "statement": _evidence_statement(rows, field.shells.n_stars, n_removed, scope),
+        "tier_note": (
+            "Star counts and de-duplication are reproduced_archive. Every EIG and P(no "
+            "detection) here also depends on an illustrative_calibration input (the transmitter "
+            "EIRP luminosity function in distance_scaled_eirp; the sensitivity-blind detection "
+            "probability in flat_probability, ruling v0.2.1-R2), so none of them is a verified "
+            "observational bound."
+        ),
+    }
+
+
+def _evidence_statement(rows: list[dict], n_bg: int, n_removed: int, scope: dict) -> str:
+    by = {r["radio_mode"]: r for r in rows}
+    phys, flat = by["distance_scaled_eirp"], by["flat_probability"]
+    pub = scope["published"]
+    return (
+        f"Realized EIG with N_bg = {n_bg:,} Gaia DR3 background stars over "
+        f"{scope['retrieved']['n_pointings']} Enriquez (2017) L-band pointings: "
+        f"{phys['realized_eig_bits']:.4g} bits physical (distance_scaled_eirp) vs "
+        f"{phys['predicted_eig_bits']:.4g} predicted; {flat['realized_eig_bits']:.4g} bits "
+        f"unphysical (flat_probability) vs {flat['predicted_eig_bits']:.4g} predicted. Without "
+        f"the {n_removed} suspected unmatched primaries the physical value is "
+        f"{phys['realized_eig_bits_excluding_suspected_unmatched_primary']:.4g} bits. The "
+        f"prediction used a synthetic proxy of the {pub['n_stars_gbt_l_plus_s_band']['value']:,} "
+        f"GBT stars of Wlodarczyk-Sroka et al. (2020), whose catalogue covers "
+        f"{pub['n_pointings']:,} Price (2020) multi-band pointings and {pub['n_stars_total']:,} "
+        "stars with Gaia DR2; the populations differ, so the two numbers are not expected to agree."
+    )
+
+
+def background_extension_completion(graph: FactorGraph) -> dict | None:
+    """Verified completion record of the background-field job, or None if not promoted.
+
+    A Tier-1 archival job is completed by its promoted, SHA-256-pinned artifact: loading it
+    here re-runs the full pin / schema / offline-recomputation check, so a job is never
+    marked completed on the strength of a file that fails ``fermi-desk validate``.
+    """
+    field = background_field.load_background_field(graph)
+    if field is None or field.record.data_tier != "reproduced_archive":
+        return None
+    return {
+        "output_sha256": field.file_sha256,
+        "output_path": field.path,
+        "code_git_sha": field.record.code_git_sha,
+        "completed_at": field.record.assembled_at_utc or field.record.fetched_at_utc,
+        "rng_seed": field.record.validation_sample.rng_seed,
+    }
+
+
+ARCHIVAL_COMPLETIONS: dict[str, Callable[[FactorGraph], dict | None]] = {
+    BACKGROUND_JOB_ID: background_extension_completion,
+}
 
 
 def eig_control_fields(graph: FactorGraph, p: Mapping) -> eig.EIGResult:

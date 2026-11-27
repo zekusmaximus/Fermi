@@ -71,8 +71,14 @@ def small_targets() -> TargetTable:
 
 @pytest.fixture
 def data_copy(tmp_path: Path) -> Path:
-    """Writable copy of the project data tree for negative-path schema tests."""
-    shutil.copytree(ROOT / "data", tmp_path / "data")
+    """Writable copy of the project data tree for negative-path schema tests.
+
+    The gitignored archive caches (data/cache, data/fits: raw cone replies and FITS
+    cutouts) are not part of the data contracts and are left out.
+    """
+    shutil.copytree(
+        ROOT / "data", tmp_path / "data", ignore=shutil.ignore_patterns("cache", "fits")
+    )
     return tmp_path
 
 

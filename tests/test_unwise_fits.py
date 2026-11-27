@@ -12,9 +12,12 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
+import tarfile
 
 import astropy.units as u
 import numpy as np
@@ -526,6 +529,49 @@ def test_conformal_threshold_finite_sample_level_is_k_plus_1_over_n_plus_1():
         assert (k + 1) / (n + 1) <= alpha < (k + 2) / (n + 1)  # the largest attainable k
 
 
+def test_r3_conformal_level_is_one_percent_from_99_stars_and_falls_back_below():
+    """Ruling v0.2.2-R3: alpha = 0.01 is exact at 1 / (n_cal + 1) <= 1% once n_cal >= 99;
+    a smaller calibration half freezes at 1 / (n_cal + 1) only when the fallback is allowed."""
+    for n in (99, 100, 112, 128, 198):
+        assert uf.resolve_conformal_alpha(0.01, n, allow_fallback=True) == 0.01
+        t = uf.conformal_threshold(np.arange(float(n)), 0.01)
+        assert t["k_exceedances"] == 0 and t["alpha_guaranteed"] == 1 / (n + 1) <= 0.01
+    assert 1 / 101 <= 0.01 and round(100 / 101, 3) == 0.990  # the R3 figure, in percent
+    for n in (60, 77, 98):
+        assert uf.resolve_conformal_alpha(0.01, n) == 0.01  # strict: left for the refusal
+        level = uf.resolve_conformal_alpha(0.01, n, allow_fallback=True)
+        assert level == 1 / (n + 1) > 0.01
+        t = uf.conformal_threshold(np.arange(float(n)), level)  # attainable by construction
+        assert t["k_exceedances"] == 0 and t["alpha_guaranteed"] == level
+    for bad in ((0.0, 60), (1.0, 60), (0.01, 0)):
+        with pytest.raises(ValueError):
+            uf.resolve_conformal_alpha(*bad, allow_fallback=True)
+    cuts = _cutouts(12, "calibration", 7)
+    with pytest.raises(ValueError, match="not attainable with n_cal = 12"):
+        uf.freeze_calibration(cuts, SIGMA_SYS)  # the kernel default stays strict
+    state = uf.freeze_calibration(cuts, SIGMA_SYS, allow_conformal_fallback=True)
+    assert state.conformal_fallback and state.alpha_requested == 0.01
+    assert state.conformal_alpha == 1 / 13
+    fz = state.payload()["frozen_screens"]
+    assert (fz["conformal_alpha_nominal"], fz["conformal_alpha_requested"]) == (1 / 13, 0.01)
+    again = uf.FrozenCalibration.from_payload(state.payload(), None)
+    assert again.state_sha256 == state.state_sha256 and again.conformal_fallback
+    plain = uf.freeze_calibration(cuts, SIGMA_SYS, conformal_alpha=0.1)
+    assert not plain.conformal_fallback and plain.conformal_alpha == plain.alpha_requested == 0.1
+    lying = state.payload()
+    lying["frozen_screens"]["conformal_alpha_fallback"] = False
+    with pytest.raises(LeakageError, match="fallback flag"):
+        uf.FrozenCalibration.from_payload(lying, None)
+
+
+def test_r3_live_defaults_target_at_least_100_stars_per_half(script, args):
+    assert args.n_controls == script.DEFAULT_N_CONTROLS == 224 and args.n_patches == 16
+    assert args.n_controls // args.n_patches == 14  # 13-14 controls per patch (v0.2.2-R3)
+    assert args.n_controls // 2 >= 100 and args.conformal_alpha == 0.01
+    assert script.protocol(args)["conformal_alpha"] == 0.01
+    assert schemas.UNWISE_GATE_MIN_SPLIT == 60  # the promotion floor is only the fallback
+
+
 def test_conformal_level_holds_for_heavy_tails_without_a_chi2_assumption():
     """Monte Carlo of the exchangeability argument, on scores with no finite variance."""
     rng = np.random.default_rng(np.random.SeedSequence([42, 0xC0F]))
@@ -550,7 +596,10 @@ def test_frozen_thresholds_follow_from_the_stored_calibration_nulls(run, locked)
     fz = run.receipt["frozen_screens"]
     cal, sc = fz["calibration"], fz["screens"]
     n = len(cal["star_ids"])
-    assert n == 60 and fz["conformal_alpha_nominal"] == 0.02 and fz["target_false_alarm"] == 0.0027
+    assert n == 60 and fz["target_false_alarm"] == 0.0027
+    # v0.2.2-R3: alpha = 0.01 needs n_cal >= 99, so 60 stars freeze at the fallback 1 / 61.
+    assert fz["conformal_alpha_requested"] == uf.DEFAULT_CONFORMAL_ALPHA == 0.01
+    assert fz["conformal_alpha_fallback"] is True and fz["conformal_alpha_nominal"] == 1 / 61
     for name, stat in uf.CHI2_SCREENS.items():  # Screens A and B: the Gate #2 rule, in-sample
         scale = hf.delta_chi2_scale(np.array(cal[f"delta_chi2_{stat}"]))
         assert sc[name]["delta_chi2_scale"] == scale
@@ -920,6 +969,16 @@ def test_schema_pins_the_conformal_finite_sample_level(doc):
     sc.update(k_exceedances=1, order_statistic_rank_from_top=2, alpha_guaranteed=2 / 61)
     with pytest.raises(ProvenanceError, match="exceeds the nominal alpha"):
         _load(d)
+    # v0.2.2-R3 fallback bookkeeping: the flag, the request and the frozen level must agree.
+    assert doc["frozen_screens"]["conformal_alpha_fallback"] is True
+    d = copy.deepcopy(doc)  # fallback claimed although the request was attainable
+    d["frozen_screens"]["conformal_alpha_requested"] = 0.05
+    with pytest.raises(ProvenanceError, match=r"fallback \(v0.2.2-R3\) is only valid"):
+        _load(d)
+    d = copy.deepcopy(doc)  # two different levels without the flag
+    d["frozen_screens"]["conformal_alpha_fallback"] = False
+    with pytest.raises(ProvenanceError, match=r"without the v0.2.2-R3 fallback flag"):
+        _load(d)
     d = copy.deepcopy(doc)  # covariance below its positive-definiteness bound
     d["noise_model"]["minimum_eigenvalue_bound"] = 0.0
     with pytest.raises(ProvenanceError, match="strictly positive definite"):
@@ -1236,7 +1295,27 @@ def test_cutout_reply_parser_keeps_native_pixels_and_refuses_everything_else(scr
         "https://unwise.me/cutout_fits?version=allwise&ra=211.2500000&dec=41.5000000"
         "&size=45&bands=3&file_img_m=on&file_invvar_m=on"
     )
-    assert script.ENDPOINTS["unwise_cutout"]["verified_live"] is False
+    # v0.2.2-R4: the three live endpoints were smoke-tested; the fallbacks never were.
+    for name in ("gaia_tap", "allwise_tap", "unwise_cutout"):
+        assert script.ENDPOINTS[name]["verified_live"] is True, name
+    assert all(not fb["verified_live"] for fb in script.ENDPOINTS["fallbacks"].values())
+    assert script.LIVE_SMOKE_TEST["ruling"] == "v0.2.2-R4"
+    # The live reply mixes a plain img-m member with a gzipped invvar-m member.
+    live_like = io.BytesIO()
+    with (
+        tarfile.open(fileobj=io.BytesIO(gzip.decompress(blob))) as src,
+        tarfile.open(fileobj=live_like, mode="w") as dst,
+    ):
+        for m in src.getmembers():
+            data = src.extractfile(m).read()
+            if "invvar" in m.name:
+                data, m.name = gzip.compress(data, mtime=0), m.name + ".gz"
+            m.size = len(data)
+            dst.addfile(m, io.BytesIO(data))
+    mixed = script.parse_cutout(gzip.compress(live_like.getvalue(), mtime=0), control, 10.0)
+    assert mixed.tile == "2112p408"
+    assert mixed.pixel_scale_measured_arcsec == got.pixel_scale_measured_arcsec
+    np.testing.assert_array_equal(mixed.invvar, got.invvar)
 
 
 def test_no_network_outside_fetch_and_no_fetch_from_a_dirty_tree(script, monkeypatch, capsys):
@@ -1332,7 +1411,7 @@ def test_dry_run_cli_rehearses_end_to_end_offline_and_writes_nothing(script, cap
     for sha in LOCKED.values():
         assert sha in out
     assert "disjoint from all 12 Gate #1 patches" in out
-    assert "https://unwise.me/cutout_fits?version=allwise" in out and "verified live: False" in out
+    assert "https://unwise.me/cutout_fits?version=allwise" in out and "verified live: True" in out
     assert "gaiadr3.allwise_best_neighbour" in out and "allwise_p3as_psd" in out
     assert "synthetic_proxy" in out and "(k+1)/(n_cal+1) = 1/25" in out
     assert out.count("LeakageError guard") == 10 and "NOT RAISED" not in out

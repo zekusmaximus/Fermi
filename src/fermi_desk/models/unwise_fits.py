@@ -114,7 +114,7 @@ NOISE_TAPER_FLAT = 0.5  # lags <= 0.5 * max_lag untouched, cosine roll-off to ze
 NOISE_POWER_FLOOR = 1.0e-3  # spectral floor, in units of the mean power V(0)
 NOISE_SHRINKAGE = 0.05  # V <- (1 - lambda) V + lambda V(0) delta: eigenvalues >= lambda V(0)
 MIN_LAG_PAIRS = 200
-DEFAULT_CONFORMAL_ALPHA = 0.02
+DEFAULT_CONFORMAL_ALPHA = 0.01  # ruling v0.2.2-R3: exact level 1 / (n_cal + 1) <= 1% at n_cal >= 99
 PRIMARY_SIGMA_SYS_ESTIMATOR = "robust_median"  # the Gate #1 primary estimator, unchanged
 
 CENTROID_SCREENS = ("centroid_locked", "centroid_fresh")
@@ -891,6 +891,22 @@ def conformal_threshold(scores: Sequence[float], alpha: float) -> dict:
     }
 
 
+def resolve_conformal_alpha(requested: float, n_cal: int, *, allow_fallback: bool = False) -> float:
+    """The level the conformal screens are frozen at (ruling v0.2.2-R3).
+
+    ``requested`` whenever ``n_cal`` calibration nulls can attain it, i.e. ``requested >=
+    1 / (n_cal + 1)``. Otherwise, with ``allow_fallback``, the smallest level they can
+    guarantee, ``1 / (n_cal + 1)`` (the calibration maximum, ``k = 0``); without it the
+    request is returned unchanged and :func:`conformal_threshold` refuses it. The choice
+    depends on the calibration half only (its size), so it is part of the freeze.
+    """
+    if not 0 < requested < 1 or n_cal < 1:
+        raise ValueError("need conformal alpha in (0, 1) and at least one calibration null")
+    if not allow_fallback or np.floor(requested * (n_cal + 1) + 1e-9) >= 1:
+        return float(requested)
+    return 1.0 / (n_cal + 1)
+
+
 def fresh_sigma_sys(offset_arcsec: Sequence[float], w3snr: Sequence[float]) -> dict:
     """Registration floor re-measured on the calibration half (every Gate #1 estimator)."""
     r = np.asarray(offset_arcsec, float) * u.arcsec
@@ -1016,6 +1032,10 @@ class FrozenCalibration:
     conformal_alpha: float
     calibration: dict  # star_ids, patch_ids, w3snr, offsets, 4 Delta chi^2 arrays, fetch times
     frozen_at_utc: str | None = None
+    # The level asked for (v0.2.2-R3). It differs from ``conformal_alpha`` only when the
+    # calibration half was too small to attain it and the frozen level fell back to
+    # 1 / (n_cal + 1); ``None`` means "as frozen".
+    conformal_alpha_requested: float | None = None
 
     @property
     def star_ids(self) -> tuple[str, ...]:
@@ -1024,6 +1044,16 @@ class FrozenCalibration:
     @property
     def is_sealed(self) -> bool:
         return self.frozen_at_utc is not None
+
+    @property
+    def alpha_requested(self) -> float:
+        req = self.conformal_alpha_requested
+        return self.conformal_alpha if req is None else float(req)
+
+    @property
+    def conformal_fallback(self) -> bool:
+        """True when the frozen level is the R3 fallback 1 / (n_cal + 1), not the request."""
+        return self.alpha_requested != self.conformal_alpha
 
     def rules(self) -> dict:
         return frozen_screen_rules(
@@ -1044,6 +1074,8 @@ class FrozenCalibration:
             "frozen_screens": {
                 "target_false_alarm": self.target_false_alarm,
                 "conformal_alpha_nominal": self.conformal_alpha,
+                "conformal_alpha_requested": self.alpha_requested,
+                "conformal_alpha_fallback": self.conformal_fallback,
                 "locked_sigma_sys_arcsec": self.locked_sigma_sys_arcsec,
                 "fresh_sigma_sys": rules["fresh_sigma_sys"],
                 "screens": rules["screens"],
@@ -1112,7 +1144,10 @@ class FrozenCalibration:
             float(fz["target_false_alarm"]),
             float(fz["conformal_alpha_nominal"]),
             {k: list(v) if isinstance(v, list) else v for k, v in fz["calibration"].items()},
+            conformal_alpha_requested=float(fz["conformal_alpha_requested"]),
         )
+        if state.conformal_fallback != bool(fz["conformal_alpha_fallback"]):
+            raise LeakageError("stored conformal fallback flag disagrees with its two levels")
         return replace(state, frozen_at_utc=frozen_at_utc)
 
 
@@ -1122,11 +1157,14 @@ def freeze_calibration(
     *,
     target_false_alarm: float = RAYLEIGH_3SIGMA_FALSE_ALARM,
     conformal_alpha: float = DEFAULT_CONFORMAL_ALPHA,
+    allow_conformal_fallback: bool = False,
 ) -> FrozenCalibration:
     """Fit the PSF, the noise covariance and every threshold on the calibration split.
 
     Raises ``LeakageError`` if any cutout is not labelled ``calibration``. The returned state
-    is unsealed.
+    is unsealed. ``conformal_alpha`` is the requested level; with ``allow_conformal_fallback``
+    a calibration half too small to attain it freezes the conformal screens at
+    ``1 / (n_cal + 1)`` instead and records both levels (:func:`resolve_conformal_alpha`).
     """
     cuts = _require_split(calibration_cutouts, "calibration", "freeze_calibration")
     sys_arcsec = _arcsec(locked_sigma_sys, "locked_sigma_sys")
@@ -1163,8 +1201,18 @@ def freeze_calibration(
         cal["delta_chi2_scalar_loo"].append(outside.scalar.delta_chi2(c.flux))
         cal["delta_chi2_gls_loo"].append(outside.gls.delta_chi2(c.flux))
         cal["fetched_at_utc"].append(c.fetched_at_utc)
+    level = resolve_conformal_alpha(
+        float(conformal_alpha), len(cal["star_ids"]), allow_fallback=allow_conformal_fallback
+    )
     state = FrozenCalibration(
-        geom, psf, noise, sys_arcsec, float(target_false_alarm), float(conformal_alpha), cal
+        geom,
+        psf,
+        noise,
+        sys_arcsec,
+        float(target_false_alarm),
+        level,
+        cal,
+        conformal_alpha_requested=float(conformal_alpha),
     )
     state.rules()  # raises now if alpha is unattainable or a null median is not positive
     return state

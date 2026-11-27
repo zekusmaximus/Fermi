@@ -25,6 +25,12 @@ Exactly one mode must be chosen:
     Per-star cutouts are cached under the gitignored ``data/cache/unwise_w3/`` with a
     SHA-256 manifest; an interrupted run resumes from the cache and never re-freezes.
     Three consecutive failed requests stop the run.
+    Ruling v0.2.2-R3: the default target is 224 controls (14 per patch over 16 patches, so
+    n_cal >= 100 and n_withheld >= 100) and the conformal level is alpha = 0.01, exact at
+    1 / (n_cal + 1) <= 1% once n_cal >= 99. If the live yield leaves fewer than 99 evaluated
+    calibration stars, the freeze falls back to the smallest attainable level
+    1 / (n_cal + 1) and records both levels (``conformal_alpha_fallback``); the fallback is
+    decided on the calibration half alone, before any withheld cutout is requested.
 ``--promote-from <receipt.json>``
     Offline. Refuses a dirty ``git_sha``, a synthetic payload, any leakage violation, an
     undersized split (< 60 calibration or < 60 withheld stars) or an output >= 5 MB;
@@ -116,6 +122,7 @@ LOCKED_ARTIFACTS = {
     ),
 }
 LOCKED_SIGMA_SYS = "data/calibrations/wise_sigma_sys_control.json"
+DEFAULT_N_CONTROLS = 224  # ruling v0.2.2-R3: N >= 200, i.e. n_cal >= 100 and n_withheld >= 100
 MAX_CONSECUTIVE_FAILURES = 3  # stop querying: a schema / outage error will not fix itself
 WISE_MEAN_EPOCH_YR = 2010.5  # the unWISE "allwise" coadds stack the AllWISE frame set
 SYNTHETIC_ID_BASE = 9_000_000_000_000_000_000  # above every real Gaia DR3 source_id
@@ -154,18 +161,38 @@ CUTOUT_URL_TEMPLATE = (
     "&file_img_m=on&file_invvar_m=on"
 )
 MEMBER_RE = re.compile(r"unwise-(\d{4}[pm]\d{3})-w3-(img|invvar)-m\.fits(\.gz)?$")
-# Every archive assumption in one place. Nothing here was queried in v0.2.2a: the entries
-# marked ``verified_live: False`` are to be ratified before v0.2.2b touches a server.
+# Every archive assumption in one place. The three live endpoints were verified by the
+# v0.2.2-R4 smoke test (LIVE_SMOKE_TEST below: the full catalog stage and ONE calibration
+# cutout, into a temporary cache outside the repository that was deleted afterwards); the
+# fallbacks were never queried and stay ``verified_live: False``.
+LIVE_SMOKE_TEST = {
+    "ruling": "v0.2.2-R4",
+    "date_utc": "2026-11-27",
+    "code_git_sha": "27b4259f0ed20c48a105f6ca122d6fe647d3ee40",
+    "command": "run_unwise_gate.py --fetch --allow-dirty --max-new-cutouts 1 --n-controls 224 "
+    "--conformal-alpha 0.01 --cache-dir <temporary directory outside the repository>",
+    "catalog_stage": "16 patches, 3,390 Gaia M dwarfs and 33,910 AllWISE W3-band rows in the "
+    "cones, 881 joined candidates, 379 isolation queries; coadd_id returned for every "
+    "selected control",
+    "cutout_stage": "1 calibration cutout requested and parsed (10,666 bytes); no withheld "
+    "cutout was requested and nothing was frozen",
+    "cache": "isolated temporary --cache-dir, deleted after inspection; data/cache/unwise_w3/ "
+    "did not exist before or after",
+}
 ENDPOINTS = {
     "gaia_tap": {
         "url": ARI_TAP,
         "label": "ARI Heidelberg Gaia TAP (gaiadr3.gaia_source, gaiadr3.allwise_best_neighbour)",
-        "verified_live": "used unchanged by Gate #1 (b02ec7df820d) and v0.2.1 (9f3740ee71b0)",
+        "verified_live": True,
+        "verified_note": "used unchanged by Gate #1 (b02ec7df820d) and v0.2.1 (9f3740ee71b0); "
+        "cone, best-neighbour join and isolation queries re-verified by the v0.2.2-R4 smoke test",
     },
     "allwise_tap": {
         "url": IRSA_TAP,
         "label": "NASA/IPAC IRSA TAP (allwise_p3as_psd)",
-        "verified_live": "Gate #1 query; the added coadd_id column is NOT yet verified live",
+        "verified_live": True,
+        "verified_note": "Gate #1 query plus the coadd_id column: returned as text "
+        "(e.g. '1394p318_ac51') for every row by the v0.2.2-R4 smoke test",
     },
     "unwise_cutout": {
         "service": "unwise.me cutout service, Lang (2014) unWISE coadds, release 'allwise' "
@@ -181,20 +208,31 @@ ENDPOINTS = {
         },
         "expected_reply": "gzipped tar archive holding one img-m / invvar-m FITS pair per "
         "overlapping tile, cut from the coadd on its native pixel grid (no resampling), "
-        "each with a TAN WCS",
+        "each with a TAN WCS; live, the img-m member is a plain .fits and the invvar-m "
+        "member a gzipped .fits.gz (both accepted by the parser)",
         "tile_choice": "the pair whose tile is the AllWISE coadd_id[:8] of the star when it "
         "covers the star with the required margin, otherwise the pair with the largest "
         "margin; a reply with no such pair is recorded as unusable, never resampled",
         "native_pixel_check": "the WCS pixel scale must be 2.75 arcsec within 1e-3, else the "
         "cutout is refused",
-        "verified_live": False,
-        "assumptions_to_ratify": [
+        "verified_live": True,
+        "verified_by_smoke_test": [
             "host and path https://unwise.me/cutout_fits answer over TLS",
-            "query keys version / ra / dec / size / bands / file_img_m / file_invvar_m",
-            "'size' is in pixels and 45 is within the service limit",
-            "the reply is a (gzipped) tar whose members are named "
-            "unwise-<RRRRsDDD>-w3-{img,invvar}-m.fits[.gz]",
-            "invvar-m is the per-pixel inverse variance of the img-m coadd in the same units",
+            "query keys version / ra / dec / size / bands / file_img_m / file_invvar_m are "
+            "honoured: size=45 returned a 45 x 45 pixel W3 cutout",
+            "the reply is a gzipped tar with members unwise-1394p318-w3-img-m.fits and "
+            "unwise-1394p318-w3-invvar-m.fits.gz",
+            "the tile name equals the first 8 characters of the star's AllWISE coadd_id "
+            "(1394p318_ac51)",
+            "both members carry the same RA---TAN / DEC--TAN WCS with CD = 2.75 arcsec per "
+            "pixel (measured 2.7500000 arcsec), 32-bit floats, MAGZP 22.5",
+            "invvar-m is finite and strictly positive on every pixel of the cutout",
+        ],
+        "documented_not_live_verifiable": [
+            "invvar-m is the per-pixel inverse variance of the img-m coadd in the same units "
+            "(Lang 2014); a transport test cannot confirm its calibration",
+            "one cutout was fetched, so a reply spanning several tiles was not exercised "
+            "live (the parser's tile choice is covered by the offline tests)",
         ],
     },
     "fallbacks": {
@@ -255,6 +293,11 @@ CAVEATS = [
     "SNR_eff = w3snr / (1 - f_bg) assumes background-limited photometry of the blend; w3snr "
     "is the AllWISE catalog value, not re-measured on unWISE",
     "epoch propagation uses proper motion only; the coadd mean epoch is taken as 2010.5",
+    "ruling v0.2.2-R3: the conformal screens request --conformal-alpha (default 0.01, "
+    "attainable only with at least 99 evaluated calibration stars); when the calibration "
+    "half cannot attain the request the frozen level is the smallest attainable one, "
+    "1 / (n_cal + 1), flagged by frozen_screens.conformal_alpha_fallback with the request "
+    "kept in conformal_alpha_requested",
 ]
 
 
@@ -1124,6 +1167,7 @@ def run_gate(
             locked.sigma_sys,
             target_false_alarm=args.target_false_alarm,
             conformal_alpha=args.conformal_alpha,
+            allow_conformal_fallback=True,  # ruling v0.2.2-R3, recorded in the frozen state
         ).seal(clock())
         cache.write_once(
             FROZEN_NAME,
@@ -1173,6 +1217,13 @@ def run_gate(
             f"{sc['alpha_guaranteed']:.4f}"
         )
         print(f"      {name}: threshold {sc['threshold']:.2f} ({extra})")
+    if frozen.conformal_fallback:
+        print(
+            f"      v0.2.2-R3 FALLBACK: conformal alpha = {frozen.alpha_requested:g} needs "
+            f"n_cal >= {math.ceil(1.0 / frozen.alpha_requested - 1e-9) - 1}; only "
+            f"{len(frozen.star_ids)} calibration stars were evaluated, so the conformal "
+            f"screens are frozen at 1 / (n_cal + 1) = {frozen.conformal_alpha:.5f}"
+        )
 
     print("  [stage 2] Withheld cutouts (after the freeze), then the two-arm injection ...")
     wh = fetch_split(
@@ -1660,7 +1711,12 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--fetch", action="store_true", help="LIVE archive queries (opt-in)")
     mode.add_argument("--promote-from", type=Path, default=None, metavar="RECEIPT")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--n-controls", type=int, default=160, help="target number of controls")
+    ap.add_argument(
+        "--n-controls",
+        type=int,
+        default=DEFAULT_N_CONTROLS,
+        help="target number of controls (v0.2.2-R3: 14 per patch over 16 patches)",
+    )
     ap.add_argument("--n-patches", type=int, default=16)
     ap.add_argument("--patch-radius-deg", type=float, default=2.0)
     ap.add_argument("--min-abs-b", type=float, default=30.0)
@@ -1675,7 +1731,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--conformal-alpha",
         type=float,
         default=uf.DEFAULT_CONFORMAL_ALPHA,
-        help="nominal level of the conformal screens; the frozen level is (k+1)/(n_cal+1)",
+        help="requested level of the conformal screens; the frozen level is (k+1)/(n_cal+1), "
+        "or the fallback 1/(n_cal+1) when n_cal cannot attain the request (v0.2.2-R3)",
     )
     ap.add_argument("--cutout-size-pix", type=int, default=45)
     ap.add_argument("--rehearsal-stars", type=int, default=100, help="dry-run sample size")

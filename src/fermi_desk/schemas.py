@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -1630,8 +1631,18 @@ class UnwiseCalibrationNulls(_Frozen):
 
 
 class UnwiseFrozenScreens(_Frozen):
+    """Frozen thresholds and the calibration nulls they follow from.
+
+    ``conformal_alpha_nominal`` is the level the conformal screens were frozen at. It equals
+    ``conformal_alpha_requested`` unless ``conformal_alpha_fallback`` is set (ruling
+    v0.2.2-R3): then the calibration half was too small to attain the request and the frozen
+    level is the smallest attainable one, ``1 / (n_cal + 1)``.
+    """
+
     target_false_alarm: float = Field(gt=0, lt=1)
     conformal_alpha_nominal: float = Field(gt=0, lt=1)
+    conformal_alpha_requested: float = Field(gt=0, lt=1)
+    conformal_alpha_fallback: bool
     locked_sigma_sys_arcsec: float = Field(gt=0)
     fresh_sigma_sys: dict
     screens: UnwiseScreens
@@ -1823,6 +1834,19 @@ class UnwiseGateWithheldFile(_Frozen):
             sc = getattr(fz.screens, name)
             if sc.n_calibration != n_cal or sc.alpha_nominal != fz.conformal_alpha_nominal:
                 raise ProvenanceError(f"{name} was not frozen on the stored calibration nulls")
+        requested, nominal = fz.conformal_alpha_requested, fz.conformal_alpha_nominal
+        attainable = math.floor(requested * (n_cal + 1) + 1e-9) >= 1
+        if fz.conformal_alpha_fallback:
+            if attainable or abs(nominal - 1.0 / (n_cal + 1)) > 1e-12:
+                raise ProvenanceError(
+                    "conformal fallback (v0.2.2-R3) is only valid when the requested alpha is "
+                    "unattainable, and then the frozen level must be exactly 1 / (n_cal + 1)"
+                )
+        elif nominal != requested:
+            raise ProvenanceError(
+                "conformal_alpha_nominal differs from conformal_alpha_requested without the "
+                "v0.2.2-R3 fallback flag"
+            )
         if self.empirical_psf.pixel_scale_arcsec != self.geometry.get("pixel_scale_arcsec"):
             raise SchemaValidationError("geometry and PSF disagree on the pixel scale")
         # The fresh sample: declared high-latitude patches, a 50/50 split, every evaluated

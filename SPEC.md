@@ -423,11 +423,14 @@ archive is queried and nothing is promoted until `v0.2.2b`.
   - *Screen B* `image_gls_chi2`: the same statistic after Cholesky whitening of data and
     templates (sky projected out in the whitened space), same threshold rule.
   - *Screen C* `image_scalar_conformal`: the scalar statistic against the `(k+1)`-th largest
-    leave-one-out calibration null, `k = floor(alpha (n_cal + 1)) - 1` (default `alpha = 0.02`).
-    A new exchangeable null exceeds it with probability exactly `(k + 1) / (n_cal + 1)`, with
-    no tail-shape assumption; `alpha < 1 / (n_cal + 1)` is refused as unattainable. The level
-    is marginal over calibration draws; given one frozen threshold the realised rate follows
-    `Beta(k + 1, n_cal - k)`.
+    leave-one-out calibration null, `k = floor(alpha (n_cal + 1)) - 1` (default `alpha = 0.01`,
+    ruling v0.2.2-R3). A new exchangeable null exceeds it with probability exactly
+    `(k + 1) / (n_cal + 1)`, with no tail-shape assumption. The kernel refuses
+    `alpha < 1 / (n_cal + 1)` as unattainable; the live script instead freezes at the smallest
+    attainable level `1 / (n_cal + 1)` and records `conformal_alpha_requested` and
+    `conformal_alpha_fallback` (decided on the calibration half alone, before any withheld
+    cutout is requested). The level is marginal over calibration draws; given one frozen
+    threshold the realised rate follows `Beta(k + 1, n_cal - k)`.
   - `image_gls_conformal` (GLS statistic, conformal threshold) is predeclared as a secondary
     screen so the fourth corner of the 2x2 is never evaluated post hoc.
   - Reference screens as in Gate #2: the centroid screen at the **locked** `0.4356"` floor and,
@@ -450,9 +453,13 @@ archive is queried and nothing is promoted until `v0.2.2b`.
   threshold and every withheld summary from the stored per-star arrays. Promotion refuses a
   dirty commit, a synthetic payload, any leakage violation, fewer than 60 evaluated stars in
   either half, or an output of 5 MB or more.
-- **Open before `v0.2.2b`:** the unWISE cutout endpoint and reply format are documented
-  assumptions (`ENDPOINTS` in the script, `verified_live: False`); a `<= 1%` conformal level
-  needs `n_cal >= 99`.
+- **Live transport (ruling v0.2.2-R4, `v0.2.2b-prep`).** A one-cutout smoke test into a
+  temporary cache outside the repository verified ARI Gaia TAP, IRSA `allwise_p3as_psd`
+  (including `coadd_id`) and `https://unwise.me/cutout_fits` (gzipped tar,
+  `unwise-<tile>-w3-img-m.fits` + `unwise-<tile>-w3-invvar-m.fits.gz`, TAN WCS at the native
+  2.75 arcsec per pixel); `ENDPOINTS` in the script records it (`verified_live: True`,
+  `LIVE_SMOKE_TEST`). Live defaults (ruling v0.2.2-R3): 224 target controls over the 16
+  patches (`n_cal >= 100`, `n_withheld >= 100`) and conformal `alpha = 0.01`.
 
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the

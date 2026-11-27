@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 import astropy.units as u
@@ -17,6 +17,7 @@ from pydantic import (
 )
 
 from fermi_desk.errors import (
+    LeakageError,
     MergePolicyError,
     ProvenanceError,
     SchemaValidationError,
@@ -309,6 +310,11 @@ class InfraredSpec(_Frozen):
     # (reproduced_archive), pinned by file SHA-256 the same way.
     fits_gate2_path: str | None = None
     fits_gate2_sha256: str | None = None
+    # v0.2.2: frozen-method blend screens on unsmoothed unWISE W3 coadds of a FRESH control
+    # sample (UnwiseGateWithheldFile, reproduced_archive), pinned by file SHA-256. Unset
+    # until scripts/run_unwise_gate.py --promote-from has produced the artifact (v0.2.2b).
+    unwise_gate_path: str | None = None
+    unwise_gate_sha256: str | None = None
 
     @model_validator(mode="after")
     def _unique_ids(self) -> InfraredSpec:
@@ -327,6 +333,15 @@ class InfraredSpec(_Frozen):
             raise ProvenanceError("fits_gate2_sha256 must be a 64-hex SHA-256")
         if self.fits_gate2_path is not None and self.sigma_sys_calibration_path is None:
             raise ProvenanceError("fits_gate2 requires the locked sigma_sys calibration it froze")
+        if (self.unwise_gate_path is None) != (self.unwise_gate_sha256 is None):
+            raise ProvenanceError("unwise_gate_path and unwise_gate_sha256 must be given together")
+        if self.unwise_gate_sha256 is not None and not _SHA256_RE.match(self.unwise_gate_sha256):
+            raise ProvenanceError("unwise_gate_sha256 must be a 64-hex SHA-256")
+        if self.unwise_gate_path is not None and self.sigma_sys_calibration_path is None:
+            raise ProvenanceError(
+                "unwise_gate requires the locked sigma_sys calibration its fresh sample is "
+                "disjoint from"
+            )
         return self
 
 
@@ -1283,5 +1298,601 @@ class BackgroundSummaryFile(_Frozen):
                 raise ProvenanceError(
                     f"reproduced_archive summary needs a validation sample of at least "
                     f"{BACKGROUND_VALIDATION_SAMPLE} background stars"
+                )
+        return self
+
+
+# --------------------------- unsmoothed unWISE W3 gate on a fresh split (v0.2.2)
+UNWISE_GATE_PATH = "data/calibrations/unwise_w3_gate_withheld.json"
+UNWISE_GATE_MAX_BYTES = 5 * 1024 * 1024  # promoted artifact must stay strictly below
+UNWISE_GATE_MIN_SPLIT = 60  # evaluated stars required in EACH half of a promoted run
+UNWISE_GATE_MIN_ABS_B_DEG = 30.0
+UNWISE_GATE_MIN_LOCKED_SEPARATION_DEG = 15.0
+UNWISE_PIXEL_SCALE_ARCSEC = 2.75
+# Must equal fermi_desk.models.unwise_fits.SCREENS / STATISTICS (asserted in the tests).
+UNWISE_SCREENS: tuple[str, ...] = (
+    "centroid_locked",
+    "centroid_fresh",
+    "image_scalar_chi2",
+    "image_gls_chi2",
+    "image_scalar_conformal",
+    "image_gls_conformal",
+    "naive_flux_excess",
+)
+UNWISE_STATISTICS: tuple[str, ...] = (
+    "centroid_offset_arcsec",
+    "delta_chi2_scalar",
+    "delta_chi2_gls",
+    "flux_ratio",
+)
+Split = Literal["calibration", "withheld"]
+Pair = tuple[float, float]
+
+
+def _utc(value: str, name: str) -> datetime:
+    """An ISO-8601 timestamp as an aware UTC datetime (naive values are read as UTC)."""
+    t = datetime.fromisoformat(_iso_utc(value, name))
+    return t.replace(tzinfo=UTC) if t.tzinfo is None else t.astimezone(UTC)
+
+
+class UnwiseLockedInputs(_Frozen):
+    """The locked Gate #1 file the fresh sample was checked against (never modified)."""
+
+    sigma_sys_calibration_path: str = Field(min_length=1)
+    sigma_sys_calibration_sha256: str
+    sigma_sys_arcsec: float = Field(gt=0)
+    n_locked_stars: int = Field(ge=1)
+    n_locked_patches: int = Field(ge=1)
+
+    @field_validator("sigma_sys_calibration_sha256")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        if not _SHA256_RE.match(v):
+            raise ProvenanceError("locked sigma_sys_calibration_sha256 must be a 64-hex SHA-256")
+        return v
+
+
+class UnwisePatch(_Frozen):
+    patch_id: str = Field(min_length=1)
+    l_deg: float
+    b_deg: float
+    ra_deg: float
+    dec_deg: float
+    radius_deg: float = Field(gt=0)
+    nearest_locked_patch_id: str = Field(min_length=1)
+    nearest_locked_patch_separation_deg: float = Field(ge=0)
+    gaia_adql: str = Field(min_length=1)
+    allwise_adql: str = Field(min_length=1)
+    cut_counts: dict[str, int]
+
+
+class UnwiseControl(_Frozen):
+    """One fresh control star. Its Gaia id is a decimal string (ruling v0.2.1-R4)."""
+
+    gaia_dr3_source_id: GaiaSourceIdStr
+    allwise: str = Field(min_length=1)
+    coadd_id: str | None = None
+    patch_id: str = Field(min_length=1)
+    split: Split
+    l_deg: float
+    b_deg: float
+    gaia_ra_epoch_wise_deg: float
+    gaia_dec_epoch_wise_deg: float
+    phot_g_mean_mag: float
+    bp_rp: float
+    parallax_mas: float = Field(gt=0)
+    ruwe: float = Field(lt=1.4)
+    w3snr: float = Field(ge=8.0, le=20.0)
+    w3mpro: float
+    cc_flags: Literal["0000"]
+    ext_flg: Literal[0]
+    n_gaia_neighbours: Literal[0]
+
+
+class UnwiseSample(_Frozen):
+    patches: list[UnwisePatch] = Field(min_length=1)
+    controls: list[UnwiseControl] = Field(min_length=2)
+    selection: dict
+    cut_counts_total: dict[str, int]
+
+
+class UnwiseCutoutFile(_Frozen):
+    gaia_dr3_source_id: GaiaSourceIdStr
+    split: Split
+    url: str = Field(min_length=1)
+    sha256: str
+    bytes: int = Field(ge=1)
+    fetched_at_utc: str
+    cached: bool
+    tile: str = Field(min_length=1)
+    shape: tuple[int, int]
+    gaia_xy: Pair
+    pixel_scale_measured_arcsec: float = Field(gt=0)
+    code_git_sha: str
+
+    @model_validator(mode="after")
+    def _contract(self) -> UnwiseCutoutFile:
+        if not _SHA256_RE.match(self.sha256):
+            raise ProvenanceError("every fetched cutout needs a 64-hex sha256")
+        _iso_utc(self.fetched_at_utc, f"fetch.files[{self.gaia_dr3_source_id}].fetched_at_utc")
+        return self
+
+
+class UnwiseFetch(_Frozen):
+    service: str = Field(min_length=1)
+    url_template: str = Field(min_length=1)
+    cutout_size_pix: int = Field(ge=1)
+    n_requested: int = Field(ge=1)
+    n_ok: int = Field(ge=0)
+    n_failed: int = Field(ge=0)
+    files: list[UnwiseCutoutFile]
+    failures: list[dict]
+    cache_manifest_sha256: str
+
+    @model_validator(mode="after")
+    def _counts(self) -> UnwiseFetch:
+        if self.n_ok + self.n_failed != self.n_requested:
+            raise SchemaValidationError("fetch counts do not add up")
+        if len(self.files) != self.n_ok or len(self.failures) != self.n_failed:
+            raise SchemaValidationError("fetch.files / fetch.failures disagree with the counts")
+        if not _SHA256_RE.match(self.cache_manifest_sha256):
+            raise ProvenanceError("fetch.cache_manifest_sha256 must be a 64-hex SHA-256")
+        return self
+
+
+class UnwisePSF(_Frozen):
+    stamp: list[list[float]] = Field(min_length=3)
+    stamp_half_pix: int = Field(ge=1)
+    pixel_scale_arcsec: float = Field(gt=0)
+    n_stars: int = Field(ge=5)
+    star_ids: list[GaiaSourceIdStr]
+    excluded: list[dict]
+    fwhm_gaussian_arcsec: float = Field(gt=0)
+    fwhm_halfmax_arcsec: float = Field(gt=0)
+    halfmax_oversample: int = Field(ge=1)
+    nominal_fwhm_arcsec: float = Field(gt=0)
+    construction: str
+
+    @model_validator(mode="after")
+    def _shape(self) -> UnwisePSF:
+        n = 2 * self.stamp_half_pix + 1
+        if len(self.stamp) != n or any(len(r) != n for r in self.stamp):
+            raise SchemaValidationError("PSF stamp shape disagrees with stamp_half_pix")
+        if len(self.star_ids) != self.n_stars:
+            raise SchemaValidationError("PSF n_stars disagrees with star_ids")
+        return self
+
+
+class UnwiseNoiseModel(_Frozen):
+    """Frozen stationary pixel-noise covariance (units of the per-cutout scalar variance)."""
+
+    n_torus: int = Field(ge=4)
+    max_lag_pix: int = Field(ge=1)
+    torus_covariance: list[list[float]]
+    raw_lag_covariance: list[list[float]]
+    n_pairs: list[list[float]]
+    n_cutouts: int = Field(ge=1)
+    star_ids: list[GaiaSourceIdStr]
+    shrinkage: float = Field(gt=0, lt=1)
+    power_floor: float = Field(gt=0)
+    clip_sigma: float = Field(gt=0)
+    taper_flat_fraction: float = Field(ge=0, le=1)
+    variance_inflation: float = Field(gt=0)
+    correlation_lag1: Pair
+    raw_correlation_lag1: Pair
+    minimum_eigenvalue_bound: float
+    construction: str
+
+    @model_validator(mode="after")
+    def _contract(self) -> UnwiseNoiseModel:
+        n, m = self.n_torus, 2 * self.max_lag_pix + 1
+        if _shape_of(self.torus_covariance) != (n, n):
+            raise SchemaValidationError("torus_covariance is not n_torus x n_torus")
+        if _shape_of(self.raw_lag_covariance) != (m, m) or _shape_of(self.n_pairs) != (m, m):
+            raise SchemaValidationError("lag tables are not (2 max_lag + 1) square")
+        if n < 4 * self.max_lag_pix + 2:
+            raise SchemaValidationError("torus is too small to hold every lag unaliased")
+        if len(self.star_ids) != self.n_cutouts:
+            raise SchemaValidationError("noise-model n_cutouts disagrees with star_ids")
+        if self.variance_inflation != self.torus_covariance[0][0]:
+            raise SchemaValidationError("variance_inflation must equal torus_covariance[0][0]")
+        # Strict positive definiteness: the smallest eigenvalue of the circulant covariance
+        # bounds every per-star matrix from below, and shrinkage guarantees shrinkage * V(0).
+        floor = self.shrinkage * self.variance_inflation
+        if not self.minimum_eigenvalue_bound >= floor * (1.0 - 1e-9):
+            raise ProvenanceError(
+                f"pixel covariance is not strictly positive definite: minimum eigenvalue "
+                f"{self.minimum_eigenvalue_bound} < shrinkage * V(0) = {floor}"
+            )
+        return self
+
+
+class UnwiseCentroidScreen(_Frozen):
+    role: str
+    statistic: Literal["centroid_offset_arcsec"]
+    sigma_sys_arcsec: float = Field(ge=0)
+    sigma_sys_source: Literal["locked", "fresh_calibration_half"]
+    sigma_stat_rule: str
+    target_false_alarm: float = Field(gt=0, lt=1)
+    multiplier: float = Field(gt=0)
+    threshold_arcsec_at_calibration_median_snr: float = Field(gt=0)
+    calibration_median_snr: float = Field(gt=0)
+
+
+class UnwiseChi2Screen(_Frozen):
+    role: str
+    statistic: Literal["delta_chi2_scalar", "delta_chi2_gls"]
+    calibration_scores: str
+    chi2_dof: Literal[3]
+    scale_rule: str
+    target_false_alarm: float = Field(gt=0, lt=1)
+    delta_chi2_scale: float = Field(gt=0)
+    threshold: float = Field(gt=0)
+
+
+class UnwiseConformalScreen(_Frozen):
+    """Distribution-free order-statistic threshold with its exact finite-sample level.
+
+    The threshold is the ``(k+1)``-th largest of ``n_calibration`` leave-one-out calibration
+    nulls. For exchangeable continuous scores a new null exceeds it with probability
+    ``alpha_guaranteed = (k + 1) / (n_calibration + 1)`` exactly, and ``k`` is the largest
+    integer keeping that at or below ``alpha_nominal``.
+    """
+
+    role: str
+    statistic: Literal["delta_chi2_scalar", "delta_chi2_gls"]
+    calibration_scores: str
+    rule: str
+    alpha_nominal: float = Field(gt=0, lt=1)
+    n_calibration: int = Field(ge=1)
+    k_exceedances: int = Field(ge=0)
+    order_statistic_rank_from_top: int = Field(ge=1)
+    alpha_guaranteed: float = Field(gt=0, lt=1)
+    threshold: float
+    n_calibration_strictly_above: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _finite_sample_level(self) -> UnwiseConformalScreen:
+        k, n = self.k_exceedances, self.n_calibration
+        if self.order_statistic_rank_from_top != k + 1 or k + 1 > n:
+            raise SchemaValidationError("order_statistic_rank_from_top must equal k + 1 <= n_cal")
+        if abs(self.alpha_guaranteed - (k + 1) / (n + 1)) > 1e-12:
+            raise ProvenanceError(
+                f"alpha_guaranteed {self.alpha_guaranteed} != (k + 1) / (n_cal + 1) = "
+                f"{(k + 1) / (n + 1)}"
+            )
+        if self.alpha_guaranteed > self.alpha_nominal + 1e-9:
+            raise ProvenanceError("conformal level exceeds the nominal alpha it was frozen for")
+        if (k + 2) / (n + 1) <= self.alpha_nominal + 1e-9:
+            raise ProvenanceError("k is not the largest order statistic attaining alpha_nominal")
+        if self.n_calibration_strictly_above > k:
+            raise ProvenanceError("more calibration nulls exceed the threshold than k allows")
+        return self
+
+
+class UnwiseNaiveScreen(_Frozen):
+    role: str
+    statistic: Literal["flux_ratio"]
+    rule: str
+
+
+class UnwiseScreens(_Frozen):
+    """Every frozen screen of rule version ``unwise-gate-v1`` (all seven are required)."""
+
+    centroid_locked: UnwiseCentroidScreen
+    centroid_fresh: UnwiseCentroidScreen
+    image_scalar_chi2: UnwiseChi2Screen
+    image_gls_chi2: UnwiseChi2Screen
+    image_scalar_conformal: UnwiseConformalScreen
+    image_gls_conformal: UnwiseConformalScreen
+    naive_flux_excess: UnwiseNaiveScreen
+
+    @model_validator(mode="after")
+    def _statistics(self) -> UnwiseScreens:
+        want = {
+            "image_scalar_chi2": "delta_chi2_scalar",
+            "image_gls_chi2": "delta_chi2_gls",
+            "image_scalar_conformal": "delta_chi2_scalar",
+            "image_gls_conformal": "delta_chi2_gls",
+        }
+        for name, stat in want.items():
+            if getattr(self, name).statistic != stat:
+                raise SchemaValidationError(f"screen {name} must threshold {stat}")
+        if self.centroid_locked.sigma_sys_source != "locked" or (
+            self.centroid_fresh.sigma_sys_source != "fresh_calibration_half"
+        ):
+            raise SchemaValidationError("centroid screens carry the wrong sigma_sys source")
+        return self
+
+
+class UnwiseCalibrationNulls(_Frozen):
+    """Per-star calibration statistics every threshold is re-derived from."""
+
+    star_ids: list[GaiaSourceIdStr] = Field(min_length=1)
+    patch_ids: list[str]
+    w3snr: list[float]
+    centroid_offset_arcsec: list[float]
+    delta_chi2_scalar: list[float]
+    delta_chi2_gls: list[float]
+    delta_chi2_scalar_loo: list[float]
+    delta_chi2_gls_loo: list[float]
+    fetched_at_utc: list[str]
+
+    @model_validator(mode="after")
+    def _lengths(self) -> UnwiseCalibrationNulls:
+        n = len(self.star_ids)
+        for name in type(self).model_fields:
+            if len(getattr(self, name)) != n:
+                raise SchemaValidationError(f"calibration.{name} disagrees with star_ids")
+        if len(set(self.star_ids)) != n:
+            raise SchemaValidationError("duplicate calibration star")
+        return self
+
+
+class UnwiseFrozenScreens(_Frozen):
+    target_false_alarm: float = Field(gt=0, lt=1)
+    conformal_alpha_nominal: float = Field(gt=0, lt=1)
+    locked_sigma_sys_arcsec: float = Field(gt=0)
+    fresh_sigma_sys: dict
+    screens: UnwiseScreens
+    snr_eff_rule: str
+    calibration: UnwiseCalibrationNulls
+    calibration_false_alarm_in_sample: dict
+
+
+class UnwiseRate(_Frozen):
+    k: int = Field(ge=0)
+    n: int = Field(ge=1)
+    rate: float = Field(ge=0, le=1)
+    clopper_pearson_95: Pair
+
+
+class UnwiseScreenSummary(_Frozen):
+    """Withheld result of one screen: null false alarms, Arm A and Arm B tables."""
+
+    role: str
+    n_stars: int = Field(ge=1)
+    null_false_alarm: UnwiseRate
+    arm_a_blend_recovery: list[list[float]]
+    arm_a_k: list[list[int]]
+    arm_a_clopper_pearson_95: list[list[Pair]]
+    arm_b_false_rejection: list[float]
+    arm_b_k: list[int]
+    arm_b_clopper_pearson_95: list[Pair]
+    arm_b_false_rejection_pooled: UnwiseRate
+    blend_survival_within_3p25_arcsec: float = Field(ge=0, le=1)
+    centered_excess_retained_pooled: float = Field(ge=0, le=1)
+
+
+class UnwiseSummary(_Frozen):
+    survival_max_separation_arcsec: float = Field(gt=0)
+    survival_weighting: str
+    flux_fractions: list[float]
+    screens: dict[str, UnwiseScreenSummary]
+
+    @model_validator(mode="after")
+    def _all_screens(self) -> UnwiseSummary:
+        if set(self.screens) != set(UNWISE_SCREENS):
+            raise SchemaValidationError(f"summary must cover exactly {UNWISE_SCREENS}")
+        return self
+
+
+class UnwiseWithheld(_Frozen):
+    rng_seed: int
+    rng: str
+    n_stars: int = Field(ge=1)
+    star_ids: list[GaiaSourceIdStr]
+    patch_ids: list[str]
+    fetched_at_utc: list[str]
+    w3snr: list[float]
+    reference_flux: list[float]
+    separations_arcsec: list[float] = Field(min_length=1)
+    flux_fractions: list[float] = Field(min_length=1)
+    injection: dict
+    statistics: dict[str, dict[str, list]]
+    excluded: list[dict]
+    summary: UnwiseSummary
+
+    @model_validator(mode="after")
+    def _shapes(self) -> UnwiseWithheld:
+        n, ns, nf = self.n_stars, len(self.separations_arcsec), len(self.flux_fractions)
+        for name in ("star_ids", "patch_ids", "fetched_at_utc", "w3snr", "reference_flux"):
+            if len(getattr(self, name)) != n:
+                raise SchemaValidationError(f"withheld.{name} disagrees with n_stars")
+        if len(set(self.star_ids)) != n:
+            raise SchemaValidationError("duplicate withheld star")
+        want = {"null": (n,), "arm_a": (n, ns, nf), "arm_b": (n, nf)}
+        if set(self.statistics) != set(want):
+            raise SchemaValidationError(f"withheld statistics must hold exactly {sorted(want)}")
+        for arm, shape in want.items():
+            block = self.statistics[arm]
+            if set(block) != set(UNWISE_STATISTICS):
+                raise SchemaValidationError(f"withheld {arm} must hold {UNWISE_STATISTICS}")
+            for key in UNWISE_STATISTICS:
+                if _shape_of(block[key]) != shape:
+                    raise SchemaValidationError(f"withheld {arm}.{key} is not shaped {shape}")
+        if self.summary.flux_fractions != self.flux_fractions:
+            raise SchemaValidationError("summary flux fractions disagree with the injection grid")
+        for name, sc in self.summary.screens.items():
+            if sc.n_stars != n or sc.null_false_alarm.n != n:
+                raise SchemaValidationError(f"summary of {name} covers a different star count")
+            if _shape_of(sc.arm_a_blend_recovery) != (ns, nf) or len(sc.arm_b_k) != nf:
+                raise SchemaValidationError(f"summary tables of {name} are mis-shaped")
+        return self
+
+
+class UnwiseGateWithheldFile(_Frozen):
+    """``UNWISE_GATE_PATH``: frozen-method blend screens on unsmoothed unWISE W3 (v0.2.2).
+
+    ``reproduced_archive`` files come from ``scripts/run_unwise_gate.py --promote-from``
+    only: clean commit, source receipt, at least ``UNWISE_GATE_MIN_SPLIT`` evaluated stars
+    in each half, native 2.75 arcsec pixels. ``synthetic_proxy`` files are the in-memory
+    dry-run rehearsal and offline test fixtures; they can never be promoted or pinned.
+
+    Zero leakage is part of the schema: every calibration cutout was fetched at or before
+    ``frozen_at_utc`` and every withheld cutout strictly after it (``LeakageError``
+    otherwise), the PSF and covariance stars are calibration stars, and the two halves share
+    no star. ``disjoint_from_gate1_sha256`` is the SHA-256 of the locked Gate #1 control file
+    the fresh sample was checked against (re-checked star by star by ``fermi-desk validate``).
+    """
+
+    id: str = Field(min_length=1)
+    schema_version: Literal[1]
+    data_tier: Literal["reproduced_archive", "synthetic_proxy"]
+    description: str = Field(min_length=1)
+    rule_version: str = Field(min_length=1)
+    code_git_sha: str
+    rng_seed: int
+    query_window_utc: tuple[str, str]
+    frozen_at_utc: str
+    frozen_state_sha256: str
+    frozen_before_withheld_fetch: bool
+    disjoint_from_gate1_sha256: str
+    locked_inputs: UnwiseLockedInputs
+    sample: UnwiseSample
+    endpoints: dict
+    fetch: UnwiseFetch
+    geometry: dict
+    empirical_psf: UnwisePSF
+    noise_model: UnwiseNoiseModel
+    frozen_screens: UnwiseFrozenScreens
+    withheld: UnwiseWithheld
+    config: dict
+    caveats: list[str]
+    source_receipt: SourceReceipt | None = None
+    content_sha256: str
+
+    @property
+    def n_calibration(self) -> int:
+        return len(self.frozen_screens.calibration.star_ids)
+
+    @property
+    def n_withheld(self) -> int:
+        return self.withheld.n_stars
+
+    @model_validator(mode="after")
+    def _zero_leakage(self) -> UnwiseGateWithheldFile:
+        cal, wh = self.frozen_screens.calibration, self.withheld
+        cal_ids, wh_ids = set(cal.star_ids), set(wh.star_ids)
+        if cal_ids & wh_ids:
+            raise LeakageError("calibration and withheld star sets overlap")
+        if not set(self.empirical_psf.star_ids) <= cal_ids:
+            raise LeakageError("empirical PSF uses stars outside the calibration split")
+        if not set(self.noise_model.star_ids) <= cal_ids:
+            raise LeakageError("pixel covariance uses stars outside the calibration split")
+        frozen = _utc(self.frozen_at_utc, "frozen_at_utc")
+        start, end = (_utc(t, "query_window_utc") for t in self.query_window_utc)
+        if not start <= frozen <= end:
+            raise ProvenanceError("frozen_at_utc lies outside the run window")
+        late = [t for t in cal.fetched_at_utc if _utc(t, "calibration fetched_at_utc") > frozen]
+        if late:
+            raise LeakageError(
+                f"{len(late)} calibration cutout(s) were fetched after frozen_at_utc: the "
+                "recorded freeze is not the freeze"
+            )
+        early = [t for t in wh.fetched_at_utc if _utc(t, "withheld fetched_at_utc") <= frozen]
+        if early:
+            raise LeakageError(
+                f"{len(early)} withheld cutout(s) were fetched at or before frozen_at_utc "
+                f"({min(early)} <= {self.frozen_at_utc})"
+            )
+        if not self.frozen_before_withheld_fetch:
+            raise LeakageError("frozen_before_withheld_fetch is false: the freeze did not hold")
+        return self
+
+    @model_validator(mode="after")
+    def _contract(self) -> UnwiseGateWithheldFile:
+        for name in ("content_sha256", "frozen_state_sha256", "disjoint_from_gate1_sha256"):
+            if not _SHA256_RE.match(getattr(self, name)):
+                raise ProvenanceError(f"{name} must be a 64-hex SHA-256")
+        li = self.locked_inputs
+        if self.disjoint_from_gate1_sha256 != li.sigma_sys_calibration_sha256:
+            raise ProvenanceError(
+                "disjoint_from_gate1_sha256 must be the SHA-256 of the locked sigma_sys "
+                "calibration named in locked_inputs"
+            )
+        fz, wh, sample = self.frozen_screens, self.withheld, self.sample
+        if fz.locked_sigma_sys_arcsec != li.sigma_sys_arcsec or (
+            fz.screens.centroid_locked.sigma_sys_arcsec != li.sigma_sys_arcsec
+        ):
+            raise ProvenanceError("the locked sigma_sys was not carried into the frozen screens")
+        if wh.rng_seed != self.rng_seed:
+            raise SchemaValidationError("withheld rng_seed disagrees with rng_seed")
+        n_cal = self.n_calibration
+        for name in ("image_scalar_conformal", "image_gls_conformal"):
+            sc = getattr(fz.screens, name)
+            if sc.n_calibration != n_cal or sc.alpha_nominal != fz.conformal_alpha_nominal:
+                raise ProvenanceError(f"{name} was not frozen on the stored calibration nulls")
+        if self.empirical_psf.pixel_scale_arcsec != self.geometry.get("pixel_scale_arcsec"):
+            raise SchemaValidationError("geometry and PSF disagree on the pixel scale")
+        # The fresh sample: declared high-latitude patches, a 50/50 split, every evaluated
+        # star a member with the right label.
+        patches = {p.patch_id: p for p in sample.patches}
+        if len(patches) != len(sample.patches):
+            raise SchemaValidationError("duplicate patch id")
+        for p in sample.patches:
+            if abs(p.b_deg) - p.radius_deg < UNWISE_GATE_MIN_ABS_B_DEG:
+                raise SchemaValidationError(
+                    f"patch {p.patch_id} cone reaches |b| < {UNWISE_GATE_MIN_ABS_B_DEG:g} deg"
+                )
+            if p.nearest_locked_patch_separation_deg < UNWISE_GATE_MIN_LOCKED_SEPARATION_DEG:
+                raise LeakageError(
+                    f"patch {p.patch_id} lies {p.nearest_locked_patch_separation_deg:.2f} deg "
+                    f"from a locked Gate #1 patch (< {UNWISE_GATE_MIN_LOCKED_SEPARATION_DEG:g})"
+                )
+        split = {c.gaia_dr3_source_id: c.split for c in sample.controls}
+        if len(split) != len(sample.controls):
+            raise SchemaValidationError("duplicate control star")
+        if any(
+            c.patch_id not in patches or abs(c.b_deg) <= UNWISE_GATE_MIN_ABS_B_DEG
+            for c in sample.controls
+        ):
+            raise SchemaValidationError("control outside a declared high-latitude patch")
+        n_first = sum(s == "calibration" for s in split.values())
+        if abs(2 * n_first - len(split)) > 1:
+            raise SchemaValidationError("calibration / withheld split is not 50/50")
+        for label, ids in (
+            ("calibration", fz.calibration.star_ids),
+            ("withheld", wh.star_ids),
+        ):
+            wrong = [s for s in ids if split.get(s) != label]
+            if wrong:
+                raise LeakageError(
+                    f"{len(wrong)} {label} star(s) are not {label} controls of the sample "
+                    f"(e.g. {wrong[0]})"
+                )
+        # Every evaluated star has its cutout record, with the same split and fetch time.
+        files = {f.gaia_dr3_source_id: f for f in self.fetch.files}
+        if len(files) != len(self.fetch.files) or self.fetch.n_requested != len(split):
+            raise SchemaValidationError("fetch records disagree with the sample")
+        for ids, times in (
+            (fz.calibration.star_ids, fz.calibration.fetched_at_utc),
+            (wh.star_ids, wh.fetched_at_utc),
+        ):
+            for sid, t in zip(ids, times, strict=True):
+                f = files.get(sid)
+                if f is None or f.split != split[sid]:
+                    raise ProvenanceError(f"star {sid} has no cutout record of its own split")
+                if _utc(f.fetched_at_utc, "fetch") != _utc(t, "fetched_at_utc"):
+                    raise ProvenanceError(f"star {sid}: fetch time disagrees with its record")
+        if self.data_tier == "reproduced_archive":
+            if not _GIT_SHA_RE.match(self.code_git_sha):
+                raise ProvenanceError(
+                    f"code_git_sha {self.code_git_sha!r} is not a clean 40-hex commit (dirty run?)"
+                )
+            shas = sorted({f.code_git_sha for f in self.fetch.files})
+            if any(not _GIT_SHA_RE.match(s) for s in shas):
+                raise ProvenanceError(f"cutouts were fetched from a non-clean tree: {shas}")
+            if self.source_receipt is None:
+                raise ProvenanceError("reproduced_archive unWISE gate needs its source_receipt")
+            if n_cal < UNWISE_GATE_MIN_SPLIT or wh.n_stars < UNWISE_GATE_MIN_SPLIT:
+                raise ProvenanceError(
+                    f"undersized split: {n_cal} calibration / {wh.n_stars} withheld stars "
+                    f"evaluated, at least {UNWISE_GATE_MIN_SPLIT} required in each half"
+                )
+            if abs(self.empirical_psf.pixel_scale_arcsec - UNWISE_PIXEL_SCALE_ARCSEC) > 1e-6:
+                raise ProvenanceError(
+                    f"reproduced_archive unWISE cutouts must be on the native "
+                    f"{UNWISE_PIXEL_SCALE_ARCSEC} arcsec pixels (no resampling)"
                 )
         return self

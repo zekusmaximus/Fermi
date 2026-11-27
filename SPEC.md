@@ -69,6 +69,8 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   │   ├── radio.py                # Breakthrough Listen 692-star forward model (flat & per-target EIRP), off-axis beam & background shells
 │   │   ├── infrared.py             # Mid-IR waste-heat & calibration-reversal forward model
 │   │   ├── hephaistos.py           # WISE centroid vs. image-level blend-recovery grid (M2)
+│   │   ├── hephaistos_fits.py      # Gate #2: frozen screens on real AllWISE W3 Atlas cutouts (v0.1.2, locked)
+│   │   ├── unwise_fits.py          # unsmoothed unWISE W3: GLS + conformal screens on a fresh split (v0.2.2)
 │   │   └── solar_system.py         # Local Solar System / ISO null-bound forward model
 │   ├── inference/
 │   │   ├── engine.py               # Joint likelihood engine + separate Earth-unreached conditioning
@@ -387,6 +389,71 @@ archive query window (`query_window_utc`, when cones were fetched) beside `assem
 that queried the archive, all clean). `fermi-desk validate` re-checks the pin, the schema, the
 seal and recomputes the validation sample and every suspected star's shell cell offline.
 
+**Unsmoothed unWISE W3 gate on a fresh split (v0.2.2; proposed for planning ratification).**
+Gate #2 failed its image-level screen on AllWISE Atlas coadds (13.69 arcsec empirical PSF,
+5/77 null false alarms, 0.934 blend survival). v0.2.2 repeats the two-arm protocol on
+unsmoothed unWISE W3 coadds (Lang 2014; native 2.75 arcsec pixels, never resampled) to
+separate two causes: Atlas smoothing, and the scalar-variance chi^2(3) cutoff. `v0.2.2a`
+ships the offline pipeline only (`models/unwise_fits.py`, `scripts/run_unwise_gate.py`); no
+archive is queried and nothing is promoted until `v0.2.2b`.
+
+- **Fresh sample, disjoint by construction.** Seeded patches (default 16, radius 2 deg) whose
+  whole cone lies at `|b| > 30 deg`, clear of LMC/SMC/M31, at least 20 deg apart and with
+  centres **at least 15 deg from every one of the 12 locked Gate #1 patches**. Control stars
+  pass the Gate #1 cuts unchanged (RUWE < 1.4, AllWISE W3 SNR in [8, 20], `cc_flags == '0000'`,
+  `ext_flg == 0`, no other Gaia DR3 source within 15 arcsec) and are split 50/50, stratified
+  by patch. Any `gaia_dr3_source_id` shared with `wise_sigma_sys_control.json` raises
+  `LeakageError`; the sample is drawn from catalogs only, before any image exists.
+- **Geometry.** Declared in arcsec and identical to Gate #2 (fit radius 16.5, sky beyond 22,
+  primary search +-2.75, secondary search 11). At the Atlas pixel scale the scalar statistic
+  reproduces Gate #2's `_ScreenBank` (unit-tested), so Screen A is a like-for-like control.
+- **Frozen on the calibration half only:** the empirical PSF (Gaussian-fit and half-max-area
+  FWHM), a stationary pixel-noise covariance, and every threshold.
+  - *PSF.* The Gate #2 recipe (sky-subtracted, windowed-centroid aligned, median-combined,
+    unit sum) with one change: each stamp is divided by its least-squares amplitude against
+    the nominal 6.5 arcsec Gaussian, not by its own summed flux. On 2.75 arcsec pixels that
+    sum is noise-dominated and discarding non-positive sums biases the stack (unit-tested).
+  - *Covariance.* Pooled, sigma-clipped autocovariance of the sky annulus (never the
+    PSF-subtracted core), in units of each cutout's scalar variance; cosine taper; power
+    spectrum clipped at `1e-3 V(0)` on a torus; shrinkage `0.05` towards white noise. Every
+    per-star `Sigma = var_star * V` is a principal submatrix of that circulant covariance, so
+    its eigenvalues are `>= 0.05 V(0) var_star`: strictly positive definite and deterministic.
+  - *Screen A* `image_scalar_chi2`: scalar-variance profile Delta chi^2, threshold
+    `s * chi2.isf(0.0027, 3)` with the median-matched `s` (the Gate #2 rule, verbatim).
+  - *Screen B* `image_gls_chi2`: the same statistic after Cholesky whitening of data and
+    templates (sky projected out in the whitened space), same threshold rule.
+  - *Screen C* `image_scalar_conformal`: the scalar statistic against the `(k+1)`-th largest
+    leave-one-out calibration null, `k = floor(alpha (n_cal + 1)) - 1` (default `alpha = 0.02`).
+    A new exchangeable null exceeds it with probability exactly `(k + 1) / (n_cal + 1)`, with
+    no tail-shape assumption; `alpha < 1 / (n_cal + 1)` is refused as unattainable. The level
+    is marginal over calibration draws; given one frozen threshold the realised rate follows
+    `Beta(k + 1, n_cal - k)`.
+  - `image_gls_conformal` (GLS statistic, conformal threshold) is predeclared as a secondary
+    screen so the fourth corner of the 2x2 is never evaluated post hoc.
+  - Reference screens as in Gate #2: the centroid screen at the **locked** `0.4356"` floor and,
+    side by side, at a floor re-measured on this calibration half (the locked Gate #1 value is
+    never overwritten), plus the adversarial `naive_flux_excess` rule.
+- **Zero-leakage state machine.** Fitting steps refuse any non-calibration cutout. A frozen
+  state must be sealed with a UTC time no earlier than its newest calibration cutout; withheld
+  evaluation refuses an unsealed state, a withheld cutout without a fetch time or with one at
+  or before the seal, and any star shared with the calibration set (`LeakageError` throughout).
+  A live run is two physical stages: catalog + calibration cutouts, then an immutable
+  `frozen_calibration_state.json` (UTC + SHA-256, never rewritten, reused verbatim on resume),
+  and only then the withheld cutouts.
+- **Artifact and validation.** `data/calibrations/unwise_w3_gate_withheld.json`
+  (`UnwiseGateWithheldFile`, `< 5 MB`, Gaia ids as strings per v0.2.1-R4,
+  `frozen_before_withheld_fetch`, `disjoint_from_gate1_sha256` = SHA-256 of the locked Gate #1
+  file) is pinned by `infrared.unwise_gate_path` / `unwise_gate_sha256`. `fermi-desk validate`
+  reports `unwise_gate_promotion`: "not promoted yet" while unpinned; once pinned it enforces
+  the SHA-256, the timestamp ordering, zero id overlap with and `>= 15 deg` from the locked
+  sample, and re-derives PSF widths, the covariance and its positive-definiteness bound, every
+  threshold and every withheld summary from the stored per-star arrays. Promotion refuses a
+  dirty commit, a synthetic payload, any leakage violation, fewer than 60 evaluated stars in
+  either half, or an output of 5 MB or more.
+- **Open before `v0.2.2b`:** the unWISE cutout endpoint and reply format are documented
+  assumptions (`ENDPOINTS` in the script, `verified_live: False`); a `<= 1%` conformal level
+  needs `n_cal >= 99`.
+
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
 Bailer-Jones DR2 distance (752.61 pc, ~1,071x) is the historical Wlodarczyk-Sroka
@@ -490,6 +557,9 @@ linked evidence (`fermi-desk background-field`, `GET /api/queue`).
    `atlas_smoothing_caveat` in `ir-drilldown` receipts). Re-measure the same controls on
    unWISE coadds (native, unblurred PSF) and report both floors side by side; never
    overwrite the locked Atlas artifact.
+   **Offline pipeline implemented in v0.2.2a** (Sec. 4.3 "Unsmoothed unWISE W3 gate", proposed
+   for planning ratification), on a fresh sample rather than the locked 154 stars so that the
+   image screens are also tested out of sample; the live fetch and promotion are `v0.2.2b`.
 
 ### v0.1.2: Public-Launch Gate #2 (brief: `docs/V0_1_2_GATE_2.md`)
 - Frozen-method real AllWISE W3 FITS blend screens on the 154 locked controls: empirical

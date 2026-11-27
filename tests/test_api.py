@@ -82,7 +82,7 @@ def test_health_reports_provenance(client):
     assert h["catalog_sha256"].startswith("c299d61d")
     assert h["wise_calibration_sha256"].startswith("2da2a234")
     assert h["receipt_schema_version"] == 5 and h["git_sha"]
-    assert h["version"] == "0.2.1"  # v0.2.0-R6: one version string everywhere
+    assert h["version"] == "0.2.2"  # v0.2.0-R6: one version string everywhere
     # v0.1.2: live control-sample provenance, read from the verified calibration files.
     assert (h["n_controls"], h["n_calibration"], h["n_withheld"]) == (154, 77, 77)
     assert h["calibration_data_tier"] == "reproduced_archive"
@@ -664,7 +664,7 @@ def test_version_is_synchronised_across_pyproject_package_and_api(client, env):
 
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
     declared = pyproject["project"]["version"]
-    assert declared == "0.2.1"
+    assert declared == "0.2.2"
     assert fermi_desk.__version__ == declared
     assert installed_version("fermi-desk") == declared, "stale install: run `uv sync`"
     assert client.app.version == declared

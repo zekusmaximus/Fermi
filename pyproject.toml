@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "fermi-desk"
 # Single source of truth for the version: fermi_desk.__version__ and the FastAPI app read it.
-version = "0.2.1"
+version = "0.2.2"
 description = "Executable empirical constraint engine and Bayesian Optimal Experimental Design (BOED) desk for the Fermi paradox."
 readme = "README.md"
 license = { file = "LICENSE" }

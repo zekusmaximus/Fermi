@@ -28,7 +28,7 @@ from fermi_desk.errors import (
     SchemaValidationError,
     UnitValidationError,
 )
-from fermi_desk.models import hephaistos, hephaistos_fits, radio
+from fermi_desk.models import hephaistos, hephaistos_fits, radio, unwise_fits
 from fermi_desk.models.expansion import DISK_PROFILES, FINITE_DISK, ExpansionModel
 from fermi_desk.schemas import (
     BACKGROUND_SUMMARY_MAX_BYTES,
@@ -36,6 +36,10 @@ from fermi_desk.schemas import (
     POINTING_MERGE_POLICIES,
     REJECT_DUPLICATE_POINTING_GROUP,
     UNION_TARGETS_BY_POINTING,
+    UNWISE_GATE_MAX_BYTES,
+    UNWISE_GATE_MIN_ABS_B_DEG,
+    UNWISE_GATE_MIN_LOCKED_SEPARATION_DEG,
+    UNWISE_GATE_PATH,
     BackgroundSummaryFile,
     Hypothesis,
     MergeProvenance,
@@ -43,6 +47,7 @@ from fermi_desk.schemas import (
     PointingCorrectionsFile,
     SigmaSysCalibrationFile,
     Survey,
+    UnwiseGateWithheldFile,
     WiseFitsGate2File,
     validate_pointing_merge_policy,
 )
@@ -1965,6 +1970,214 @@ def load_fits_gate2(survey: Survey, root: Path) -> FitsGate2Result | None:
     return FitsGate2Result(survey.id, ir.fits_gate2_path, sha, rec)
 
 
+# ------------------------- unsmoothed unWISE W3 gate on a fresh split (v0.2.2)
+def seal_unwise_gate(doc: Mapping) -> dict:
+    """Return ``doc`` with ``content_sha256`` (re)computed over everything else."""
+    body = {k: v for k, v in doc.items() if k != "content_sha256"}
+    return {**body, "content_sha256": _canonical_sha256(body)}
+
+
+def unwise_gate_bytes(doc: Mapping) -> bytes:
+    """Canonical on-disk serialisation (compact separators; the 5 MB budget is for these bytes)."""
+    return (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def locked_gate1_centres(locked: SigmaSysCalibration) -> tuple[list[str], SkyCoord]:
+    """Ids and Galactic centres of the locked Gate #1 patches (read-only)."""
+    patches = locked.record.patches
+    centres = SkyCoord(
+        l=[p.l_deg for p in patches] * u.deg, b=[p.b_deg for p in patches] * u.deg, frame="galactic"
+    )
+    return [p.patch_id for p in patches], centres
+
+
+@dataclass(frozen=True)
+class UnwiseGateResult:
+    """Verified unWISE W3 fresh-split result (``reproduced_archive``)."""
+
+    survey_id: str
+    path: str
+    file_sha256: str
+    record: UnwiseGateWithheldFile
+    detail: str
+
+    def summary(self) -> dict:
+        r = self.record
+        psf, nm, fz, wh = r.empirical_psf, r.noise_model, r.frozen_screens, r.withheld
+        return {
+            "id": r.id,
+            "path": self.path,
+            "file_sha256": self.file_sha256,
+            "content_sha256": r.content_sha256,
+            "data_tier": r.data_tier,
+            "rule_version": r.rule_version,
+            "code_git_sha": r.code_git_sha,
+            "rng_seed": r.rng_seed,
+            "query_window_utc": list(r.query_window_utc),
+            "frozen_at_utc": r.frozen_at_utc,
+            "frozen_state_sha256": r.frozen_state_sha256,
+            "frozen_before_withheld_fetch": r.frozen_before_withheld_fetch,
+            "disjoint_from_gate1_sha256": r.disjoint_from_gate1_sha256,
+            "n_patches": len(r.sample.patches),
+            "n_controls": len(r.sample.controls),
+            "n_calibration": r.n_calibration,
+            "n_withheld": r.n_withheld,
+            "empirical_psf": {
+                "fwhm_gaussian_arcsec": psf.fwhm_gaussian_arcsec,
+                "fwhm_halfmax_arcsec": psf.fwhm_halfmax_arcsec,
+                "nominal_fwhm_arcsec": psf.nominal_fwhm_arcsec,
+                "n_stars": psf.n_stars,
+                "pixel_scale_arcsec": psf.pixel_scale_arcsec,
+            },
+            "noise_model": {
+                "variance_inflation": nm.variance_inflation,
+                "correlation_lag1": list(nm.correlation_lag1),
+                "shrinkage": nm.shrinkage,
+                "minimum_eigenvalue_bound": nm.minimum_eigenvalue_bound,
+            },
+            "locked_sigma_sys_arcsec": fz.locked_sigma_sys_arcsec,
+            "fresh_sigma_sys": fz.fresh_sigma_sys,
+            "frozen_screens": fz.screens.model_dump(),
+            "calibration_false_alarm_in_sample": fz.calibration_false_alarm_in_sample,
+            "separations_arcsec": wh.separations_arcsec,
+            "flux_fractions": wh.flux_fractions,
+            "screens": {k: v.model_dump() for k, v in wh.summary.screens.items()},
+            "survival_weighting": wh.summary.survival_weighting,
+            "caveats": r.caveats,
+        }
+
+
+def verify_unwise_gate(
+    doc: Mapping, rec: UnwiseGateWithheldFile, locked: SigmaSysCalibration
+) -> str:
+    """Offline re-derivation of an unWISE gate file against the locked Gate #1 sample.
+
+    ``doc`` is the raw JSON the record was validated from (hashes are taken over it). Checks:
+    the locked input (file hash and sigma_sys value); zero Gaia DR3 id overlap with the
+    locked controls and every fresh patch >= 15 deg from every locked patch (``LeakageError``);
+    the freeze ordering of every stored timestamp; and that the PSF widths, the regularised
+    covariance and its positive-definiteness bound, every frozen threshold (including the
+    conformal order statistics and their finite-sample level), the calibration in-sample
+    false alarms and every withheld summary follow from the stored per-star arrays.
+    """
+    li = rec.locked_inputs
+    if li.sigma_sys_calibration_path != locked.path or (
+        li.sigma_sys_calibration_sha256 != locked.file_sha256
+    ):
+        raise ProvenanceError("unWISE gate was checked against a different sigma_sys calibration")
+    sys_locked = float(locked.sigma_sys.to_value(u.arcsec))
+    if not math.isclose(li.sigma_sys_arcsec, sys_locked, rel_tol=0, abs_tol=1e-12):
+        raise ProvenanceError(f"unWISE gate sigma_sys {li.sigma_sys_arcsec} != locked {sys_locked}")
+    locked_ids = [c.gaia_dr3_source_id for c in locked.record.controls]
+    patch_ids, centres = locked_gate1_centres(locked)
+    if li.n_locked_stars != len(locked_ids) or li.n_locked_patches != len(patch_ids):
+        raise ProvenanceError("unWISE gate records a different locked sample size")
+    n_fresh = unwise_fits.assert_disjoint_from_locked(
+        [c.gaia_dr3_source_id for c in rec.sample.controls], locked_ids
+    )
+    audit = unwise_fits.patch_separation_audit(
+        [p.model_dump() for p in rec.sample.patches],
+        centres,
+        min_abs_b=UNWISE_GATE_MIN_ABS_B_DEG * u.deg,
+        min_locked_separation=UNWISE_GATE_MIN_LOCKED_SEPARATION_DEG * u.deg,
+    )
+    for p in rec.sample.patches:
+        c = SkyCoord(l=p.l_deg * u.deg, b=p.b_deg * u.deg, frame="galactic")
+        sep = c.separation(centres).deg
+        _close(float(sep.min()), p.nearest_locked_patch_separation_deg, p.patch_id, 1e-6)
+        if patch_ids[int(np.argmin(sep))] != p.nearest_locked_patch_id:
+            raise ProvenanceError(f"patch {p.patch_id}: nearest locked patch is misrecorded")
+    got = unwise_fits.recompute_unwise_gate(doc)
+    psf, nm, fz = rec.empirical_psf, rec.noise_model, rec.frozen_screens
+    if got["frozen_state_sha256"] != rec.frozen_state_sha256:
+        raise ProvenanceError("frozen_state_sha256 does not match the stored frozen blocks")
+    _close(got["geometry"], rec.geometry, "geometry")
+    _close(got["stamp_sum"], 1.0, "empirical_psf.stamp_sum")
+    _close(got["fwhm_gaussian_arcsec"], psf.fwhm_gaussian_arcsec, "fwhm_gaussian", 1e-6)
+    _close(got["fwhm_halfmax_arcsec"], psf.fwhm_halfmax_arcsec, "fwhm_halfmax")
+    if got["torus_covariance_max_abs_diff"] > 1e-9 * nm.variance_inflation:
+        raise ProvenanceError("torus_covariance is not the regularised raw_lag_covariance")
+    _close(got["minimum_eigenvalue_bound"], nm.minimum_eigenvalue_bound, "min_eigenvalue")
+    if got["minimum_eigenvalue_bound"] < got["minimum_eigenvalue_required"] * (1.0 - 1e-9):
+        raise ProvenanceError("pixel covariance is not strictly positive definite")
+    geom = unwise_fits.Geometry.for_pixel_scale(psf.pixel_scale_arcsec * u.arcsec)
+    span = np.arange(-geom.max_lag_pix, geom.max_lag_pix + 1)
+    yy, xx = np.meshgrid(span, span, indexing="ij")
+    disk = xx**2 + yy**2 <= geom.fit_radius_pix**2
+    model = unwise_fits.NoiseModel(
+        np.asarray(nm.torus_covariance, float),
+        np.asarray(nm.raw_lag_covariance, float),
+        np.asarray(nm.n_pairs, float),
+        tuple(nm.star_ids),
+        nm.shrinkage,
+        nm.power_floor,
+    )
+    unwise_fits.gls_projector(model.matrix(yy[disk], xx[disk]))  # Cholesky: LinAlgError if not PD
+    _close(got["fresh_sigma_sys"], fz.fresh_sigma_sys, "fresh_sigma_sys")
+    _close(got["screens"], fz.screens.model_dump(), "frozen_screens.screens")
+    _close(
+        got["calibration_false_alarm_in_sample"],
+        fz.calibration_false_alarm_in_sample,
+        "calibration_false_alarm_in_sample",
+    )
+    _close(got["summary"], doc["withheld"]["summary"], "withheld.summary")
+    con = fz.screens.image_scalar_conformal
+    s = rec.withheld.summary.screens
+    return (
+        f"PSF FWHM {psf.fwhm_gaussian_arcsec:.3f} arcsec (nominal {psf.nominal_fwhm_arcsec}); "
+        f"covariance V(0) = {nm.variance_inflation:.3f}, lag-1 correlation "
+        f"{nm.correlation_lag1[0]:.3f}, positive definite (min eigenvalue "
+        f"{nm.minimum_eigenvalue_bound:.4f}); thresholds re-derived from {rec.n_calibration} "
+        f"calibration stars (conformal level (k+1)/(n_cal+1) = {con.k_exceedances + 1}/"
+        f"{con.n_calibration + 1} = {con.alpha_guaranteed:.4f}); {rec.n_withheld} withheld "
+        f"summaries recomputed (survival <= 3.25 arcsec: scalar chi2 "
+        f"{s['image_scalar_chi2'].blend_survival_within_3p25_arcsec:.3f}, GLS chi2 "
+        f"{s['image_gls_chi2'].blend_survival_within_3p25_arcsec:.3f}, conformal "
+        f"{s['image_scalar_conformal'].blend_survival_within_3p25_arcsec:.3f}); frozen "
+        f"{rec.frozen_at_utc} before every withheld fetch; 0 of {n_fresh} fresh stars among the "
+        f"{len(locked_ids)} locked controls; nearest locked patch "
+        f"{audit['min_locked_separation_deg']:.2f} deg away"
+    )
+
+
+def load_unwise_gate(survey: Survey, root: Path) -> UnwiseGateResult | None:
+    """Load and fully verify a survey's pinned unWISE gate result (None if not pinned).
+
+    Checks: file size < 5 MB; file SHA-256 == survey pin; schema (including the zero-leakage
+    timestamp ordering); ``reproduced_archive`` tier; content_sha256; then everything in
+    :func:`verify_unwise_gate`.
+    """
+    ir = survey.infrared
+    if ir is None or ir.unwise_gate_path is None:
+        return None
+    locked = load_sigma_sys_calibration(survey, root)
+    if locked is None:
+        raise ProvenanceError("unWISE gate pinned without the locked sigma_sys calibration")
+    path = root / ir.unwise_gate_path
+    if not path.is_file():
+        raise ProvenanceError(f"unWISE gate {path} missing (scripts/run_unwise_gate.py)")
+    raw = path.read_bytes()
+    if len(raw) >= UNWISE_GATE_MAX_BYTES:
+        raise ProvenanceError(f"{ir.unwise_gate_path}: {len(raw)} bytes is not < 5 MB")
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha != ir.unwise_gate_sha256:
+        raise ProvenanceError(
+            f"{ir.unwise_gate_path}: sha256 {sha} != pinned {ir.unwise_gate_sha256}"
+        )
+    doc = json.loads(raw)
+    rec = UnwiseGateWithheldFile.model_validate(doc)
+    if rec.data_tier != "reproduced_archive":
+        raise ProvenanceError(
+            f"{ir.unwise_gate_path}: data_tier {rec.data_tier!r} can never be pinned "
+            "(only a promoted reproduced_archive run)"
+        )
+    body = {k: v for k, v in doc.items() if k != "content_sha256"}
+    if _canonical_sha256(body) != rec.content_sha256:
+        raise ProvenanceError(f"{ir.unwise_gate_path}: content_sha256 mismatch")
+    detail = verify_unwise_gate(doc, rec, locked)
+    return UnwiseGateResult(survey.id, ir.unwise_gate_path, sha, rec, detail)
+
+
 # --------------------------------------------------------------------- validation
 @dataclass(frozen=True)
 class CheckResult:
@@ -2099,6 +2312,43 @@ def _check_background_promotion(graph: FactorGraph) -> str:
     return "pinned by " + ", ".join(f"{s.id} -> {s.background_summary_path}" for s in pinned)
 
 
+def _check_unwise_gate_promotion(graph: FactorGraph) -> str:
+    """The unWISE W3 gate artifact must be absent, or pinned and fully re-verified.
+
+    Unpinned (v0.2.2a) it passes with a note. Once a survey pins it, the SHA-256, the schema
+    with its zero-leakage timestamp ordering, disjointness from the locked
+    ``wise_sigma_sys_control.json`` and the offline recomputation are all enforced here.
+    """
+    pinned = [
+        s
+        for s in graph.surveys.values()
+        if s.infrared is not None and s.infrared.unwise_gate_path is not None
+    ]
+    present = (graph.root / UNWISE_GATE_PATH).is_file()
+    if present and UNWISE_GATE_PATH not in {s.infrared.unwise_gate_path for s in pinned}:
+        raise ProvenanceError(
+            f"{UNWISE_GATE_PATH} exists but no survey pins its SHA-256 "
+            "(infrared.unwise_gate_path / unwise_gate_sha256 in data/surveys/)"
+        )
+    if not pinned:
+        return (
+            f"not promoted yet - belongs to v0.2.2b: no survey pins an unWISE gate and "
+            f"{UNWISE_GATE_PATH} is absent (scripts/run_unwise_gate.py --fetch, then "
+            "--promote-from); once pinned, SHA-256, zero-leakage timestamp ordering, "
+            "disjointness from wise_sigma_sys_control.json and offline recomputation are "
+            "enforced automatically"
+        )
+    rows = []
+    for s in pinned:
+        g = load_unwise_gate(s, graph.root)
+        assert g is not None
+        rows.append(
+            f"{s.id} -> {g.path}: sha256 {g.file_sha256[:16]}..., {g.record.data_tier}, git "
+            f"{g.record.code_git_sha[:12]}; {g.detail}"
+        )
+    return "pinned by " + "; ".join(rows)
+
+
 def _check_pointing_corrections(graph: FactorGraph, survey: Survey) -> str:
     """The pinned pointing-correction overlay (ruling v0.2.1-R5), end to end and offline.
 
@@ -2192,6 +2442,7 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
     )
     record("pointing_merge_policy", lambda: _check_merge_policy_contract(graph))
     record("background_field_promotion", lambda: _check_background_promotion(graph))
+    record("unwise_gate_promotion", lambda: _check_unwise_gate_promotion(graph))
     for s in graph.surveys.values():
         if s.background_summary_path is not None:
 

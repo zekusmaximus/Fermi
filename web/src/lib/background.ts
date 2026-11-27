@@ -11,7 +11,7 @@ import type {
   PointingCentreAudit,
 } from "../api";
 
-/** Integer with thousands separators ("120,176"); "—" for a missing value. */
+/** Integer with thousands separators ("119,947"); "—" for a missing value. */
 export function fmtCount(n: number | null | undefined): string {
   if (n === null || n === undefined || !Number.isFinite(n)) return "—";
   return Math.round(n).toLocaleString("en-US");
@@ -183,10 +183,15 @@ export function fmtWatts(x: number | null | undefined): string {
   return x === null || x === undefined || !Number.isFinite(x) ? "—" : `${x.toExponential(2)} W`;
 }
 
-/** One-line caveat for the pointing-centre audit, or null when nothing is flagged. */
+/**
+ * One-line caveat for the pointing-centre audit, or null when nothing is flagged.
+ * Only a band with the sign-flip signature (empty mirror band, most targets unfound) is a
+ * "wrong field" warning: once the overlay has corrected the known flips, the densest band of
+ * unfound primaries is an ordinary one and must not be shown as an erratum.
+ */
 export function auditCaveat(a: PointingCentreAudit | null | undefined): string | null {
   const d = a?.densest_band_of_unfound_primaries;
-  if (!a || !d || d.n_no_counterpart === 0) return null;
+  if (!a || !d || d.n_no_counterpart === 0 || !d.sign_flip_signature) return null;
   const [lo, hi] = d.declination_band_deg;
   const sign = (x: number) => (x >= 0 ? `+${x}` : `${x}`);
   return (
@@ -194,4 +199,57 @@ export function auditCaveat(a: PointingCentreAudit | null | undefined): string |
     `(${d.n_targets_in_mirror_band} targets in the mirror band): ${fmtCount(d.n_background_stars_in_those_pointings)} background stars ` +
     `(${(d.fraction_of_background_stars * 100).toFixed(2)}% of N_bg) may come from the wrong field.`
   );
+}
+
+/** Signed degrees with 4 decimals and a real minus sign, e.g. "−10.4485°" / "+10.4483°". */
+export function fmtDec(x: number | null | undefined): string {
+  if (x === null || x === undefined || !Number.isFinite(x)) return "—";
+  return `${x < 0 ? "−" : "+"}${Math.abs(x).toFixed(4)}°`;
+}
+
+export interface OverlayStatus {
+  /** "14/692": cones re-centred by the overlay, out of all pointings. */
+  corrected: string;
+  /** Plain-English headline of the block. */
+  headline: string;
+  /** "0 uncorrected cones remaining" (or how many, and how many stars they hold). */
+  remaining: string;
+  /** How the corrected primaries were (or were not) matched to their own Gaia sighting. */
+  absorbed: string;
+  /** True when no overlay entry is left on a sign-flipped centre. */
+  clean: boolean;
+}
+
+/**
+ * Status of the pointing-correction overlay (ruling v0.2.1-R5), or null when the survey
+ * pins none. Counts only; the catalog is never edited, so "corrected" always means
+ * "the cone was re-centred", never "the catalog row changed".
+ */
+export function overlayStatus(a: PointingCentreAudit | null | undefined): OverlayStatus | null {
+  const fixed = a?.corrected_via_overlay;
+  const stale = a?.uncorrected_flipped_cones;
+  if (!a || !fixed || !stale || !fixed.overlay_sha256) return null;
+  const plural = (n: number, one: string, many: string) => `${fmtCount(n)} ${n === 1 ? one : many}`;
+  const remaining =
+    stale.n === 0
+      ? "0 uncorrected cones remaining"
+      : `${plural(stale.n, "uncorrected cone", "uncorrected cones")} remaining: ` +
+        `${fmtCount(stale.n_background_stars_in_those_pointings)} background stars ` +
+        `(${(stale.fraction_of_background_stars * 100).toFixed(2)}% of N_bg) come from the wrong field`;
+  const missed = fixed.not_absorbed.length;
+  return {
+    corrected: `${fmtCount(fixed.n)}/${fmtCount(a.n_primaries)}`,
+    headline: `${fmtCount(fixed.n)}/${fmtCount(a.n_primaries)} catalog-erratum cones corrected non-destructively`,
+    remaining,
+    absorbed:
+      `${fmtCount(fixed.n_absorbed_by_gaia_id)} matched to their own Gaia sighting by id, ` +
+      `${fmtCount(fixed.n_absorbed_by_angular_fallback)} by the < 3″ fallback, ${fmtCount(missed)} not matched` +
+      (missed ? ` (${fixed.not_absorbed.join(", ")})` : ""),
+    clean: stale.n === 0 && fixed.n === fixed.n_pinned_corrections,
+  };
+}
+
+/** A Gaia DR3 id for a table cell: the exact string, or "no Gaia DR3 id" when the catalog has none. */
+export function gaiaIdOrNone(id: unknown): string {
+  return id === null || id === undefined ? "no Gaia DR3 id" : gaiaIdText(id);
 }

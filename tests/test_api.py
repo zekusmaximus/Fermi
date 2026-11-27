@@ -162,6 +162,22 @@ def test_adversary_receipt(client):
     assert all(f["repro_command"].endswith("--seed 42") for f in checks.values())
     assert checks["hip1692_distance_revision"]["citations"]
     assert len(r["results_sha256"]) == 64
+    # v0.2.1c (ruling v0.2.1-R5): the catalog declination sign-flip audit is in the feed,
+    # next to HIP 1692 and the 16 beam-sharing pairs, citing its claim file.
+    flip = checks["catalog_dec_sign_audit"]
+    assert (flip["status"], flip["severity"]) == ("finding", "warning")
+    assert any("Isaacson et al. 2017" in c for c in flip["citations"])
+    d = flip["details"]
+    assert d["n_affected_targets"] == 14 and len(d["affected_targets"]) == 14
+    assert d["locked_catalog"]["sha256"].startswith("c299d61d")
+    assert d["locked_catalog"]["modified_by_this_audit"] is False
+    assert d["band_census"]["n_targets_in_mirror_band"] == 0
+    ids = [t["gaia_dr3_source_id"] for t in d["affected_targets"]]
+    assert sum(i is None for i in ids) == 3  # three targets have no Gaia DR3 id in the catalog
+    assert all(i is None or (isinstance(i, str) and i.isdigit()) for i in ids)
+    assert {c["target_name"] for c in d["northern_controls"]} == {"HIP 59608", "HIP 92283"}
+    (sec,) = d["secondary_discrepancies"]
+    assert len(sec["records"]) == 3 and sec["inherited_by_locked_catalog"] is False
 
 
 def test_runs_feed_lists_receipts_newest_first(env):
@@ -248,7 +264,7 @@ def test_queue_lists_split_tiers(client):
     assert bg["expected_eig_bits"] == pytest.approx(0.0145226, rel=1e-4)
     ev = bg["linked_evidence"]
     assert ev["kind"] == "background_field_eig" and ev["summary_sha256"] == pin
-    assert ev["summary_data_tier"] == "reproduced_archive" and ev["n_background_stars"] == 120176
+    assert ev["summary_data_tier"] == "reproduced_archive" and ev["n_background_stars"] == 119947
     assert {r["radio_mode"] for r in ev["comparison"]} == {
         "distance_scaled_eirp",
         "flat_probability",
@@ -686,8 +702,12 @@ def test_health_exposes_the_promoted_background_sha_and_tier(client):
     assert h["background_summary_sha256"] == survey.background_summary_sha256
     assert h["background_summary_data_tier"] == "reproduced_archive"
     assert len(h["background_summary_code_git_sha"]) == 40
-    assert (h["n_background_stars"], h["n_suspected_unmatched_primary"]) == (120176, 49)
-    assert h["status"] == "ok" and h["validation_checks_total"] >= 40
+    assert (h["n_background_stars"], h["n_suspected_unmatched_primary"]) == (119947, 49)
+    # v0.2.1c (ruling v0.2.1-R5): the pinned pointing-correction overlay and its state.
+    assert h["pointing_corrections_path"] == survey.pointing_corrections_path
+    assert h["pointing_corrections_sha256"] == survey.pointing_corrections_sha256
+    assert (h["n_corrected_pointings"], h["n_uncorrected_flipped_cones"]) == (14, 0)
+    assert h["status"] == "ok" and h["validation_checks_total"] >= 41
     assert h["catalog_sha256"].startswith("c299d61d")  # the locked primaries are untouched
 
 
@@ -708,13 +728,13 @@ def test_radio_drilldown_exposes_the_background_field_extension(client):
         8.4,
         4.2,
     )
-    assert (prov["n_background_stars"], prov["n_cells"]) == (120176, 46913)
+    assert (prov["n_background_stars"], prov["n_cells"]) == (119947, 46888)
     assert prov["query_window_utc"][0] < prov["query_window_utc"][1] < prov["assembled_at_utc"]
     # Distance cuts and de-duplication counters, including the reported suspected primaries.
     cuts, mp, da = prov["distance_cuts"], prov["merge_provenance"], prov["dedup_audit"]
-    assert (cuts["n_cone_sightings_raw"], cuts["n_dropped_beyond_d_max"]) == (259285, 133)
-    assert (mp["n_dedup_gaia_id"], mp["n_dedup_angular_fallback"]) == (4270, 105)
-    assert (mp["n_multi_beam_resolved"], mp["n_background_absorbed_by_primary"]) == (3764, 635)
+    assert (cuts["n_cone_sightings_raw"], cuts["n_dropped_beyond_d_max"]) == (258927, 132)
+    assert (mp["n_dedup_gaia_id"], mp["n_dedup_angular_fallback"]) == (4281, 106)
+    assert (mp["n_multi_beam_resolved"], mp["n_background_absorbed_by_primary"]) == (3764, 647)
     assert da["n_duplicate_gaia_ids_vs_primary"] == 0
     assert (da["n_suspected_unmatched_primary"], da["n_suspected_unmatched_primary_stars"]) == (
         49,
@@ -732,7 +752,7 @@ def test_radio_drilldown_exposes_the_background_field_extension(client):
     assert pub["n_stars_gbt_l_band"]["verified_against_paper"] is False
     assert (got["n_pointings"], got["n_background_stars"], got["gaia_release"]) == (
         692,
-        120176,
+        119947,
         "Gaia DR3",
     )
     # Realized vs predicted EIG, both radio modes, never labelled as verified.
@@ -740,9 +760,9 @@ def test_radio_drilldown_exposes_the_background_field_extension(client):
     assert rows["distance_scaled_eirp"]["label"] == "physical"
     assert rows["flat_probability"]["label"] == "unphysical"
     assert rows["distance_scaled_eirp"]["predicted_eig_bits"] == pytest.approx(0.01452, abs=5e-6)
-    assert rows["distance_scaled_eirp"]["realized_eig_bits"] == pytest.approx(0.00235113, rel=1e-5)
+    assert rows["distance_scaled_eirp"]["realized_eig_bits"] == pytest.approx(0.00234721, rel=1e-5)
     assert rows["flat_probability"]["predicted_eig_bits"] == pytest.approx(0.827, abs=5e-4)
-    assert rows["flat_probability"]["realized_eig_bits"] == pytest.approx(0.651404, rel=1e-5)
+    assert rows["flat_probability"]["realized_eig_bits"] == pytest.approx(0.650681, rel=1e-5)
     for row in rows.values():
         assert row["data_tiers"] == ["illustrative_calibration", "reproduced_archive"]
     # Harris-FKG / Frechet bounds, shell summary, off-axis attenuation, pointing-centre audit.
@@ -750,11 +770,24 @@ def test_radio_drilldown_exposes_the_background_field_extension(client):
     for b in bf["bounds"]:
         assert b["p_zero_markov_lower"] <= b["p_zero_fkg_lower"] <= b["p_zero_frechet_upper"]
     assert "LOWER bound" in bf["correlation_assumption"]
-    assert bf["shells"]["n_stars"] == 120176 and bf["shells"]["eirp_min_cumulative_by_decade"]
+    assert bf["shells"]["n_stars"] == 119947 and bf["shells"]["eirp_min_cumulative_by_decade"]
     assert bf["attenuation"]["median_eirp_min_ratio_background_over_primary"] > 1e3
-    assert (
-        bf["pointing_centre_audit"]["densest_band_of_unfound_primaries"]["n_no_counterpart"] == 14
+    # Ruling v0.2.1-R5: the 14 Isaacson -10 deg erratum cones are corrected by the pinned
+    # overlay; none is left uncorrected; the locked catalog is untouched.
+    audit, pc = bf["pointing_centre_audit"], prov["pointing_corrections"]
+    assert audit["uncorrected_flipped_cones"]["n"] == 0
+    assert audit["corrected_via_overlay"]["n"] == 14
+    assert audit["corrected_via_overlay"]["overlay_sha256"] == health["pointing_corrections_sha256"]
+    assert audit["corrected_via_overlay"]["locked_catalog_modified"] is False
+    assert (pc["n_corrected_pointings"], pc["n_uncorrected_pointings"]) == (14, 0)
+    assert pc["pointing_corrections_sha256"] == health["pointing_corrections_sha256"]
+    assert pc["locked_catalog_sha256"] == health["catalog_sha256"]
+    assert len(pc["corrected_pointings"]) == 14
+    assert all(
+        c["cone_dec_deg"] < -10.0 < 10.0 <= c["catalog_dec_deg"] for c in pc["corrected_pointings"]
     )
+    dense = audit["densest_band_of_unfound_primaries"]
+    assert dense["n_no_counterpart"] == 3 and dense["sign_flip_signature"] is False
     assert bf["commands"]["report"] == "uv run fermi-desk background-field"
     # Ruling v0.2.1-R4: every Gaia id in the response is a string, never a JSON number.
     ids = [v for k, v in _walk(bf) if k == "gaia_dr3_source_id"]
@@ -805,7 +838,7 @@ def test_json_safe_stringifies_source_ids_and_unsafe_integers():
             "star_ids": [big, 7],
             "psf_star_ids": np.array([big]),
             "rng_seed": 42,
-            "n_stars": np.int64(120176),
+            "n_stars": np.int64(119947),
             "survey_id": "bl",
             "flag": True,
             "unsafe": 2**53,
@@ -819,7 +852,7 @@ def test_json_safe_stringifies_source_ids_and_unsafe_integers():
         "star_ids": [str(big), "7"],
         "psf_star_ids": [str(big)],
         "rng_seed": 42,
-        "n_stars": 120176,
+        "n_stars": 119947,
         "survey_id": "bl",
         "flag": True,
         "unsafe": str(2**53),
@@ -843,15 +876,15 @@ def test_compare_union_flat_holds_radio_out_and_carries_background_provenance(cl
     assert note["channel"] == "radio" and note["rulings"] == ["v0.2.1-R2"]
     assert note["held_out_of_reported_headline"] is True
     assert "d^2 / B(theta)" in note["reasons"][0]
-    assert note["merged_background"]["n_background_stars"] == 120176
+    assert note["merged_background"]["n_background_stars"] == 119947
     head = rec["results"]["headline"]["headline"]
     assert head["terms"] == ["earth_unreached"]
     assert "radio" in rec["results"]["headline"]["log10_bf_by_term"]  # still in the table
     assert abs(d["headline_log10_bf"]) < 1e-9 and note["log10_bf_term"] < -0.5
     bf = rec["background_field"]
-    assert bf["data_tier"] == "reproduced_archive" and bf["n_background_stars"] == 120176
+    assert bf["data_tier"] == "reproduced_archive" and bf["n_background_stars"] == 119947
     assert bf["dedup_audit"]["n_suspected_unmatched_primary"] == 49
-    assert rec["merge_provenance"]["n_merged_targets"] == 692 + 120176
+    assert rec["merge_provenance"]["n_merged_targets"] == 692 + 119947
     assert rec["held_out_extension_surveys"] == []
     # Opt-in: the term enters the headline under the loud policy.
     loud = _post(client, {**base, "include_illustrative": True})

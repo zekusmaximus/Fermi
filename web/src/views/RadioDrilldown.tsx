@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { get, type BackgroundFieldBlock, type BeamPair, type RadioDrill, type Target } from "../api";
-import { Command, ErrorBox, Hash, Loading, Panel, TierBadge, useApi } from "../components/ui";
+import { get, type BackgroundFieldBlock, type BeamPair, type PointingCentreAudit, type RadioDrill, type Target } from "../api";
+import { Command, ErrorBox, Hash, HelpPopover, Loading, Panel, TierBadge, useApi } from "../components/ui";
 import {
   attenuationHeadline,
   auditCaveat,
@@ -11,8 +11,10 @@ import {
   eigRows,
   eigVerdict,
   fmtCount,
+  fmtDec,
   fmtWatts,
   gaiaIdText,
+  overlayStatus,
   scopeRows,
   utcWindow,
 } from "../lib/background";
@@ -52,6 +54,101 @@ export function RadioDrilldown() {
       </Panel>
       <Pairs pairs={data.beam_sharing_pairs} fwhm={data.beam_fwhm_arcmin} note={data.beam_sharing_interpretation} />
       <BackgroundField block={data.background_field} />
+    </div>
+  );
+}
+
+/**
+ * v0.2.1c (ruling v0.2.1-R5): the pointing-centre audit block. Isaacson et al. (2017)
+ * Table 1 prints 14 targets at +10° instead of −10°; the locked catalog keeps the published
+ * values (emerald, published_catalog) and the background cones are re-centred by a
+ * SHA-256-pinned overlay whose positions come from Gaia DR3 / Hipparcos (cyan,
+ * reproduced_archive). Cyan when nothing is left uncorrected, red while any cone is.
+ */
+function PointingAudit({ audit }: { audit: PointingCentreAudit }) {
+  const status = overlayStatus(audit);
+  if (!status) return null;
+  const fixed = audit.corrected_via_overlay;
+  const stale = audit.uncorrected_flipped_cones;
+  return (
+    <div className={status.clean ? "audit-block audit-ok" : "audit-block audit-bad"} aria-label="Pointing-centre audit">
+      <p className="eyebrow">
+        Pointing-centre audit — catalog erratum (Isaacson et al. 2017, declination −10° band){" "}
+        <HelpPopover
+          label="the catalog erratum and how it is corrected"
+          title="Catalog erratum, corrected without editing the catalog"
+          tradeoff={
+            `Isaacson et al. (2017) Table 1 prints every target with a true declination between −11° and −10° without its minus ` +
+            `sign, so ${fmtCount(fixed.n_pinned_corrections)} of the ${fmtCount(audit.n_primaries)} beams were catalogued about 21° ` +
+            `north of the star that was observed. The target list is kept exactly as published; a pinned overlay file re-centres ` +
+            `only those background cones on the stars’ J2000 positions (Gaia DR3 / Hipparcos). The verified headline is unchanged: ` +
+            `the background field never enters it in either radio mode.`
+          }
+          invariant={
+            `Ruling ${fixed.ruling ?? "v0.2.1-R5"}: the locked catalog is immutable (its SHA-256 is pinned by every receipt); ` +
+            `corrections live only in the SHA-256-pinned overlay. Adversary finding: catalog_dec_sign_audit.`
+          }
+          cli={["uv run fermi-desk validate", "uv run fermi-desk adversary run --seed 42", "uv run fermi-desk background-field"]}
+        />
+      </p>
+      <p className="audit-headline">
+        <span className="stat-big num">{status.corrected}</span> catalog-erratum cones corrected non-destructively ·{" "}
+        <span className={stale.n === 0 ? "ok num" : "bad num"}>{status.remaining}</span>
+      </p>
+      <p>
+        Cones re-centred on J2000 positions <TierBadge tier="reproduced_archive" /> by the pinned overlay{" "}
+        <code className="num">{fixed.overlay_path}</code> · overlay SHA-256 <Hash sha={fixed.overlay_sha256} n={16} /> ·{" "}
+        <span className="num">{fixed.ruling}</span>
+      </p>
+      <p>
+        Locked catalog <code className="num">{fixed.locked_catalog_path}</code> <TierBadge tier="published_catalog" />{" "}
+        <Hash sha={fixed.locked_catalog_sha256} n={16} />{" "}
+        <span className={fixed.locked_catalog_modified ? "bad" : "ok"}>{fixed.locked_catalog_modified ? "MODIFIED" : "unmodified (read-only)"}</span>
+      </p>
+      <p className="small">
+        Corrected primaries: {status.absorbed}. {fixed.not_absorbed.length ? <span className="muted">Not matched means: {fixed.not_absorbed_reading}.</span> : null}{" "}
+        <span className="num">{fmtCount(fixed.n_listed_as_suspected_unmatched_primary)}</span> of them listed as suspected unmatched primaries.
+      </p>
+      {stale.n > 0 ? (
+        <p className="bad small">
+          Still on a sign-flipped centre: {stale.targets.join(", ")}. {stale.reading}
+        </p>
+      ) : null}
+      <details>
+        <summary>list the {fmtCount(fixed.cones.length)} corrected cones (catalog value → centre used)</summary>
+        <div className="scroll-x">
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>target</th>
+                <th className="r">
+                  catalog Dec <TierBadge tier="published_catalog" />
+                </th>
+                <th className="r">
+                  cone centre Dec (J2000) <TierBadge tier="reproduced_archive" />
+                </th>
+                <th className="r">cone centre RA (J2000)</th>
+                <th>position from</th>
+                <th>fetched by commit</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fixed.cones.map((c) => (
+                <tr key={c.target_name}>
+                  <td>{c.target_name}</td>
+                  <td className="r num">{fmtDec(c.catalog_dec_deg)}</td>
+                  <td className="r num">{fmtDec(c.cone_dec_deg)}</td>
+                  <td className="r num">{c.cone_ra_deg.toFixed(4)}°</td>
+                  <td>{c.truth_source === "gaia_dr3" ? "Gaia DR3" : "Hipparcos-2"}</td>
+                  <td>
+                    <Hash sha={c.code_git_sha} n={12} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
   );
 }
@@ -190,6 +287,7 @@ function BackgroundField({ block }: { block: BackgroundFieldBlock }) {
             </div>
           </details>
         </div>
+        <PointingAudit audit={block.pointing_centre_audit} />
         {caveat ? (
           <div className="caveat">
             <b>Pointing-centre audit:</b> {caveat} {band?.reading} {block.pointing_centre_audit.policy}.

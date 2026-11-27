@@ -183,21 +183,21 @@ def test_promoted_artifact_counts_are_the_exact_live_fetch_counts(field):
     """The numbers quoted in the handoff, pinned (they are fixed by the artifact's SHA-256)."""
     rec = field.record
     cuts, mp, da = rec.distance_cuts, rec.merge_provenance, rec.dedup_audit
-    assert (rec.shells.n_stars, rec.shells.n_cells) == (120176, 46913)
-    assert cuts.n_cone_sightings_raw == 259285
-    assert cuts.n_dropped_invalid_parallax + cuts.n_dropped_beyond_d_max == 134601 + 133
+    assert (rec.shells.n_stars, rec.shells.n_cells) == (119947, 46888)
+    assert cuts.n_cone_sightings_raw == 258927
+    assert cuts.n_dropped_invalid_parallax + cuts.n_dropped_beyond_d_max == 134461 + 132
     assert (cuts.n_dropped_no_bailer_jones, cuts.n_dropped_outside_cone_recheck) == (0, 0)
-    assert cuts.n_sightings_with_distance == 124551 == 37888 + 86663
+    assert cuts.n_sightings_with_distance == 124334 == 37814 + 86520
     assert (cuts.n_background_inverse_parallax, cuts.n_background_bailer_jones_geo) == (
-        36069,
-        84107,
+        35983,
+        83964,
     )
-    assert (mp.n_raw_targets, mp.n_merged_targets) == (692 + 124551, 692 + 120176)
-    assert (mp.n_dedup_gaia_id, mp.n_dedup_angular_fallback) == (4270, 105)
-    assert (mp.n_multi_beam_resolved, mp.n_background_absorbed_by_primary) == (3764, 635)
-    assert mp.n_merged_by_role == {"primary": 692, "background": 120176}
-    assert da.n_background_sightings_matched_to_primary_gaia_id == 523
-    assert da.n_background_sightings_matched_to_primary_angular == 112
+    assert (mp.n_raw_targets, mp.n_merged_targets) == (692 + 124334, 692 + 119947)
+    assert (mp.n_dedup_gaia_id, mp.n_dedup_angular_fallback) == (4281, 106)
+    assert (mp.n_multi_beam_resolved, mp.n_background_absorbed_by_primary) == (3764, 647)
+    assert mp.n_merged_by_role == {"primary": 692, "background": 119947}
+    assert da.n_background_sightings_matched_to_primary_gaia_id == 534
+    assert da.n_background_sightings_matched_to_primary_angular == 113
     counts = field.dedup_counts()
     assert counts["n_suspected_unmatched_primary"] == 49
     assert counts["n_suspected_unmatched_primary_stars"] == 47
@@ -229,7 +229,7 @@ def test_zero_duplicate_gaia_ids_against_the_locked_primary_catalog(field, raw_d
         for m in sample["primary_matched"]
         if m["match"] == "gaia_dr3_source_id"
     }
-    assert by_id <= primary_ids and len(by_id) == 506  # 16 were never sighted: see the audit
+    assert by_id <= primary_ids and len(by_id) == 517  # 5 were never sighted: see the audit
     # ... and the suspected stars carry ids no primary has.
     suspects = {
         r["gaia_dr3_source_id"] for r in raw_doc["dedup_audit"]["suspected_unmatched_primary"]
@@ -242,7 +242,7 @@ def test_artifact_serialises_every_gaia_id_as_a_string_never_a_json_number(raw_d
     raw = (ROOT / BACKGROUND_SUMMARY_PATH).read_bytes()
     assert re.search(rb'"gaia_dr3_source_id":\s*[0-9-]', raw) is None
     ids = re.findall(rb'"gaia_dr3_source_id":"([1-9][0-9]*)"', raw)
-    assert len(ids) == 1000 + 635 + 49
+    assert len(ids) == 1000 + 647 + 49
     over = [int(x) for x in ids if int(x) > 2**53]
     assert len(over) > 1600 and any(int(float(x)) != x for x in over)  # float64 would corrupt
     star = raw_doc["validation_sample"]["background"][0]
@@ -401,7 +401,7 @@ def test_flat_mode_merged_background_is_held_out_of_the_verified_headline(flat_u
     mb = note["merged_background"]
     assert mb["survey_id"] == EXT and mb["data_tier"] == "reproduced_archive"
     assert mb["summary_sha256"] == field.file_sha256
-    assert (mb["n_primary_targets"], mb["n_background_stars"]) == (692, 120176)
+    assert (mb["n_primary_targets"], mb["n_background_stars"]) == (692, 119947)
     assert mb["log10_bf_primary_targets_exact_mc"] + mb[
         "log10_bf_background_shells_fkg_product"
     ] == pytest.approx(note["log10_bf_term"], abs=1e-12)
@@ -413,12 +413,12 @@ def test_flat_mode_merged_background_is_held_out_of_the_verified_headline(flat_u
     assert rec["merge_provenance"] == field.record.merge_provenance.model_dump()
     assert rec["background_field"]["file_sha256"] == field.file_sha256
     assert rec["background_field"]["dedup_audit"]["n_suspected_unmatched_primary"] == 49
-    assert rec["background_field"]["scope"]["retrieved"]["n_background_stars"] == 120176
+    assert rec["background_field"]["scope"]["retrieved"]["n_background_stars"] == 119947
     assert rec["held_out_extension_surveys"] == []
     for hid in PAIR:
         comp = rec["results"]["hypotheses"][hid]["components"]["radio"]
         assert comp["illustrative_inputs"] == [FLAT_BACKGROUND_INPUT]
-        assert rec["results"]["hypotheses"][hid]["radio"]["n_targets_merged"] == 692 + 120176
+        assert rec["results"]["hypotheses"][hid]["radio"]["n_targets_merged"] == 692 + 119947
 
 
 def test_include_illustrative_folds_the_flat_background_in_with_the_loud_warning(graph, flat_union):
@@ -449,7 +449,7 @@ def test_distance_scaled_merge_stays_excluded_for_its_own_reason(graph):
     assert head["terms"] == ["earth_unreached"]
     (note,) = head["headline_exclusion_notes"]
     assert note["illustrative_inputs"] == ["transmitter_eirp_luminosity_function"]
-    assert "rulings" not in note and note["merged_background"]["n_background_stars"] == 120176
+    assert "rulings" not in note and note["merged_background"]["n_background_stars"] == 119947
     # Off-axis d^2 / B(theta) attenuation: the physical background term is tiny.
     assert abs(note["log10_bf_term"]) < 0.01
 
@@ -503,7 +503,7 @@ def test_cli_reports_the_r2_note_the_banner_and_the_suspected_count(tmp_path):
     assert "ruling v0.2.1-R2" in out and "d^2 / B(theta)" in out
     assert "terms: earth_unreached;" in out and "illustrative channels excluded: ['radio']" in out
     assert "suspected_unmatched_primary = 49 row(s), 47 distinct stars" in out
-    assert "N_bg = 120176 stars in 46913 shell cells over 692 pointings" in out
+    assert "N_bg = 119947 stars in 46888 shell cells over 692 pointings" in out
     assert "1,327 Price et al. (2020)" in out and "288,315" in out
     loud = " ".join(CliRunner().invoke(app, [*base, "--include-illustrative"]).output.split())
     assert "ILLUSTRATIVE CHANNELS FOLDED INTO THE HEADLINE BF - NOT AN OBSERVATIONAL BOUND" in loud
@@ -563,7 +563,7 @@ def test_realized_eig_is_recorded_beside_the_prediction_in_both_radio_modes(evid
         ev["summary_sha256"] == field.file_sha256
         and ev["summary_data_tier"] == "reproduced_archive"
     )
-    assert ev["n_background_stars"] == ev["realized"]["n_stars"] == 120176
+    assert ev["n_background_stars"] == ev["realized"]["n_stars"] == 119947
     d = ev["definition"]
     assert d["prior"] == {"type": "uniform", "over": list(PAIR)} and d["geometry"] == "thin_disk_2d"
     assert d["condition_on_earth_unreached"] is True and "Harris-FKG lower bound" in d["outcome"]
@@ -578,10 +578,11 @@ def test_realized_eig_is_recorded_beside_the_prediction_in_both_radio_modes(evid
         ev["predicted"]["data_tier"] == "synthetic_proxy" and ev["predicted"]["n_stars"] == 249990
     )
     # Realized with the pinned Gaia DR3 shells (deterministic: no RNG).
-    assert phys["realized_eig_bits"] == pytest.approx(0.00235113, rel=1e-5)
-    assert flat["realized_eig_bits"] == pytest.approx(0.651404, rel=1e-5)
-    assert phys["realized_over_predicted"] == pytest.approx(0.16189, rel=1e-4)
-    assert flat["realized_over_predicted"] == pytest.approx(0.78735, rel=1e-4)
+    # v0.2.1c (14 cones re-centred, ruling v0.2.1-R5); v0.2.1b gave 0.00235113 / 0.651404.
+    assert phys["realized_eig_bits"] == pytest.approx(0.00234721, rel=1e-5)
+    assert flat["realized_eig_bits"] == pytest.approx(0.650681, rel=1e-5)
+    assert phys["realized_over_predicted"] == pytest.approx(0.16162, rel=1e-4)
+    assert flat["realized_over_predicted"] == pytest.approx(0.78647, rel=1e-4)
     # The real, attenuated population is LESS informative than predicted in both modes: a
     # null result, reported as it is.
     assert phys["realized_eig_bits"] < phys["predicted_eig_bits"] < 0.02
@@ -607,13 +608,13 @@ def test_realized_eig_is_reported_with_and_without_suspected_unmatched_primaries
     little they move the result."""
     without = evidence["realized_excluding_suspected_unmatched_primary"]
     assert without["diagnostic_only"] is True and without["n_stars_removed"] == 47
-    assert without["n_stars"] == 120176 - 47 and "never removed" in without["policy"]
+    assert without["n_stars"] == 119947 - 47 and "never removed" in without["policy"]
     for r in evidence["comparison"]:
         full = r["realized_eig_bits"]
         excl = r["realized_eig_bits_excluding_suspected_unmatched_primary"]
         assert excl < full and (full - excl) / full < 0.005
     trimmed = field.shells_excluding_suspected()
-    assert trimmed.n_stars == field.shells.n_stars - 47 and field.shells.n_stars == 120176
+    assert trimmed.n_stars == field.shells.n_stars - 47 and field.shells.n_stars == 119947
     assert trimmed.n_cells <= field.shells.n_cells and trimmed.count.min() >= 1
     cells = field.suspected_star_cells()
     assert len(cells) == 47
@@ -648,10 +649,10 @@ def test_harris_fkg_and_frechet_bounds_bracket_every_zero_detection_probability(
     fs_phys = by[("distance_scaled_eirp", PAIR[0])]
     # Same stars reached in both modes; what differs is how detectable they are.
     assert fs_flat["expected_reached"] == pytest.approx(fs_phys["expected_reached"])
-    assert fs_flat["expected_detections"] == pytest.approx(2.0004, rel=1e-4)
-    assert fs_phys["expected_detections"] == pytest.approx(0.0048679, rel=1e-4)
-    assert fs_flat["p_zero_fkg_lower"] == pytest.approx(0.135274, rel=1e-5)
-    assert fs_phys["p_zero_fkg_lower"] == pytest.approx(0.995144, rel=1e-6)
+    assert fs_flat["expected_detections"] == pytest.approx(1.99658, rel=1e-4)
+    assert fs_phys["expected_detections"] == pytest.approx(0.0048597, rel=1e-4)
+    assert fs_flat["p_zero_fkg_lower"] == pytest.approx(0.135797, rel=1e-5)
+    assert fs_phys["p_zero_fkg_lower"] == pytest.approx(0.995152, rel=1e-6)
     assert "LOWER bound" in radio.SHELL_CORRELATION_ASSUMPTION
 
 
@@ -661,7 +662,7 @@ def test_scope_states_what_was_retrieved_and_what_the_paper_published(field, evi
     got, pub = scope["retrieved"], scope["published"]
     assert (got["n_pointings"], got["n_background_stars"], got["gaia_release"]) == (
         692,
-        120176,
+        119947,
         "Gaia DR3",
     )
     assert "Enriquez et al. (2017) GBT L-band pointings" in got["pointings"]
@@ -682,28 +683,58 @@ def test_scope_states_what_was_retrieved_and_what_the_paper_published(field, evi
     assert lband["value"] == 251983 and lband["verified_against_paper"] is False
     for text in (scope["statement"], evidence["statement"]):
         assert "692" in text and "1,327" in text and "288,315" in text and "Gaia DR2" in text
-    assert "120,176" in evidence["statement"] and "not expected to agree" in evidence["statement"]
+    assert "119,947" in evidence["statement"] and "not expected to agree" in evidence["statement"]
 
 
 def test_pointing_centre_audit_reports_primaries_missing_from_their_own_cone(graph, field):
-    """Offline audit of the cone centres (artifact + locked catalog). It surfaces, without
-    correcting, the declination band where the locked catalog lists 16 targets and none in
-    the mirror band, 14 of which have no Gaia counterpart in their own cone."""
+    """Offline audit of the cone centres (artifact + locked catalog).
+
+    v0.2.1b: the catalog band [+10, +11) deg held 16 targets (none in the mirror band), 14 of
+    them without a Gaia counterpart in their own cone - 1,055 background stars from the wrong
+    field. v0.2.1c (ruling v0.2.1-R5): those 14 cones are re-centred by the pinned overlay,
+    none is left uncorrected, and the catalog still reads +10 deg (it is never edited)."""
     a = bgf.pointing_centre_audit(graph, field)
     assert (a["n_primaries"], a["n_with_gaia_id"], a["n_without_gaia_id"]) == (692, 522, 170)
-    assert a["n_with_gaia_id_sighted_in_own_cone"] == 506
-    assert len(a["with_gaia_id_not_sighted_in_own_cone"]) == 16
-    assert a["n_without_gaia_id_absorbed_by_angular_fallback"] == 105
+    stale, fixed = a["uncorrected_flipped_cones"], a["corrected_via_overlay"]
+    assert stale["n"] == 0 and stale["targets"] == []
+    assert stale["n_background_stars_in_those_pointings"] == 0
+    assert stale["fraction_of_background_stars"] == 0.0
+    assert fixed["n"] == fixed["n_pinned_corrections"] == 14 and "HIP 5364" in fixed["targets"]
+    assert fixed["overlay_path"] == "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml"
+    assert fixed["overlay_sha256"] == graph.surveys[EXT].pointing_corrections_sha256
+    assert fixed["overlay_sha256"] == field.record.pointing_corrections_sha256
+    assert fixed["ruling"] == "v0.2.1-R5" and fixed["locked_catalog_modified"] is False
+    assert fixed["locked_catalog_sha256"] == LOCKED["data/catalogs/bl_692_targets.csv"]
+    assert all(-11.0 <= c["cone_dec_deg"] < -10.0 for c in fixed["cones"])
+    assert all(10.0 <= c["catalog_dec_deg"] < 11.0 for c in fixed["cones"])
+    # Measured, not assumed: all 11 corrected primaries with a Gaia id are absorbed by id and
+    # one of the three without an id by the < 3 arcsec fallback. HIP 34104 and HIP 77349 have
+    # only two-parameter Gaia DR3 solutions (no parallax, hence no distance): the distance cut
+    # drops them before the de-duplication, so nothing is absorbed and nothing leaks.
+    assert (fixed["n_absorbed_by_gaia_id"], fixed["n_absorbed_by_angular_fallback"]) == (11, 1)
+    assert fixed["not_absorbed"] == ["HIP 34104", "HIP 77349"]
+    assert fixed["n_listed_as_suspected_unmatched_primary"] == 0
+    assert "dropped by the distance cut" in fixed["not_absorbed_reading"]
+    # 11 more primaries sighted by id than in v0.2.1b (506), 12 fewer without any counterpart.
+    assert a["n_with_gaia_id_sighted_in_own_cone"] == 517
+    assert a["with_gaia_id_not_sighted_in_own_cone"] == [
+        "HIP 14669",
+        "HIP 28614",
+        "HIP 36850",
+        "HIP 76603",
+        "HIP 77052",
+    ]
+    assert a["n_without_gaia_id_absorbed_by_angular_fallback"] == 106
     assert a["n_without_gaia_id_suspected_only"] == 13
-    assert a["n_no_counterpart_in_own_cone"] == 68
-    assert "immutable (ruling v0.2.1-R3)" in a["policy"]
+    assert a["n_no_counterpart_in_own_cone"] == 56
+    assert "immutable" in a["policy"] and "v0.2.1-R3 / R5" in a["policy"]
+    # With the flips corrected, the densest band of unfound primaries is an ordinary one:
+    # its mirror band is populated, so it must NOT be read as a sign error.
     d = a["densest_band_of_unfound_primaries"]
-    assert d["declination_band_deg"] == [10, 11] and d["mirror_band_deg"] == [-11, -10]
-    assert (d["n_targets"], d["n_targets_in_mirror_band"], d["n_no_counterpart"]) == (16, 0, 14)
-    assert len(d["targets_no_counterpart"]) == 14 and "HIP 5364" in d["targets_no_counterpart"]
-    assert d["n_background_stars_in_those_pointings"] == 1055
-    assert d["fraction_of_background_stars"] == pytest.approx(1055 / 120176)
-    assert "declination sign error" in d["reading"] and "consistent with" in d["reading"]
+    assert d["declination_band_deg"] == [14, 15] and d["mirror_band_deg"] == [-15, -14]
+    assert (d["n_targets"], d["n_targets_in_mirror_band"], d["n_no_counterpart"]) == (7, 7, 3)
+    assert d["sign_flip_signature"] is False
+    assert d["reading"].startswith("no declination sign-flip signature")
     # Independent recount from the locked catalog: nothing below the mirror band is empty
     # by coverage (the catalog reaches Dec -29.6 deg).
     cat = pd.read_csv(ROOT / "data/catalogs/bl_692_targets.csv")
@@ -717,16 +748,78 @@ def test_pointing_centre_audit_reports_primaries_missing_from_their_own_cone(gra
     assert sha == LOCKED["data/catalogs/bl_692_targets.csv"]
 
 
+def test_refused_link_beside_a_primary_is_verified_exactly_not_waved_through(
+    field, raw_doc, tmp_path
+):
+    """GJ 473AB (Wolf 424) is published as ONE target; Gaia DR3 resolves two sources within
+    3 arcsec of it. The merge absorbs the nearer one and refuses the second (rule: links by
+    increasing separation, never joining two Gaia ids); the second stays in the shells and
+    is listed under ruling v0.2.1-R3. The offline re-verification accepts exactly that case
+    and nothing weaker: any other star inside the fallback radius of an ID-less primary is
+    still an unmerged collision (non-double-counting invariant)."""
+    star, absorbed = "3902874650602495232", "3902874650601954816"
+    sample = raw_doc["validation_sample"]
+    assert star in {s["gaia_dr3_source_id"] for s in sample["background"]}
+    (kept,) = [m for m in sample["primary_matched"] if m["primary_target_name"] == "GJ 473AB"]
+    assert (kept["gaia_dr3_source_id"], kept["match"]) == (absorbed, "angular_fallback")
+    (suspect,) = [
+        r
+        for r in raw_doc["dedup_audit"]["suspected_unmatched_primary"]
+        if r["primary_target_name"] == "GJ 473AB"
+    ]
+    assert suspect["gaia_dr3_source_id"] == star  # reported, never removed (v0.2.1-R3)
+    assert kept["separation_arcsec"] < suspect["separation_arcsec"] < 3.0
+    assert f"GJ 473AB / Gaia DR3 {star}" in field.detail
+    assert "link refused by rule, not an unmerged collision" in field.detail
+    assert raw_doc["merge_provenance"]["n_angular_links_refused"] == 8
+
+    def edit_matched(doc, rows):
+        n_ang = sum(m["match"] == "angular_fallback" for m in rows)
+        return {
+            **doc,
+            "validation_sample": {**doc["validation_sample"], "primary_matched": rows},
+            "dedup_audit": {
+                **doc["dedup_audit"],
+                "n_background_sightings_matched_to_primary_angular": n_ang,
+            },
+            "merge_provenance": {
+                **doc["merge_provenance"],
+                "n_background_absorbed_by_primary": len(rows),
+            },
+        }
+
+    others = [m for m in sample["primary_matched"] if m is not kept]
+    # 1. The primary absorbed nothing: the star beside it is a genuine unmerged collision.
+    with pytest.raises(DoubleCountingError, match="unmerged collision"):
+        _load(_root_with(tmp_path, lambda d: edit_matched(d, others)))
+    # 2. The absorbed sighting is FARTHER than the star left in the shells: the merge takes
+    #    links by increasing separation, so this cannot be a refused link.
+    farther = {**kept, "separation_arcsec": 2.0}
+    with pytest.raises(DoubleCountingError, match="unmerged collision"):
+        _load(_root_with(tmp_path, lambda d: edit_matched(d, [*others, farther])))
+    # 3. The absorbed sighting IS the star (same Gaia id): no second source, no excuse.
+    same = {**kept, "gaia_dr3_source_id": star}
+    with pytest.raises(DoubleCountingError, match="unmerged collision"):
+        _load(_root_with(tmp_path, lambda d: edit_matched(d, [*others, same])))
+
+    # 4. More such stars than the merge itself recorded as refused links.
+    def no_refusals(d):
+        return {**d, "merge_provenance": {**d["merge_provenance"], "n_angular_links_refused": 0}}
+
+    with pytest.raises(DoubleCountingError, match="recorded only 0 refused link"):
+        _load(_root_with(tmp_path, no_refusals))
+
+
 def test_shell_and_attenuation_summaries(graph, field):
     sh = bgf.shell_summary(field)
-    assert (sh["n_stars"], sh["n_cells"]) == (120176, 46913)
-    assert sum(sh["distance_histogram"]["counts"]) == 120176
+    assert (sh["n_stars"], sh["n_cells"]) == (119947, 46888)
+    assert sum(sh["distance_histogram"]["counts"]) == 119947
     assert (
         len(sh["distance_histogram"]["bin_edges_pc"]) == len(sh["distance_histogram"]["counts"]) + 1
     )
     cum = [c["n_stars"] for c in sh["eirp_min_cumulative_by_decade"]]
-    assert cum == sorted(cum) and cum[-1] == 120176
-    assert sh["distance_cumulative"][-1]["n_stars"] == 120176
+    assert cum == sorted(cum) and cum[-1] == 119947
+    assert sh["distance_cumulative"][-1]["n_stars"] == 119947
     assert sh["stars_per_pointing"]["n_pointings"] == 692
     att = bgf.attenuation_summary(graph, field)
     v = att["validation_sample"]
@@ -816,10 +909,16 @@ def test_cli_background_field_report_and_receipt(tmp_path):
     out = " ".join(res.output.replace("│", "|").split())  # box-drawing column rule
     assert res.exit_code == 0, res.output
     for text in (
-        "tier=reproduced_archive | N_bg=120176",
-        "raw Gaia DR3 cone sightings | 259285",
+        "tier=reproduced_archive | N_bg=119947",
+        "raw Gaia DR3 cone sightings | 258927",
         "suspected_unmatched_primary rows | 49",
         "duplicate Gaia ids vs bl_692_targets.csv | 0",
+        # ruling v0.2.1-R5: the overlay, its pinned SHA-256 and the two audit counters
+        "pointing_corrections_sha256 (pinned) | 7d976fe57e93ca1f",
+        "14 corrected of 14 pinned; 0 uncorrected",
+        "corrected_via_overlay = 14 of 14",
+        "uncorrected_flipped_cones = 0",
+        "11 by Gaia id, 1 by the angular fallback, 2 not absorbed (HIP 34104, HIP 77349",
         "distance_scaled_eirp (physical)",
         "flat_probability (unphysical)",
         "Harris-FKG lower (used)",
@@ -830,7 +929,7 @@ def test_cli_background_field_report_and_receipt(tmp_path):
     (path,) = tmp_path.glob("background_field-*.json")
     doc = json.loads(path.read_text("utf-8"))
     assert doc["kind"] == "background_field" and doc["data_tier"] == "reproduced_archive"
-    assert doc["results"]["provenance"]["n_background_stars"] == 120176
+    assert doc["results"]["provenance"]["n_background_stars"] == 119947
     assert doc["results"]["eig"]["scope"]["published"]["n_stars_total"] == 288315
     assert re.search(r'"gaia_dr3_source_id":\s*[0-9-]', path.read_text("utf-8")) is None
     again = CliRunner().invoke(app, ["background-field", "--out-dir", str(tmp_path)])

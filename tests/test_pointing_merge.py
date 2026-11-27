@@ -1582,11 +1582,8 @@ def test_overlay_tampering_in_a_promoted_summary_is_caught_offline(overlay_root,
     }
     with pytest.raises(ProvenanceError, match="did not correct exactly"):
         load(fewer)
-    # Dropping the overlay record altogether leaves stars 21 deg from their catalog beam
-    # centre: the offline theta recomputation refuses the summary.
-    corrected_idx = {c["pointing_index"] for c in cps}
-    sample = doc["validation_sample"]["background"]
-    assert any(s["pointing_index"] in corrected_idx for s in sample)
+    # Dropping the overlay record altogether: a promoted summary that ignores the pinned
+    # overlay still has 14 cones on sign-flipped declinations and is refused outright.
     keys = (
         "pointing_corrections_path",
         "pointing_corrections_sha256",
@@ -1594,7 +1591,7 @@ def test_overlay_tampering_in_a_promoted_summary_is_caught_offline(overlay_root,
         "corrected_target_names",
         "corrected_pointings",
     )
-    with pytest.raises(ProvenanceError, match="theta"):
+    with pytest.raises(ProvenanceError, match=r"predates the pinned overlay.*14 uncorrected"):
         load({k: v for k, v in doc.items() if k not in keys})
     # Schema: a promoted summary cannot record corrections without the pinned overlay,
     # nor a corrected cone without its query hash and clean commit.

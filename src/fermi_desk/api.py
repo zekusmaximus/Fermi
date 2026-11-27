@@ -195,6 +195,12 @@ class HealthOut(_Out):
     background_summary_code_git_sha: str | None
     n_background_stars: int | None
     n_suspected_unmatched_primary: int | None
+    # v0.2.1c (ruling v0.2.1-R5): the pinned pointing-correction overlay and its state in
+    # the promoted background summary (None until a survey pins one)
+    pointing_corrections_path: str | None
+    pointing_corrections_sha256: str | None
+    n_corrected_pointings: int | None
+    n_uncorrected_flipped_cones: int | None
     receipt_schema_version: int
     read_only: bool
     version: str  # fermi_desk.__version__ (single source: pyproject.toml)
@@ -260,6 +266,7 @@ ADVERSARY_CITATIONS = {
 ADVERSARY_CLAIM_FILES = {
     "hip1692_distance_revision": "data/adversary_claims/hip_1692.yaml",
     "hephaistos_blend_anchors": "data/adversary_claims/hephaistos_candidates_d_e.yaml",
+    "catalog_dec_sign_audit": "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml",
 }
 
 
@@ -348,6 +355,10 @@ def create_app(
                 "background_summary_code_git_sha",
                 "n_background_stars",
                 "n_suspected_unmatched_primary",
+                "pointing_corrections_path",
+                "pointing_corrections_sha256",
+                "n_corrected_pointings",
+                "n_uncorrected_flipped_cones",
             )
         )
         try:  # the background field is verified on load (pin, schema, offline recomputation)
@@ -365,6 +376,14 @@ def create_app(
                     field.record.dedup_audit.n_suspected_unmatched_primary
                 ),
             )
+            pc = field.pointing_corrections()
+            if pc["pointing_corrections_path"] is not None:
+                out.update(
+                    pointing_corrections_path=pc["pointing_corrections_path"],
+                    pointing_corrections_sha256=pc["pointing_corrections_sha256"],
+                    n_corrected_pointings=pc["n_corrected_pointings"],
+                    n_uncorrected_flipped_cones=pc["n_uncorrected_pointings"],
+                )
         try:
             cal = load_sigma_sys_calibration(ir_survey, root)
             gate = load_fits_gate2(ir_survey, root)

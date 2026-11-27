@@ -4,6 +4,7 @@ import type {
   BackgroundDedup,
   BackgroundDistanceCuts,
   BackgroundScope,
+  CorrectedCone,
   EigComparisonRow,
   MergeProvenance,
   PointingCentreAudit,
@@ -19,8 +20,11 @@ import {
   eigVerdict,
   fmtBits,
   fmtCount,
+  fmtDec,
   fmtWatts,
+  gaiaIdOrNone,
   gaiaIdText,
+  overlayStatus,
   scopeRows,
   utcWindow,
 } from "./background";
@@ -29,17 +33,17 @@ const CUTS: BackgroundDistanceCuts = {
   d_max_pc: 10000,
   inverse_parallax_min_snr: 5,
   bailer_jones_min_snr_exclusive: 1,
-  n_cone_sightings_raw: 259285,
-  n_dropped_invalid_parallax: 134601,
+  n_cone_sightings_raw: 258927,
+  n_dropped_invalid_parallax: 134461,
   n_dropped_no_bailer_jones: 0,
-  n_dropped_beyond_d_max: 133,
+  n_dropped_beyond_d_max: 132,
   n_dropped_outside_cone_recheck: 0,
-  n_sightings_with_distance: 124551,
-  n_sightings_inverse_parallax: 37888,
-  n_sightings_bailer_jones_geo: 86663,
-  n_background_stars: 120176,
-  n_background_inverse_parallax: 36069,
-  n_background_bailer_jones_geo: 84107,
+  n_sightings_with_distance: 124334,
+  n_sightings_inverse_parallax: 37814,
+  n_sightings_bailer_jones_geo: 86520,
+  n_background_stars: 119947,
+  n_background_inverse_parallax: 35983,
+  n_background_bailer_jones_geo: 83964,
 };
 
 const MP: MergeProvenance = {
@@ -47,15 +51,15 @@ const MP: MergeProvenance = {
   policy: "union_targets_by_pointing",
   input_surveys: ["bl_enriquez_2017_692", "bl_gbt_lband_background_gaia_dr3"],
   input_sha256s: ["a".repeat(64), "b".repeat(64)],
-  n_raw_targets: 125243,
-  n_merged_targets: 120868,
-  n_dedup_gaia_id: 4270,
-  n_dedup_angular_fallback: 105,
+  n_raw_targets: 125026,
+  n_merged_targets: 120639,
+  n_dedup_gaia_id: 4281,
+  n_dedup_angular_fallback: 106,
   n_multi_beam_resolved: 3764,
   angular_fallback_arcsec: 3,
-  n_raw_by_survey: { bl_enriquez_2017_692: 692, bl_gbt_lband_background_gaia_dr3: 124551 },
-  n_merged_by_role: { primary: 692, background: 120176 },
-  n_background_absorbed_by_primary: 635,
+  n_raw_by_survey: { bl_enriquez_2017_692: 692, bl_gbt_lband_background_gaia_dr3: 124334 },
+  n_merged_by_role: { primary: 692, background: 119947 },
+  n_background_absorbed_by_primary: 647,
   n_angular_links_refused: 8,
   n_duplicate_gaia_ids_post_merge: 0,
 };
@@ -64,8 +68,8 @@ const DEDUP: BackgroundDedup = {
   n_primary_targets: 692,
   n_primary_with_gaia_id: 522,
   n_primary_without_gaia_id: 170,
-  n_background_sightings_matched_to_primary_gaia_id: 523,
-  n_background_sightings_matched_to_primary_angular: 112,
+  n_background_sightings_matched_to_primary_gaia_id: 534,
+  n_background_sightings_matched_to_primary_angular: 113,
   n_duplicate_gaia_ids_vs_primary: 0,
   n_duplicate_gaia_ids_within_background: 0,
   angular_fallback_arcsec: 3,
@@ -84,7 +88,7 @@ const SCOPE: BackgroundScope = {
     data_tier: "reproduced_archive",
     pointings: "692 Enriquez et al. (2017) GBT L-band pointings",
     n_pointings: 692,
-    n_background_stars: 120176,
+    n_background_stars: 119947,
     gaia_release: "Gaia DR3",
     distances: "inverse parallax / Bailer-Jones (2021)",
     selection: "inside the 8.4 arcmin FWHM beam",
@@ -112,11 +116,11 @@ const EIG: EigComparisonRow[] = [
     label: "unphysical",
     physical: false,
     predicted_eig_bits: 0.827341791920764,
-    realized_eig_bits: 0.6514043242652702,
-    realized_over_predicted: 0.7873460891573774,
-    realized_eig_bits_range_fkg_to_frechet: [0, 0.700890842181218],
-    realized_eig_bits_excluding_suspected_unmatched_primary: 0.6514023013095627,
-    realized_information_bits_from_observed_null: 0.46890270968722636,
+    realized_eig_bits: 0.6506810175970102,
+    realized_over_predicted: 0.7864718354023716,
+    realized_eig_bits_range_fkg_to_frechet: [0, 0.7000895745511692],
+    realized_eig_bits_excluding_suspected_unmatched_primary: 0.6506789898544011,
+    realized_information_bits_from_observed_null: 0.4677372197026715,
     data_tiers: ["illustrative_calibration", "reproduced_archive"],
   },
   {
@@ -124,26 +128,26 @@ const EIG: EigComparisonRow[] = [
     label: "physical",
     physical: true,
     predicted_eig_bits: 0.014522573794389263,
-    realized_eig_bits: 0.0023511276893152517,
-    realized_over_predicted: 0.16189469735892134,
-    realized_eig_bits_range_fkg_to_frechet: [0, 0.002432265245932863],
-    realized_eig_bits_excluding_suspected_unmatched_primary: 0.0023470309957474007,
-    realized_information_bits_from_observed_null: 4.2395319305469845e-6,
+    realized_eig_bits: 0.002347208580337587,
+    realized_over_predicted: 0.1616248341078784,
+    realized_eig_bits_range_fkg_to_frechet: [0, 0.0024282060286989968],
+    realized_eig_bits_excluding_suspected_unmatched_primary: 0.00234311187697264,
+    realized_information_bits_from_observed_null: 4.225385840754808e-6,
     data_tiers: ["illustrative_calibration", "reproduced_archive"],
   },
 ];
 
 describe("number and id formatting", () => {
   it("groups thousands and never shows NaN", () => {
-    expect(fmtCount(120176)).toBe("120,176");
+    expect(fmtCount(119947)).toBe("119,947");
     expect(fmtCount(0)).toBe("0");
     expect(fmtCount(null)).toBe("—");
     expect(fmtCount(Number.NaN)).toBe("—");
   });
   it("keeps small EIG values visible instead of rounding them to zero", () => {
-    expect(fmtBits(0.0023511276893152517)).toBe("0.002351");
-    expect(fmtBits(0.6514043242652702)).toBe("0.6514");
-    expect(fmtBits(4.2395319305469845e-6)).toBe("4.24e-6");
+    expect(fmtBits(0.002347208580337587)).toBe("0.002347");
+    expect(fmtBits(0.6506810175970102)).toBe("0.6507");
+    expect(fmtBits(4.225385840754808e-6)).toBe("4.23e-6");
     expect(fmtBits(0)).toBe("0");
     expect(fmtBits(undefined)).toBe("—");
   });
@@ -178,7 +182,7 @@ describe("distance-cut and de-duplication tables", () => {
     const raw = rows[0]!;
     const kept = rows.find((r) => r.label === "sightings with a distance")!;
     const dropped = rows.filter((r) => r.kind === "drop").reduce((s, r) => s + r.value, 0);
-    expect(raw.value).toBe(259285);
+    expect(raw.value).toBe(258927);
     expect(raw.value - dropped).toBe(kept.value);
     expect(rows.filter((r) => r.kind === "keep").reduce((s, r) => s + r.value, 0)).toBe(kept.value);
     expect(rows.some((r) => r.label.includes("beyond 10,000 pc"))).toBe(true);
@@ -186,27 +190,27 @@ describe("distance-cut and de-duplication tables", () => {
   it("lists gaia_id, < 3″ fallback, multi-beam θ_min, absorbed primaries and suspected primaries", () => {
     const rows = dedupRows(MP, DEDUP);
     const value = (needle: string) => rows.find((r) => r.label.includes(needle))?.value;
-    expect(value("gaia_id")).toBe(4270);
-    expect(value("< 3″ fallback")).toBe(105);
+    expect(value("gaia_id")).toBe(4281);
+    expect(value("< 3″ fallback")).toBe(106);
     expect(value("θ_min")).toBe(3764);
-    expect(value("absorbed by primaries")).toBe(635);
+    expect(value("absorbed by primaries")).toBe(647);
     expect(value("duplicate Gaia ids vs bl_692_targets.csv")).toBe(0);
-    expect(value("N_bg")).toBe(120176);
+    expect(value("N_bg")).toBe(119947);
     const flags = rows.filter((r) => r.kind === "flag");
     expect(flags.map((r) => r.value)).toEqual([49, 47]);
     expect(flags[0]?.label).toContain("suspected_unmatched_primary");
   });
   it("checks that the de-duplication arithmetic closes", () => {
     expect(dedupCloses(MP)).toBe(true);
-    expect(dedupCloses({ ...MP, n_dedup_gaia_id: 4271 })).toBe(false);
+    expect(dedupCloses({ ...MP, n_dedup_gaia_id: 4282 })).toBe(false);
   });
 });
 
 describe("scope contrast with Wlodarczyk-Sroka et al. (2020)", () => {
-  it("puts 692 pointings / 120,176 stars beside 1,327 pointings / 288,315 stars", () => {
+  it("puts 692 pointings / 119,947 stars beside 1,327 pointings / 288,315 stars", () => {
     const rows = Object.fromEntries(scopeRows(SCOPE).map((r) => [r.field, r]));
     expect(rows["pointings"]).toMatchObject({ retrieved: "692", published: "1,327" });
-    expect(rows["stars"]).toMatchObject({ retrieved: "120,176", published: "288,315" });
+    expect(rows["stars"]).toMatchObject({ retrieved: "119,947", published: "288,315" });
     expect(rows["Gaia release"]).toMatchObject({ retrieved: "Gaia DR3", published: "Gaia DR2" });
   });
   it("marks a published count that was not verified against the paper", () => {
@@ -233,13 +237,13 @@ describe("realized vs predicted EIG table", () => {
     const [phys, flat] = eigRows(EIG);
     expect(phys).toMatchObject({
       predicted: "0.01452",
-      realized: "0.002351",
+      realized: "0.002347",
       ratio: "0.16× predicted",
-      range: "0 – 0.002432",
-      withoutSuspected: "0.002347",
-      observedNull: "4.24e-6",
+      range: "0 – 0.002428",
+      withoutSuspected: "0.002343",
+      observedNull: "4.23e-6",
     });
-    expect(flat).toMatchObject({ predicted: "0.8273", realized: "0.6514", ratio: "0.79× predicted", range: "0 – 0.7009" });
+    expect(flat).toMatchObject({ predicted: "0.8273", realized: "0.6507", ratio: "0.79× predicted", range: "0 – 0.7001" });
   });
   it("marks both rows illustrative, so neither is drawn as a verified bound", () => {
     expect(eigRows(EIG).every((r) => r.illustrative)).toBe(true);
@@ -248,7 +252,7 @@ describe("realized vs predicted EIG table", () => {
   });
   it("reports a smaller-than-predicted value as a null-strength result", () => {
     expect(eigVerdict(EIG)).toBe(
-      "Physical mode: the real background field is less informative than predicted (0.002351 vs 0.01452 bits) — a null-strength result either way (≪ 1 bit).",
+      "Physical mode: the real background field is less informative than predicted (0.002347 vs 0.01452 bits) — a null-strength result either way (≪ 1 bit).",
     );
     expect(eigVerdict([{ ...EIG[1]!, realized_over_predicted: 2 }])).toContain("more informative than predicted");
     expect(eigVerdict([EIG[0]!])).toBe("no physical-mode comparison available");
@@ -258,15 +262,58 @@ describe("realized vs predicted EIG table", () => {
 
 describe("off-axis attenuation and pointing-centre caveat", () => {
   const att = {
-    median_eirp_min_ratio_background_over_primary: 16038.4,
-    decomposition_of_the_median_ratio: { distance_term: 11408.2, beam_term: 1.4345, note: "" },
+    median_eirp_min_ratio_background_over_primary: 16047.9,
+    decomposition_of_the_median_ratio: { distance_term: 11369.9, beam_term: 1.4192, note: "" },
   } as BackgroundAttenuation;
   it("summarises why background EIRP_min is orders of magnitude higher", () => {
     expect(attenuationHeadline(att)).toBe(
-      "median EIRP_min is ×1.6e+4 the on-axis primaries’ (distance term ×1.1e+4, beam term ×1.43)",
+      "median EIRP_min is ×1.6e+4 the on-axis primaries’ (distance term ×1.1e+4, beam term ×1.42)",
     );
   });
-  const audit: PointingCentreAudit = {
+  const REF = {
+    overlay_path: "data/adversary_claims/isaacson_2017_dec_sign_flip.yaml",
+    overlay_sha256: "7d976fe57e93ca1f38020529ae7e7f2fe106074576223c914547568b35027e74",
+    claim_id: "isaacson_2017_dec_sign_flip",
+    ruling: "v0.2.1-R5",
+    locked_catalog_path: "data/catalogs/bl_692_targets.csv",
+    locked_catalog_sha256: "c299d61df3cd5f7eb9f2a28111fbcb1ae0c375a1dc7f219b2e86fdb005716ee2",
+    locked_catalog_modified: false,
+  };
+  const CONE: CorrectedCone = {
+    target_name: "HIP 103388",
+    pointing_index: 47,
+    catalog_ra_deg: 314.194167,
+    catalog_dec_deg: 10.448333,
+    cone_ra_deg: 314.194154,
+    cone_dec_deg: -10.448541,
+    truth_source: "gaia_dr3",
+    adql_sha256: "a".repeat(64),
+    fetched_at_utc: "2026-11-27T18:53:27+00:00",
+    code_git_sha: "51ae42057ab9081d701aba167c78f5b78a548303",
+  };
+  /** v0.2.1b: the overlay is pinned but the artifact predates it (14 cones on flipped centres). */
+  const before: PointingCentreAudit = {
+    uncorrected_flipped_cones: {
+      ...REF,
+      n: 14,
+      targets: ["HIP 5364"],
+      n_background_stars_in_those_pointings: 1055,
+      fraction_of_background_stars: 1055 / 120176,
+      reading: "cones still centred on a sign-flipped catalog declination",
+    },
+    corrected_via_overlay: {
+      ...REF,
+      n: 0,
+      n_pinned_corrections: 14,
+      targets: [],
+      n_absorbed_by_gaia_id: 0,
+      n_absorbed_by_angular_fallback: 0,
+      not_absorbed: [],
+      not_absorbed_reading: "",
+      n_listed_as_suspected_unmatched_primary: 0,
+      cones: [],
+      policy: "non-destructive overlay",
+    },
     n_primaries: 692,
     n_with_gaia_id: 522,
     n_with_gaia_id_sighted_in_own_cone: 506,
@@ -282,20 +329,93 @@ describe("off-axis attenuation and pointing-centre caveat", () => {
       targets_no_counterpart: ["HIP 5364"],
       n_background_stars_in_those_pointings: 1055,
       fraction_of_background_stars: 1055 / 120176,
+      sign_flip_signature: true,
       reading: "consistent with a declination sign error",
     },
-    policy: "reported, not corrected",
+    policy: "the primary catalog is immutable",
+  };
+  /** v0.2.1c: all 14 cones re-centred; the densest unfound band is an ordinary one. */
+  const after: PointingCentreAudit = {
+    ...before,
+    uncorrected_flipped_cones: {
+      ...REF,
+      n: 0,
+      targets: [],
+      n_background_stars_in_those_pointings: 0,
+      fraction_of_background_stars: 0,
+      reading: "none",
+    },
+    corrected_via_overlay: {
+      ...before.corrected_via_overlay,
+      n: 14,
+      targets: ["HIP 103388"],
+      n_absorbed_by_gaia_id: 11,
+      n_absorbed_by_angular_fallback: 1,
+      not_absorbed: ["HIP 34104", "HIP 77349"],
+      not_absorbed_reading: "no Gaia DR3 sighting with a distance",
+      cones: [CONE],
+    },
+    n_with_gaia_id_sighted_in_own_cone: 517,
+    n_no_counterpart_in_own_cone: 56,
+    densest_band_of_unfound_primaries: {
+      declination_band_deg: [14, 15],
+      mirror_band_deg: [-15, -14],
+      n_targets: 7,
+      n_targets_in_mirror_band: 7,
+      n_no_counterpart: 3,
+      targets_no_counterpart: ["HIP 23786", "HIP 45170", "HIP 57632"],
+      n_background_stars_in_those_pointings: 191,
+      fraction_of_background_stars: 191 / 119947,
+      sign_flip_signature: false,
+      reading: "no declination sign-flip signature",
+    },
   };
   it("states the flagged declination band with its counts", () => {
-    expect(auditCaveat(audit)).toBe(
+    expect(auditCaveat(before)).toBe(
       "14 of the 16 primaries catalogued at Dec +10° to +11° have no Gaia counterpart in their own cone (0 targets in the mirror band): 1,055 background stars (0.88% of N_bg) may come from the wrong field.",
     );
   });
   it("is silent when nothing is flagged", () => {
     expect(auditCaveat(null)).toBeNull();
-    expect(auditCaveat({ ...audit, densest_band_of_unfound_primaries: null })).toBeNull();
+    expect(auditCaveat({ ...before, densest_band_of_unfound_primaries: null })).toBeNull();
     expect(
-      auditCaveat({ ...audit, densest_band_of_unfound_primaries: { ...audit.densest_band_of_unfound_primaries!, n_no_counterpart: 0 } }),
+      auditCaveat({ ...before, densest_band_of_unfound_primaries: { ...before.densest_band_of_unfound_primaries!, n_no_counterpart: 0 } }),
     ).toBeNull();
+  });
+  it("never calls an ordinary band of unfound primaries a wrong field", () => {
+    // 3 of 7 unfound with 7 targets in the mirror band: no sign-flip signature, no caveat.
+    expect(auditCaveat(after)).toBeNull();
+  });
+  it("reports 14/692 erratum cones corrected non-destructively and 0 remaining", () => {
+    expect(overlayStatus(after)).toEqual({
+      corrected: "14/692",
+      headline: "14/692 catalog-erratum cones corrected non-destructively",
+      remaining: "0 uncorrected cones remaining",
+      absorbed: "11 matched to their own Gaia sighting by id, 1 by the < 3″ fallback, 2 not matched (HIP 34104, HIP 77349)",
+      clean: true,
+    });
+  });
+  it("stays loud while cones are still on a sign-flipped centre", () => {
+    const s = overlayStatus(before)!;
+    expect(s.clean).toBe(false);
+    expect(s.headline).toBe("0/692 catalog-erratum cones corrected non-destructively");
+    expect(s.remaining).toBe("14 uncorrected cones remaining: 1,055 background stars (0.88% of N_bg) come from the wrong field");
+    const one = { ...before, uncorrected_flipped_cones: { ...before.uncorrected_flipped_cones, n: 1 } };
+    expect(overlayStatus(one)!.remaining).toContain("1 uncorrected cone remaining");
+  });
+  it("is absent when no overlay is pinned", () => {
+    expect(overlayStatus(null)).toBeNull();
+    const none = { ...after, corrected_via_overlay: { ...after.corrected_via_overlay, overlay_sha256: null } };
+    expect(overlayStatus(none)).toBeNull();
+  });
+  it("prints declinations with an explicit sign and a real minus", () => {
+    expect(fmtDec(CONE.cone_dec_deg)).toBe("−10.4485°");
+    expect(fmtDec(CONE.catalog_dec_deg)).toBe("+10.4483°");
+    expect(fmtDec(null)).toBe("—");
+  });
+  it("shows a missing Gaia id as text, never as a number", () => {
+    expect(gaiaIdOrNone(null)).toBe("no Gaia DR3 id");
+    expect(gaiaIdOrNone("6890353330746858368")).toBe("6890353330746858368");
+    expect(gaiaIdOrNone(6890353330746858368)).toBe("invalid id");
   });
 });

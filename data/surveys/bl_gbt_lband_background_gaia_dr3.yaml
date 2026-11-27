@@ -10,11 +10,12 @@ pointing_group_id: bl_gbt_lband_2017
 parent_pointing_survey_id: bl_enriquez_2017_692
 pointing_merge_policy: union_targets_by_pointing
 data_tier: reproduced_archive
-# 120,176 unique background stars (d <= 10 kpc) after de-duplication, in 46,913 shell cells.
+# 119,947 unique background stars (d <= 10 kpc) after de-duplication, in 46,888 shell cells
+# (v0.2.1c; the v0.2.1b summary held 120,176 stars with 14 cones at sign-flipped centres).
 # This reproduces the METHOD of Wlodarczyk-Sroka, Garrett & Siemion (2020) on the 692
 # Enriquez (2017) L-band pointings with Gaia DR3. It is NOT their catalogue (1,327 Price et
 # al. 2020 multi-band pointings, Gaia DR2, 288,315 stars); the counts are not comparable.
-n_targets: 120176
+n_targets: 119947
 frequency_ghz: [1.1, 1.9]
 # Same observations as the parent: no narrowband detection in any of the 692 ON-target
 # beams (Enriquez et al. 2017), which bounds every star inside each beam, off-axis included.
@@ -22,11 +23,13 @@ observed_detections: 0
 minimum_flux_limit_jy: 17.0
 sefd_jy: 10.0
 # Promoted by `scripts/fetch_wlodarczyk_sroka_288k.py --promote-from` from clean commit
-# 6eca7217acf0 (cones fetched live from the ARI Heidelberg Gaia TAP on 2026-11-27 by clean
-# commit 9f3740ee71b0). `fermi-desk validate` re-checks this pin, the schema, and recomputes
-# the validation sample (beam offsets, off-axis EIRP_min, shell bins) offline.
+# 51ae42057ab9 (v0.2.1c-prep). Cones fetched live from the ARI Heidelberg Gaia TAP on
+# 2026-11-27: 678 by clean commit 9f3740ee71b0 (v0.2.1b, unchanged), and the 14 cones moved
+# by the pointing-correction overlay below by clean commit 51ae42057ab9. `fermi-desk
+# validate` re-checks this pin, the schema, and recomputes the validation sample (beam
+# offsets, off-axis EIRP_min, shell bins) offline.
 background_summary_path: "data/catalogs/bl_gbt_lband_background_summary.json"
-background_summary_sha256: "0d205838e4b65148e3c5e3878c1cf52f1e238a7df5aea47944bf0a7e988ca6e1"
+background_summary_sha256: "eb43b118ab4d0258d9fe20474b73d187cb62a98018b20790b4112f875b0018a9"
 # Ruling v0.2.1-R5: non-destructive pointing-correction overlay. Isaacson et al. (2017)
 # Table 1 prints 14 of these targets at +10 deg instead of -10 deg; data/catalogs/
 # bl_692_targets.csv keeps the published values (immutable), and the background cones and

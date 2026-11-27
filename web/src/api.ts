@@ -53,6 +53,11 @@ export interface Health {
   background_summary_code_git_sha: string | null;
   n_background_stars: number | null;
   n_suspected_unmatched_primary: number | null;
+  /** v0.2.1c (ruling v0.2.1-R5): pinned pointing-correction overlay and its state. */
+  pointing_corrections_path: string | null;
+  pointing_corrections_sha256: string | null;
+  n_corrected_pointings: number | null;
+  n_uncorrected_flipped_cones: number | null;
   receipt_schema_version: number;
   read_only: boolean;
   version: string;
@@ -224,8 +229,41 @@ export interface BackgroundProvenance {
   distance_cuts: BackgroundDistanceCuts;
   merge_provenance: MergeProvenance;
   dedup_audit: BackgroundDedup;
+  /** v0.2.1c (ruling v0.2.1-R5): overlay the survey pins vs. what the artifact was built with. */
+  pointing_corrections: PointingCorrections;
   scope: BackgroundScope;
   methodology_note: string;
+}
+
+/** One cone re-centred by the pointing-correction overlay (the catalog row is unchanged). */
+export interface CorrectedCone {
+  target_name: string;
+  pointing_index: number;
+  catalog_ra_deg: number;
+  catalog_dec_deg: number;
+  cone_ra_deg: number;
+  cone_dec_deg: number;
+  truth_source: "gaia_dr3" | "hip2";
+  adql_sha256: string | null;
+  fetched_at_utc: string | null;
+  code_git_sha: string | null;
+}
+
+export interface PointingCorrections {
+  pointing_corrections_path: string | null;
+  pointing_corrections_sha256: string | null;
+  claim_id: string | null;
+  ruling: string | null;
+  locked_catalog_path: string;
+  locked_catalog_sha256: string;
+  locked_catalog_modified: boolean;
+  n_pinned_corrections: number;
+  artifact_built_with_overlay: boolean;
+  n_corrected_pointings: number;
+  corrected_target_names: string[];
+  corrected_pointings: CorrectedCone[];
+  n_uncorrected_pointings: number;
+  uncorrected_target_names: string[];
 }
 
 export interface HeldOutSurvey {
@@ -460,7 +498,39 @@ export interface BoundsRow {
   data_tiers: string[];
 }
 
+/** Where the overlay comes from, and proof that the locked catalog was only read. */
+export interface OverlayRef {
+  overlay_path: string | null;
+  overlay_sha256: string | null;
+  claim_id: string | null;
+  ruling: string | null;
+  locked_catalog_path: string;
+  locked_catalog_sha256: string;
+  locked_catalog_modified: boolean;
+}
+
 export interface PointingCentreAudit {
+  /** v0.2.1c: overlay entries this artifact still centres on the (wrong) catalog declination. */
+  uncorrected_flipped_cones: OverlayRef & {
+    n: number;
+    targets: string[];
+    n_background_stars_in_those_pointings: number;
+    fraction_of_background_stars: number;
+    reading: string;
+  };
+  /** v0.2.1c: cones fetched at the overlay's J2000 centre (catalog untouched). */
+  corrected_via_overlay: OverlayRef & {
+    n: number;
+    n_pinned_corrections: number;
+    targets: string[];
+    n_absorbed_by_gaia_id: number;
+    n_absorbed_by_angular_fallback: number;
+    not_absorbed: string[];
+    not_absorbed_reading: string;
+    n_listed_as_suspected_unmatched_primary: number;
+    cones: CorrectedCone[];
+    policy: string;
+  };
   n_primaries: number;
   n_with_gaia_id: number;
   n_with_gaia_id_sighted_in_own_cone: number;
@@ -476,6 +546,8 @@ export interface PointingCentreAudit {
     targets_no_counterpart: string[];
     n_background_stars_in_those_pointings: number;
     fraction_of_background_stars: number;
+    /** True only for an empty mirror band with most of the band unfound (a sign-error signature). */
+    sign_flip_signature: boolean;
     reading: string;
   } | null;
   policy: string;
@@ -739,6 +811,45 @@ export interface Finding {
   details: Record<string, unknown>;
   citations: string[];
   repro_command: string;
+}
+
+/** `details` of the `catalog_dec_sign_audit` finding (ruling v0.2.1-R5). */
+export interface DecSignAuditDetails {
+  claim_path: string;
+  claim_sha256: string;
+  ruling: string;
+  locked_catalog: { path: string; sha256: string; checksum_verified: boolean; modified_by_this_audit: boolean };
+  band_census: {
+    flipped_band_deg: [number, number];
+    n_targets_in_flipped_band: number;
+    mirror_band_deg: [number, number];
+    n_targets_in_mirror_band: number;
+  };
+  match_tolerance_arcsec: number;
+  n_affected_targets: number;
+  n_catalog_targets: number;
+  affected_targets: {
+    target_name: string;
+    /** Decimal STRING (ruling v0.2.1-R4), or null when the catalog has no Gaia DR3 id. */
+    gaia_dr3_source_id: string | null;
+    catalog_dec_deg: number;
+    true_dec_deg: number;
+    truth_source: string;
+    truth_data_tier: string;
+    offset_deg: number;
+    sign_restored_separation_arcsec: number;
+    raw_isaacson_dec: string;
+    raw_692stars_dec: string;
+  }[];
+  northern_controls: { target_name: string; catalog_dec_deg: number; corrected: boolean }[];
+  secondary_discrepancies: {
+    id: string;
+    data_tier: string;
+    description: string;
+    inherited_by_locked_catalog: boolean;
+    telescope_pointing_claim: string;
+    records: { target_name: string; catalog_dec_deg: number; raw_isaacson_dec: string; raw_692stars_dec: string }[];
+  }[];
 }
 
 export interface Adversary {

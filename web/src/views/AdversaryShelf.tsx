@@ -1,5 +1,69 @@
-import { get, type Adversary, type Registry } from "../api";
-import { Command, ErrorBox, Hash, Loading, Panel, StatusPill, useApi } from "../components/ui";
+import { get, type Adversary, type Finding, type Registry } from "../api";
+import { Command, ErrorBox, Hash, Loading, Panel, StatusPill, TierBadge, useApi } from "../components/ui";
+import { decSignAudit, decSignHeadline, secondaryNote } from "../lib/adversary";
+import { fmtCount, fmtDec, gaiaIdOrNone } from "../lib/background";
+
+/**
+ * v0.2.1c (ruling v0.2.1-R5): readable body of the `catalog_dec_sign_audit` finding. Tier
+ * colours (DESIGN.md Sec. 1): the catalog values are published_catalog (emerald), the J2000
+ * truth positions are reproduced_archive (cyan). Renders nothing for any other finding.
+ */
+function DecSignDetail({ finding }: { finding: Finding }) {
+  const d = decSignAudit(finding);
+  if (!d) return null;
+  const note = secondaryNote(d);
+  return (
+    <div className="finding-detail">
+      <p className="small">{decSignHeadline(d)}</p>
+      <p className="small">
+        Locked catalog <TierBadge tier="published_catalog" /> <Hash sha={d.locked_catalog.sha256} n={16} />{" "}
+        <span className={d.locked_catalog.modified_by_this_audit ? "bad" : "ok"}>
+          {d.locked_catalog.modified_by_this_audit ? "MODIFIED" : "unmodified (read-only)"}
+        </span>{" "}
+        · claim file <Hash sha={d.claim_sha256} n={16} /> · <span className="num">{d.ruling}</span>
+      </p>
+      <details>
+        <summary>list the {fmtCount(d.affected_targets.length)} affected targets</summary>
+        <div className="scroll-x">
+          <table className="tbl tbl-compact">
+            <thead>
+              <tr>
+                <th>target</th>
+                <th>Gaia DR3 source_id</th>
+                <th className="r">
+                  catalog Dec <TierBadge tier="published_catalog" />
+                </th>
+                <th className="r">
+                  true Dec (J2000) <TierBadge tier="reproduced_archive" />
+                </th>
+                <th className="r">offset</th>
+                <th className="r">sign restored − truth [″]</th>
+                <th>position from</th>
+              </tr>
+            </thead>
+            <tbody>
+              {d.affected_targets.map((t) => (
+                <tr key={t.target_name}>
+                  <td>{t.target_name}</td>
+                  <td className="num">{gaiaIdOrNone(t.gaia_dr3_source_id)}</td>
+                  <td className="r num">{fmtDec(t.catalog_dec_deg)}</td>
+                  <td className="r num">{fmtDec(t.true_dec_deg)}</td>
+                  <td className="r num">{t.offset_deg.toFixed(2)}°</td>
+                  <td className="r num">{t.sign_restored_separation_arcsec.toFixed(2)}</td>
+                  <td>{t.truth_source === "gaia_dr3" ? "Gaia DR3" : "Hipparcos-2"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+      <p className="small">
+        Genuinely northern, never flipped: {d.northern_controls.map((c) => `${c.target_name} (${fmtDec(c.catalog_dec_deg)})`).join(", ")}.
+      </p>
+      {note ? <p className="small muted">{note}</p> : null}
+    </div>
+  );
+}
 
 export function AdversaryShelf({ seed }: { seed: number }) {
   const adv = useApi(() => get<Adversary>(`/api/adversary?seed=${seed}`), [seed]);
@@ -26,6 +90,7 @@ export function AdversaryShelf({ seed }: { seed: number }) {
                   <StatusPill status={f.status} /> <span className={`sev sev-${f.severity}`}>{f.severity}</span> <b>{f.check}</b>
                 </header>
                 <p>{f.summary}</p>
+                <DecSignDetail finding={f} />
                 {f.citations.length ? <p className="muted small">{f.citations.join(" · ")}</p> : null}
                 <Command text={f.repro_command} />
               </article>

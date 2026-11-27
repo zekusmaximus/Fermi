@@ -837,6 +837,25 @@ def background_field_cmd(
             f"{prov['n_pointings']} pointings; FWHM {prov['beam_fwhm_arcmin']:g} arcmin, cone "
             f"radius {prov['cone_radius_arcmin']:g} arcmin (FWHM/2)",
         ),
+        (
+            "pointing corrections (overlay)",
+            prov["pointing_corrections"]["pointing_corrections_path"],
+        ),
+        (
+            "pointing_corrections_sha256 (pinned)",
+            prov["pointing_corrections"]["pointing_corrections_sha256"],
+        ),
+        (
+            "n_corrected_pointings / uncorrected",
+            f"{prov['pointing_corrections']['n_corrected_pointings']} corrected of "
+            f"{prov['pointing_corrections']['n_pinned_corrections']} pinned; "
+            f"{prov['pointing_corrections']['n_uncorrected_pointings']} uncorrected",
+        ),
+        (
+            "locked primary catalog",
+            f"{prov['pointing_corrections']['locked_catalog_path']} "
+            f"{prov['pointing_corrections']['locked_catalog_sha256']} (read-only, unmodified)",
+        ),
     ):
         t.add_row(k, escape(str(v)))
     console.print(t)
@@ -908,13 +927,43 @@ def background_field_cmd(
     if dense:
         lo, hi = dense["declination_band_deg"]
         line += (
-            f" {dense['n_no_counterpart']} of them lie in catalog Dec [{lo:+d}, {hi:+d}) deg "
-            f"({dense['n_targets']} targets there, {dense['n_targets_in_mirror_band']} in the "
-            f"mirror band; {dense['n_background_stars_in_those_pointings']} background stars = "
+            f" Densest band: {dense['n_no_counterpart']} of them lie in catalog Dec "
+            f"[{lo:+d}, {hi:+d}) deg ({dense['n_targets']} targets there, "
+            f"{dense['n_targets_in_mirror_band']} in the mirror band; "
+            f"{dense['n_background_stars_in_those_pointings']} background stars = "
             f"{100 * dense['fraction_of_background_stars']:.2f}% of N_bg): {dense['reading']} "
-            f"Targets: {', '.join(dense['targets_no_counterpart'])}. {audit['policy']}"
+            f"Targets: {', '.join(dense['targets_no_counterpart'])}."
         )
+    line += f" Policy: {audit['policy']}."
     console.print("[yellow]  pointing-centre audit[/] " + escape(line))
+    fixed, stale = audit["corrected_via_overlay"], audit["uncorrected_flipped_cones"]
+    if fixed["overlay_path"]:
+        colour = "red" if stale["n"] else "cyan"
+        console.print(
+            f"[{colour}]  pointing corrections ({escape(str(fixed['ruling']))})[/] "
+            + escape(
+                f"corrected_via_overlay = {fixed['n']} of {fixed['n_pinned_corrections']} "
+                f"(catalog-erratum cones re-centred on J2000 truth by {fixed['overlay_path']}, "
+                f"sha256 {fixed['overlay_sha256']}); uncorrected_flipped_cones = {stale['n']}"
+                + (
+                    f" ({stale['n_background_stars_in_those_pointings']} background stars from "
+                    f"the wrong field: {', '.join(stale['targets'])})"
+                    if stale["n"]
+                    else ""
+                )
+                + f". Corrected primaries absorbed: {fixed['n_absorbed_by_gaia_id']} by Gaia id, "
+                f"{fixed['n_absorbed_by_angular_fallback']} by the angular fallback, "
+                f"{len(fixed['not_absorbed'])} not absorbed"
+                + (
+                    f" ({', '.join(fixed['not_absorbed'])}: {fixed['not_absorbed_reading']})"
+                    if fixed["not_absorbed"]
+                    else ""
+                )
+                + f"; {fixed['n_listed_as_suspected_unmatched_primary']} listed as suspected "
+                f"unmatched primaries. Locked catalog {fixed['locked_catalog_path']} "
+                f"({fixed['locked_catalog_sha256'][:12]}...) unmodified."
+            )
+        )
     dq, eq = shells["distance_quantiles_pc"], shells["eirp_min_quantiles_w"]
     v = att["validation_sample"]
     console.print(

@@ -1331,6 +1331,15 @@ def _overlay_primaries(
     if overlay is not None:
         overlay.corrected_pointings(prim)  # the pinned overlay must fit the locked catalog
     if rec.pointing_corrections_sha256 is None:
+        if overlay is not None and rec.data_tier == "reproduced_archive":
+            # A promoted summary that ignores the pinned overlay still has cones centred on
+            # catalog declinations known to be sign-flipped (ruling v0.2.1-R5).
+            raise ProvenanceError(
+                f"promoted background summary predates the pinned overlay {overlay.path}: "
+                f"{len(overlay.target_names)} uncorrected flipped cone(s) "
+                f"({', '.join(sorted(overlay.target_names))}); re-run "
+                "scripts/fetch_wlodarczyk_sroka_288k.py --fetch, then --promote-from"
+            )
         return prim
     if overlay is None:
         raise ProvenanceError(
@@ -1441,6 +1450,7 @@ def _recompute_background_summary(
     )
 
     bg = rec.validation_sample.background
+    refused_links: list[tuple[str, str]] = []  # (ID-less primary, second Gaia source beside it)
     if bg:
         pidx = np.array([s.pointing_index for s in bg])
         if pidx.max() >= len(prim):
@@ -1480,11 +1490,35 @@ def _recompute_background_summary(
                 [s.ra_match_deg for s in bg] * u.deg, [s.dec_match_deg for s in bg] * u.deg
             )
             no_id = SkyCoord(centres.ra_deg[~has_id] * u.deg, centres.dec_deg[~has_id] * u.deg)
-            _, _, sep, _ = match.search_around_sky(no_id, tol * u.arcsec)
-            if np.any(sep.to_value(u.arcsec) < tol):
+            no_id_names = [str(x) for x in prim.names[~has_id]]
+            i_p, i_s, sep, _ = match.search_around_sky(no_id, tol * u.arcsec)
+            for a, b, s in zip(i_p.tolist(), i_s.tolist(), sep.to_value(u.arcsec), strict=True):
+                if s >= tol:
+                    continue
+                # A star this close to an ID-less primary must have been merged into it -
+                # unless the merge REFUSED the link because the primary had already absorbed
+                # a nearer sighting carrying a different Gaia id (rule: links are taken by
+                # increasing separation and never join two Gaia ids; e.g. a binary published
+                # as one target and resolved by Gaia into two sources). Only that exact case
+                # is accepted; the star then stays in the shells and is reported under
+                # ruling v0.2.1-R3 when its distance is compatible.
+                nearer_other_id = any(
+                    m.primary_target_name == no_id_names[a]
+                    and m.match == "angular_fallback"
+                    and m.gaia_dr3_source_id != bg[b].gaia_dr3_source_id
+                    and m.separation_arcsec <= s
+                    for m in rec.validation_sample.primary_matched
+                )
+                if not nearer_other_id:
+                    raise DoubleCountingError(
+                        "a validation background star lies inside the angular fallback radius of a "
+                        "primary without a Gaia id (unmerged collision)"
+                    )
+                refused_links.append((no_id_names[a], bg[b].gaia_dr3_source_id))
+            if len(refused_links) > mp.n_angular_links_refused:
                 raise DoubleCountingError(
-                    "a validation background star lies inside the angular fallback radius of a "
-                    "primary without a Gaia id (unmerged collision)"
+                    f"{len(refused_links)} validation stars sit inside the fallback radius of a "
+                    f"primary but the merge recorded only {mp.n_angular_links_refused} refused link(s)"
                 )
     index = {str(x): i for i, x in enumerate(prim.names)}
     # Suspected unmatched primaries (ruling v0.2.1-R3: listed, never removed): every one
@@ -1556,6 +1590,12 @@ def _recompute_background_summary(
         f"{da.n_suspected_unmatched_primary} suspected_unmatched_primary row(s) "
         f"({len(suspects)} distinct stars) kept in the shells and reported (v0.2.1-R3)"
     )
+    if refused_links:
+        detail += (
+            f"; {len(refused_links)} validation star(s) within the fallback radius of a primary "
+            "that had already absorbed a nearer, different Gaia id (link refused by rule, not "
+            f"an unmerged collision): {', '.join(f'{p} / Gaia DR3 {g}' for p, g in refused_links)}"
+        )
     if rec.pointing_corrections_sha256 is not None:
         n_adql = sum(c.adql_sha256 is not None for c in rec.corrected_pointings)
         detail += (

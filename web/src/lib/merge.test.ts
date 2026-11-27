@@ -22,15 +22,15 @@ const MP: MergeProvenance = {
   policy: "union_targets_by_pointing",
   input_surveys: ["bl_enriquez_2017_692", "bl_gbt_lband_background_gaia_dr3"],
   input_sha256s: ["a".repeat(64), "b".repeat(64)],
-  n_raw_targets: 125243,
-  n_merged_targets: 120868,
-  n_dedup_gaia_id: 4270,
-  n_dedup_angular_fallback: 105,
+  n_raw_targets: 125026,
+  n_merged_targets: 120639,
+  n_dedup_gaia_id: 4281,
+  n_dedup_angular_fallback: 106,
   n_multi_beam_resolved: 3764,
   angular_fallback_arcsec: 3,
-  n_raw_by_survey: { bl_enriquez_2017_692: 692, bl_gbt_lband_background_gaia_dr3: 124551 },
-  n_merged_by_role: { primary: 692, background: 120176 },
-  n_background_absorbed_by_primary: 635,
+  n_raw_by_survey: { bl_enriquez_2017_692: 692, bl_gbt_lband_background_gaia_dr3: 124334 },
+  n_merged_by_role: { primary: 692, background: 119947 },
+  n_background_absorbed_by_primary: 647,
   n_angular_links_refused: 8,
   n_duplicate_gaia_ids_post_merge: 0,
 };
@@ -65,7 +65,7 @@ describe("pointing merge policy control", () => {
 });
 
 describe("dynamic merge-policy caption", () => {
-  const base = { radioOn: true, nBackground: 120176, heldOutSurveys: [] as string[] };
+  const base = { radioOn: true, nBackground: 119947, heldOutSurveys: [] as string[] };
   it("says the default keeps the verified headline and names what is held out", () => {
     const c = mergePolicyCaption({
       ...base,
@@ -79,7 +79,7 @@ describe("dynamic merge-policy caption", () => {
   });
   it("flags ruling v0.2.1-R2 when a flat probability meets the merged background", () => {
     const c = mergePolicyCaption({ ...base, policy: "union_targets_by_pointing", radioMode: "flat_probability" });
-    expect(c).toContain("Adds 120,176 off-axis background stars");
+    expect(c).toContain("Adds 119,947 off-axis background stars");
     expect(c).toContain("d² / B(θ)");
     expect(c).toContain("HELD OUT of the verified headline (ruling v0.2.1-R2)");
   });
@@ -117,11 +117,11 @@ describe("merge provenance read-out", () => {
   it("lists the receipt counters and flags the suspected primaries", () => {
     const rows = mergeProvenanceRows(MP, 47);
     const by = Object.fromEntries(rows.map((r) => [r.label, r]));
-    expect(by["raw sightings (primaries + cone stars)"]?.value).toBe(125243);
-    expect(by["stars after the merge"]?.value).toBe(120868);
-    expect(by["background stars (N_bg)"]?.value).toBe(120176);
-    expect(by["removed: same Gaia DR3 source_id"]?.value).toBe(4270);
-    expect(by["removed: < 3″ fallback (no Gaia id)"]?.value).toBe(105);
+    expect(by["raw sightings (primaries + cone stars)"]?.value).toBe(125026);
+    expect(by["stars after the merge"]?.value).toBe(120639);
+    expect(by["background stars (N_bg)"]?.value).toBe(119947);
+    expect(by["removed: same Gaia DR3 source_id"]?.value).toBe(4281);
+    expect(by["removed: < 3″ fallback (no Gaia id)"]?.value).toBe(106);
     expect(by["multi-beam stars kept at minimum θ"]?.value).toBe(3764);
     expect(by["duplicate Gaia ids after the merge"]?.value).toBe(0);
     const flagged = rows.filter((r) => r.flag);

@@ -59,7 +59,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   ├── surveys/                    # Calibrated survey metadata & sensitivity specs
 │   ├── catalogs/                   # Small verified target lists (e.g., BL 692 targets) + checksums
 │   ├── calibrations/               # reproduced_archive calibrations (e.g., WISE sigma_sys controls) + checksums
-│   └── adversary_claims/           # Reproducible audits (e.g., HIP 1692, Hephaistos D/E)
+│   └── adversary_claims/           # Reproducible audits (HIP 1692, Hephaistos D/E, Isaacson 2017 Dec sign flip + pinned pointing overlay)
 ├── src/fermi_desk/
 │   ├── __init__.py
 │   ├── schemas.py                  # Pydantic v2 models + Astropy unit validators
@@ -314,13 +314,52 @@ Gaia id and within 30% of its distance is listed in the artifact as
 `suspected_unmatched_primary` with the `pointing_index`, distance and beam offset that address
 its shell cell. Suspects are never removed from the shells; the count is reported in the
 artifact, `fermi-desk validate`, `fermi-desk compare`, `fermi-desk background-field`, the API
-and the Radio drill-down, and every EIG is reported with and without them.
+and the Radio drill-down, and every EIG is reported with and without them. Offline
+re-verification (made exact in v0.2.1c): a validation-sample star inside the 3 arcsec fallback
+radius of an ID-less primary is an unmerged collision (`DoubleCountingError`) **unless** that
+primary already absorbed a nearer sighting carrying a different Gaia id - the one case in
+which the merge rule above refuses the link (e.g. GJ 473AB, one published target resolved by
+Gaia into two sources). Such stars may not outnumber the merge's own `n_angular_links_refused`.
 
 **Ruling v0.2.1-R4 (Gaia ids are strings).** Gaia DR3 `source_id` values exceed 2^53. Every
 `gaia_dr3_source_id` written into an artifact from v0.2.1 on, and every one in an API
 response (including ids read from locked `v0.1.x` artifacts, which keep their integer form on
 disk), is a decimal JSON string; in the background summary a JSON number is a schema error.
 The API also stringifies any other integer beyond +-(2^53 - 1).
+
+**Ruling v0.2.1-R5 (catalog erratum corrected by a pinned overlay, never in place).** Table 1
+of Isaacson et al. (2017) prints every target whose true declination lies in (-11, -10] deg
+without its minus sign (0 rows at -10 deg, 35 at +10 deg among 1,702 targets; the authors'
+arXiv source `table1709_4paper.txt` has the same omission). `bl_692_targets.csv` takes its
+coordinates from that table, so 14 of the 692 primaries sit 20.1 - 21.9 deg north of the star
+that was observed. The catalog **stays immutable** (its SHA-256 and all eight canonical
+single-survey `results_sha256` hashes are unchanged): it is the verbatim `published_catalog`
+record, and a silent in-place edit would detach it from its citation and from every receipt
+that pins it. The correction instead lives in
+`data/adversary_claims/isaacson_2017_dec_sign_flip.yaml`, the single canonical table of the 14
+J2000 positions (11 from Gaia DR3, 3 from Hipparcos-2, `reproduced_archive`), pinned by
+`pointing_corrections_sha256` in the extension survey. It is applied as an overlay in exactly
+three places: the cone centres of the background fetch, the primary positions inside the
+de-duplication, and the offline re-verification of the summary (beam offsets and shell
+directions). The summary records `pointing_corrections_path`, `pointing_corrections_sha256`,
+`n_corrected_pointings`, `corrected_target_names` and, per corrected cone, the queried centre
+and the hash, time and commit of its query; `fermi-desk validate` re-derives each query hash
+at the corrected centre and refuses a promoted summary that ignores the pinned overlay. The
+cone cache is keyed by the queried centre, so applying the overlay re-fetched exactly those
+14 cones (the superseded replies are kept, not deleted). `pointing_centre_audit` reports
+`corrected_via_overlay` (14) and `uncorrected_flipped_cones` (0), and the Adversary runs
+`catalog_dec_sign_audit` offline on every run (a `finding`: 0 targets in [-11, -10) deg, 16 in
+[+10, +11) deg, 14 sign-restored positions within 2 arcsec of truth, the two genuinely
+northern controls HIP 59608 and HIP 92283 untouched). Scope limits, stated rather than hidden:
+(a) the primaries' own positions in the primary likelihood term are still the catalog's
+(no effect in `thin_disk_2d`, which uses distance only; in the 3D modes those 14 targets, at
+13 - 52 pc, are still placed along the catalog's mirrored direction - size of the effect not
+yet measured); (b) 2 of the 14 (HIP 34104, HIP 77349) have only two-parameter Gaia DR3 solutions, so
+no sighting with a distance exists to absorb: they are in no shell and in no suspect list;
+(c) `692stars.csv` (Enriquez et al. 2017) independently prints three (-1, 0) deg targets
+(HIP 99711, HIP 12530, HIP 82588) with a plus sign. That is an upstream published-table
+discrepancy which the catalog does not inherit; whether the telescope tracked the printed
+coordinate is not established (filterbank headers unverified).
 
 **Off-axis sensitivity and background shells (v0.2.1a; ratified in v0.2.1b).** A star at offset
 `theta` from a beam centre has `EIRP_min(d, theta) = 4 pi d^2 F_min / B(theta)` with
@@ -338,8 +377,10 @@ background is illustrative and leaves the verified headline.
 declares the extension (`parent_pointing_survey_id: bl_enriquez_2017_692`,
 `pointing_merge_policy: union_targets_by_pointing`, `data_tier: reproduced_archive`) and pins
 the summary by SHA-256. The summary reproduces the *method* of Wlodarczyk-Sroka et al. (2020)
-on the 692 Enriquez et al. (2017) GBT L-band pointings with Gaia DR3 (120,176 stars); it is not
-their catalogue (1,327 Price et al. 2020 multi-band pointings, Gaia DR2, 288,315 stars). A
+on the 692 Enriquez et al. (2017) GBT L-band pointings with Gaia DR3 (119,947 stars since
+v0.2.1c; 120,176 in v0.2.1b, of which 1,055 came from 14 cones at sign-flipped centres, ruling
+v0.2.1-R5); it is not their catalogue (1,327 Price et al. 2020 multi-band pointings, Gaia DR2,
+288,315 stars). A
 `reproduced_archive` summary must carry a clean `code_git_sha`, all 692 pointings, the true
 archive query window (`query_window_utc`, when cones were fetched) beside `assembled_at_utc`,
 `cone_cache_manifest_sha256` (the raw cone bytes) and `cone_cache_code_git_shas` (every commit
@@ -427,7 +468,10 @@ linked evidence (`fermi-desk background-field`, `GET /api/queue`).
    background stars over the 692 Enriquez (2017) L-band pointings, promoted to
    `data/catalogs/bl_gbt_lband_background_summary.json` (`reproduced_archive`). Realized EIG:
    0.00235 bits in `distance_scaled_eirp` (predicted 0.01452) and 0.651 bits in the unphysical
-   `flat_probability` mode (predicted 0.827): a null-strength result.
+   `flat_probability` mode (predicted 0.827): a null-strength result. **Corrected in v0.2.1c**
+   (ruling v0.2.1-R5): 14 cones had been fetched at sign-flipped declinations; re-fetching
+   only those 14 gives 119,947 stars and 0.002347 / 0.6507 bits. The null-strength verdict
+   is unchanged.
 2. **Finite-Galaxy disk geometry (`R_gal = 15 kpc`).** The expansion kernel is a local
    infinite-disk approximation valid only while `v_exp * T <= 8 kpc`; for
    `rare_fast_expanders` (`v_exp = 0.5 c`) this gives `T_valid = 52.2 kyr`, so receipts at

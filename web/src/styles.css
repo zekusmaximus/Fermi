@@ -260,3 +260,13 @@ button.door:hover { border-color: var(--accent); }
 .mode-physical { color: var(--cyan); border-color: var(--cyan); }
 .mode-unphysical { color: var(--red); border-color: var(--red); }
 @media (prefers-reduced-motion: reduce) { .verdict { transition: none; } }
+
+/* v0.2.1c (ruling v0.2.1-R5): pointing-centre audit block. Cyan = reproduced_archive overlay
+   with nothing left uncorrected; red = cones still on a sign-flipped catalog centre. */
+.audit-block { border-left: 3px solid var(--cyan); background: rgba(34, 211, 238, 0.06); padding: 8px 12px; font-size: 13px; margin: 10px 0; }
+.audit-block p { margin: 4px 0; }
+.audit-block.audit-bad { border-left-color: var(--red); background: rgba(248, 113, 113, 0.08); }
+.audit-headline { font-size: 14px; }
+.audit-headline .stat-big { font-size: 20px; margin-right: 4px; }
+.finding-detail { margin-top: 6px; }
+.finding-detail p { margin: 4px 0; }

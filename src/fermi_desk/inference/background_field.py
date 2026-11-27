@@ -298,6 +298,12 @@ def pointing_centre_audit(graph: FactorGraph, field: BackgroundField) -> dict:
             "n_absorbed_by_gaia_id": sum(how.get(n) == "gaia_dr3_source_id" for n in fixed),
             "n_absorbed_by_angular_fallback": sum(how.get(n) == "angular_fallback" for n in fixed),
             "not_absorbed": sorted(n for n in fixed if n not in how),
+            "not_absorbed_reading": (
+                "a corrected primary that absorbed nothing has no Gaia DR3 sighting WITH A "
+                "DISTANCE within the fallback radius of its corrected position: sources "
+                "without a usable parallax are dropped by the distance cut before the "
+                "de-duplication, so they are in no shell either"
+            ),
             "n_listed_as_suspected_unmatched_primary": sum(n in suspected for n in fixed),
             "cones": pc["corrected_pointings"],
             "policy": (
@@ -320,8 +326,10 @@ def pointing_centre_audit(graph: FactorGraph, field: BackgroundField) -> dict:
         "n_no_counterpart_in_own_cone": int((~found).sum()),
         "densest_band_of_unfound_primaries": None,
         "policy": (
-            "reported, not corrected: the primary catalog is immutable (ruling v0.2.1-R3); a "
-            "catalog correction needs its own provenance run and a new pinned SHA-256"
+            "the primary catalog is immutable and is never corrected in place (rulings "
+            "v0.2.1-R3 / R5): a known coordinate erratum is corrected only through a "
+            "SHA-256-pinned pointing-correction overlay applied to the background cones; "
+            "anything else is reported here, not corrected"
         ),
     }
     if (~found).any():
@@ -333,20 +341,31 @@ def pointing_centre_audit(graph: FactorGraph, field: BackgroundField) -> dict:
         mirror = (band == b) & (north != bool(is_north))
         missing = here & ~found
         lo, hi = (b, b + 1) if is_north else (-(b + 1), -b)
+        n_here, n_mirror, n_missing = int(here.sum()), int(mirror.sum()), int(missing.sum())
+        # The signature of a sign error: an empty mirror band AND most of the band unfound.
+        # Computed, never assumed: after the overlay corrects the known flips, the densest
+        # band of unfound primaries is an ordinary one and must not be read as an erratum.
+        signature = n_mirror == 0 and 2 * n_missing > n_here
         out["densest_band_of_unfound_primaries"] = {
             "declination_band_deg": [lo, hi],
             "mirror_band_deg": [-hi, -lo],
-            "n_targets": int(here.sum()),
-            "n_targets_in_mirror_band": int(mirror.sum()),
-            "n_no_counterpart": int(missing.sum()),
+            "n_targets": n_here,
+            "n_targets_in_mirror_band": n_mirror,
+            "n_no_counterpart": n_missing,
             "targets_no_counterpart": sorted(n for n, m in zip(names, missing, strict=True) if m),
             "n_background_stars_in_those_pointings": int(per_pointing[missing].sum()),
             "fraction_of_background_stars": float(per_pointing[missing].sum() / per_pointing.sum()),
+            "sign_flip_signature": bool(signature),
             "reading": (
                 "many catalog targets in one declination band, none in its mirror band, and "
                 "most of them missing from their own cone: consistent with a declination sign "
                 "error in the primary catalog for that band. If so, these cones were fetched "
                 "around the mirrored position and their stars are not the stars in the beam."
+                if signature
+                else f"no declination sign-flip signature: the mirror band holds {n_mirror} "
+                f"target(s) and {n_missing} of the {n_here} targets here lack a counterpart. A "
+                "primary without one is typically too bright for Gaia DR3 or has no usable "
+                "parallax there; its cone is still centred on the star."
             ),
         }
     return out

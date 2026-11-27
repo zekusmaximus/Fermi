@@ -14,6 +14,8 @@ const DEFAULT_COMPARE: CompareRequest = {
   channels: ["radio", "infrared", "solar_system"],
   include_illustrative: false,
   seed: OVERVIEW_SEED,
+  disk_profile: "uniform",
+  marginalize_lookback: false,
 };
 
 const dash = "—";

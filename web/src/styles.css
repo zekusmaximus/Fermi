@@ -80,6 +80,8 @@ code, .num, .hash { font-family: var(--mono); font-variant-numeric: tabular-nums
 .seed-input { width: 120px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .illus-toggle { display: inline-flex; gap: 8px; align-items: center; padding: 6px 10px; border: 1px dashed var(--amber); border-radius: 6px; color: var(--amber); cursor: pointer; font-weight: 600; }
 .illus-toggle.on { background: rgba(245, 158, 11, 0.15); }
+.marg-toggle { display: inline-flex; gap: 8px; align-items: center; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); cursor: pointer; font-weight: 600; }
+.marg-toggle.on { border-color: var(--cyan); color: var(--cyan); background: rgba(34, 211, 238, 0.1); }
 
 .verdict { border-radius: 12px; padding: 16px 18px; border: 1px solid var(--line); background: var(--panel); transition: opacity 0.15s; }
 .verdict.stale { opacity: 0.65; }
@@ -108,6 +110,7 @@ code, .num, .hash { font-family: var(--mono); font-variant-numeric: tabular-nums
 .tab.on { color: var(--text); border-color: var(--accent); }
 .tabs-lg .tab { font-size: 13px; padding: 6px 14px; }
 .badge-violated { display: inline-block; background: rgba(248, 113, 113, 0.15); color: var(--red); border: 1px solid var(--red); border-radius: 4px; padding: 0 6px; font: 700 11px/1.7 var(--mono); }
+.badge-finite { display: inline-block; background: rgba(34, 211, 238, 0.12); color: var(--cyan); border: 1px solid var(--emerald); border-radius: 4px; padding: 0 6px; font: 700 11px/1.7 var(--mono); }
 
 .btn { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
 .btn:hover:not(:disabled) { border-color: var(--accent); }

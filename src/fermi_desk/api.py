@@ -45,7 +45,7 @@ from fermi_desk.inference.engine import (
     run_comparison,
 )
 from fermi_desk.models import radio
-from fermi_desk.models.expansion import C_KPC_PER_GYR
+from fermi_desk.models.expansion import C_KPC_PER_GYR, FINITE_DISK
 from fermi_desk.queue.store import JOB_DEFINITIONS, JobDefinition, JobStore
 from fermi_desk.registry import (
     FactorGraph,
@@ -102,7 +102,7 @@ def json_safe(obj: Any) -> Any:
 class CompareRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    geometry_mode: Literal["thin_disk_2d", "thick_disk_3d"] = "thin_disk_2d"
+    geometry_mode: Literal["thin_disk_2d", "thick_disk_3d", "finite_disk_3d"] = "thin_disk_2d"
     radio_mode: Literal["flat_probability", "distance_scaled_eirp"] = "flat_probability"
     condition_on_earth_unreached: StrictBool = True
     channels: list[ChannelName] = Field(
@@ -110,6 +110,10 @@ class CompareRequest(BaseModel):
     )
     include_illustrative: StrictBool = False
     seed: Seed = 42
+    # v0.2.0. disk_profile is validated for every request and applied to finite_disk_3d
+    # only; marginalize_lookback integrates T over its registry log-uniform prior.
+    disk_profile: Literal["uniform", "exponential"] = "uniform"
+    marginalize_lookback: StrictBool = False
 
     @field_validator("channels")
     @classmethod
@@ -225,6 +229,8 @@ def create_app(
     runs_dir: Path | None = None,
     static_dir: Path | None = None,
     compare_n_mc: int = 20000,
+    compare_n_importance: int = 16384,
+    lookback_grid_points: int = 16,
     ir_n_trials: int = 40,
     adversary_n_mc: int = 4000,
     seed_jobs: Sequence[JobDefinition] | None = None,
@@ -319,11 +325,24 @@ def create_app(
             headline_pair=PAIR,
             ir_pair=IR_PAIR if "infrared" in req.channels else None,
             include_illustrative_in_headline=req.include_illustrative,
+            disk_profile=req.disk_profile if req.geometry_mode == FINITE_DISK else "uniform",
+            marginalize_lookback=req.marginalize_lookback,
+            lookback_grid_points=lookback_grid_points,
+            n_importance=compare_n_importance,
         )
         rec = run_comparison(graph, cfg)
         for h in rec["results"]["hypotheses"].values():
             v = h["parameters"].get("expansion_speed_c", {}).get("value")
             if h.get("expansion") and v:
+                if req.geometry_mode == FINITE_DISK:
+                    # No infinite-disk limit: origins are confined to R <= R_gal.
+                    h["expansion"]["t_valid_gyr"] = None
+                    h["expansion"]["t_valid_kyr"] = None
+                    h["expansion"]["local_validity_criterion"] = (
+                        "finite Galactic disk (origins confined to R <= R_gal): valid at any "
+                        "v_exp * T"
+                    )
+                    continue
                 t = LOCAL_VALIDITY_KPC / (v * C_KPC_PER_GYR)
                 h["expansion"]["t_valid_gyr"] = t
                 h["expansion"]["t_valid_kyr"] = t * 1e6

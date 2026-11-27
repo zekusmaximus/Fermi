@@ -17,11 +17,19 @@ from fermi_desk.inference.engine import (
     CHANNELS,
     HEADLINE_VERIFIED,
     ILLUSTRATIVE_TIERS,
+    LOOKBACK_MARGINALIZATION,
     RunConfig,
+    results_digest,
     run_comparison,
     write_receipt,
 )
-from fermi_desk.models.expansion import GEOMETRY_MODES
+from fermi_desk.models.expansion import (
+    DISK_PROFILES,
+    FINITE_DISK,
+    GEOMETRY_MODES,
+    LOCAL_APPROX_OK,
+    LOCAL_APPROX_VIOLATED,
+)
 from fermi_desk.models.radio import RADIO_MODES
 from fermi_desk.registry import load_factor_graph, run_validation
 
@@ -86,6 +94,63 @@ def validate(root: Root = None) -> None:
 
 
 # -------------------------------------------------------------------- compare
+def _local_approx(ex: dict) -> str:
+    """ok | VIOLATED (local infinite disks) | valid_finite_galaxy (finite_disk_3d)."""
+    return ex.get("local_approx") or (
+        LOCAL_APPROX_OK if ex["local_approximation_valid"] else LOCAL_APPROX_VIOLATED
+    )
+
+
+def _print_lookback_nodes(res: dict, pair: tuple[str, str]) -> None:
+    """Per-T diagnostic table of a lookback-marginalised run (headline pair)."""
+    a, b = (res["hypotheses"][h][LOOKBACK_MARGINALIZATION] for h in pair)
+    t = _table(
+        f"Lookback grid diagnostics: A = {pair[0]}, B = {pair[1]} (per-node, fixed T)",
+        (
+            "T [Gyr]",
+            "prior w",
+            "P(E reached) A",
+            "P(E reached) B",
+            "E[N] A",
+            "E[N] B",
+            "post. w A",
+            "post. w B",
+            "log10 BF verified @T",
+            "local A",
+            "local B",
+        ),
+    )
+    for col in t.columns[-2:]:
+        col.min_width = 12  # "valid_finite" / "_galaxy" folds on the underscore
+    verified = res["headline"]["verified"]["terms"]
+    for ra, rb in zip(a["per_node"], b["per_node"], strict=True):
+        bf_t = sum(ra["log10_p_by_component"][c] - rb["log10_p_by_component"][c] for c in verified)
+        t.add_row(
+            f"{ra['lookback_gyr']:.3e}",
+            f"{ra['prior_weight']:.4f}",
+            _fmt(ra.get("p_earth_reached")),
+            _fmt(rb.get("p_earth_reached")),
+            _fmt(ra.get("expected_reached")),
+            _fmt(rb.get("expected_reached")),
+            f"{ra['posterior_weight']:.4f}",
+            f"{rb['posterior_weight']:.4f}",
+            f"{bf_t:+.4g}",
+            ra.get("local_approx", "-"),
+            rb.get("local_approx", "-"),
+        )
+    console.print(t)
+    for hid in pair:
+        chk = res["hypotheses"][hid][LOOKBACK_MARGINALIZATION].get("earth_term_quadrature_check")
+        if chk:
+            console.print(
+                escape(
+                    f"  {hid}: grid check log10 P(Earth unreached) = {chk['value']:.8g} "
+                    f"({chk['n_points']} nodes) vs {chk['value_fine']:.8g} "
+                    f"({chk['n_points_fine']} nodes); |diff| = {chk['abs_difference_dex']:.2e} dex"
+                )
+            )
+
+
 def _tier_tag(tiers: list[str]) -> str:
     bad = sorted(t for t in tiers if t in ILLUSTRATIVE_TIERS)
     return ", ".join(bad) if bad else "verified (" + (", ".join(tiers) or "model term") + ")"
@@ -177,6 +242,26 @@ def compare(
             ),
         ),
     ] = False,
+    disk_profile: Annotated[
+        str,
+        typer.Option(help=f"{FINITE_DISK} density profile, one of {DISK_PROFILES} (else ignored)."),
+    ] = "uniform",
+    marginalize_lookback: Annotated[
+        bool,
+        typer.Option(
+            "--marginalize-lookback",
+            help=(
+                "Integrate the lookback window T over its registry log-uniform prior "
+                "(50 kyr - 10 Myr) in likelihood space instead of fixing T (default: off)."
+            ),
+        ),
+    ] = False,
+    lookback_grid_points: Annotated[
+        int, typer.Option(min=2, help="Gauss-Legendre nodes in ln T for --marginalize-lookback.")
+    ] = 16,
+    n_importance: Annotated[
+        int, typer.Option(min=16, help=f"{FINITE_DISK} per-target importance samples.")
+    ] = 16384,
     out_dir: Annotated[Path | None, typer.Option(help="Receipt directory (default runs/).")] = None,
     root: Root = None,
 ) -> None:
@@ -191,17 +276,36 @@ def compare(
         n_mc=n_mc,
         headline_pair=_pair(pair),
         ir_pair=_pair(ir_pair),
+        disk_profile=disk_profile,
+        marginalize_lookback=marginalize_lookback,
+        lookback_grid_points=lookback_grid_points,
+        n_importance=n_importance,
     )
     graph = load_factor_graph(root)
     receipt = run_comparison(graph, cfg)
     res = receipt["results"]
     rows = list(res["hypotheses"].items())
+    finite = geometry == FINITE_DISK
+    marg = res.get(LOOKBACK_MARGINALIZATION)
 
     console.rule(
         f"fermi-desk compare | geometry={geometry} radio_mode={radio_mode} seed={seed} "
         f"earth_unreached={'on' if condition_on_earth_unreached else 'off'} | "
         f"headline={receipt['headline_policy']}"
+        + (f" | disk_profile={disk_profile}" if finite else "")
+        + (" | lookback=MARGINALIZED" if marg else "")
     )
+    if marg:
+        lo, hi = marg["prior"]["effective_bounds_gyr"]
+        console.print(
+            escape(
+                f"Lookback T marginalised: log-uniform prior [{lo * 1e6:g} kyr, {hi * 1e3:g} Myr], "
+                f"{marg['quadrature']['n_points']}-point {marg['quadrature']['rule']}, in "
+                "likelihood space (logsumexp; log-probabilities are never averaged). Table "
+                "values below are lookback-averaged; Bayes-factor terms are chain-rule "
+                "conditionals that sum to the joint marginal."
+            )
+        )
     t1 = _table(
         "Expansion & radio forward model (per scored hypothesis)",
         (
@@ -217,6 +321,7 @@ def compare(
             "local approx",
         ),
     )
+    t1.columns[-1].min_width = 12  # "valid_finite" / "_galaxy" folds on the underscore
     for hid, h in rows:
         ex, rd, ir = h.get("expansion") or {}, h.get("radio") or {}, h.get("infrared") or {}
         ir_cell = "-"
@@ -232,9 +337,38 @@ def compare(
             _fmt(rd.get("p_zero_independent_fkg_lower"), ".8f"),
             _fmt(rd.get("p_zero_markov_lower"), ".8f"),
             ir_cell,
-            "-" if not ex else ("ok" if ex["local_approximation_valid"] else "VIOLATED"),
+            "-" if not ex else _local_approx(ex),
         )
     console.print(t1)
+    if finite:
+        for hid, h in rows:
+            fd = (h.get("radio") or {}).get("finite_disk_reach")
+            if not fd or marg:
+                continue
+            console.print(
+                escape(
+                    f"  {hid}: E[N] model = {h['radio']['expected_reached']:.5g} +/- "
+                    f"{fd['expected_reached_se']:.2g} (importance-sampled, "
+                    f"{fd['n_importance_samples']} samples); Earth cone Lambda = "
+                    f"{h['expansion']['earth_lambda']:.6g} (quadrature) vs "
+                    f"{fd['earth_lambda_importance_crosscheck']:.6g} +/- "
+                    f"{fd['earth_lambda_importance_crosscheck_se']:.2g} (importance cross-check)"
+                )
+            )
+        geo = next((h["expansion"]["finite_disk"] for _, h in rows if h.get("expansion")), None)
+        if geo:
+            console.print(
+                escape(
+                    f"  finite_disk_3d: R_gal = {geo['galactic_disk_radius_kpc']:g} kpc, Sun at "
+                    f"(R, Z) = ({geo['solar_cylindrical_radius_kpc']:.5f}, "
+                    f"{geo['solar_height_kpc']:.4f}) kpc, profile {geo['disk_profile']}: "
+                    f"{geo['density_normalisation']}; local approx: valid_finite_galaxy "
+                    "(no infinite-disk limit)"
+                )
+            )
+    if marg and "headline" in res:
+        pair_ids = (res["headline"]["numerator"], res["headline"]["denominator"])
+        _print_lookback_nodes(res, pair_ids)
 
     names = ("earth_unreached", "radio", "solar_system", "radio+solar_system", "infrared")
     present = [c for c in names if any(c in h["components"] for _, h in rows)]
@@ -330,6 +464,7 @@ def compare(
             f"data_tiers_used={receipt['data_tiers_used']}"
         )
     )
+    console.print(f"results_sha256={results_digest(receipt)}")
 
 
 # ---------------------------------------------------------------- ir-drilldown

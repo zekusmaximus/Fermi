@@ -27,7 +27,7 @@ Every model, survey, and pull request in this repository is governed by six CI-e
 2. **Three-Tier Stratification:** Predictive physical models (Tier 1), rate-constrained models (Tier 2), and unfalsifiable/monoculture claims (Tier 3) are never scored in the same pool.
 3. **Zero-Emission Invariance:** Setting a channel's detectable emission probability to `0.0` must return a likelihood ratio of exactly `1.0` across all expansion models.
 4. **Strict Non-Double-Counting:** Surveys declare a `pointing_group_id`; joint inference rejects duplicate conditioning on overlapping observations.
-5. **Explicit 2D vs. 3D Geometry:** Expansion kernels parameterize disk thickness (`thin_disk_2d` vs. `thick_disk_3d`) so 2D scaling symmetries are tested rather than assumed.
+5. **Explicit 2D vs. 3D Geometry:** Expansion kernels parameterize disk thickness (`thin_disk_2d` vs. `thick_disk_3d`) so 2D scaling symmetries are tested rather than assumed. Since v0.2.0 a third explicit mode, `finite_disk_3d` (`R_gal = 15 kpc`, uniform or exponential density), removes the infinite-disk validity limit.
 6. **Provenance Tagging:** Every dataset declares its `data_tier` (`published_catalog`, `reproduced_archive`, `illustrative_calibration`, or `synthetic_proxy`).
 
 ---
@@ -52,7 +52,14 @@ uv run pytest -v
 # 5. Run the flagship macro comparison (2D flat baseline vs. 3D distance-scaled EIRP)
 uv run fermi-desk compare --geometry thin_disk_2d --radio-mode flat_probability --seed 42
 uv run fermi-desk compare --geometry thick_disk_3d --radio-mode distance_scaled_eirp --seed 42
+
+# 6. v0.2.0: finite Galactic disk (no infinite-disk validity limit) and lookback-T marginalization
+uv run fermi-desk compare --geometry finite_disk_3d --radio-mode flat_probability --seed 42
+uv run fermi-desk compare --geometry finite_disk_3d --disk-profile exponential --radio-mode flat_probability --seed 42
+uv run fermi-desk compare --geometry finite_disk_3d --radio-mode flat_probability --marginalize-lookback --seed 42
 ```
+
+`--marginalize-lookback` integrates the lookback window `T` over the registry's log-uniform prior (50 kyr–10 Myr) in likelihood space; it evaluates one full run per grid node (16 by default), so expect roughly 40 s (`thin_disk_2d`) to 2.5 min (`thick_disk_3d`).
 
 Every `compare` run writes a deterministic JSON `RunReceipt` (including git SHA, RNG seed, active surveys, and data tiers used) to `runs/`.
 

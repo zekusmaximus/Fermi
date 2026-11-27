@@ -73,7 +73,8 @@ export interface Registry {
   surveys: { id: string; name: string; channel: string; data_tier: string; n_targets: number }[];
 }
 
-export type Geometry = "thin_disk_2d" | "thick_disk_3d";
+export type Geometry = "thin_disk_2d" | "thick_disk_3d" | "finite_disk_3d";
+export type DiskProfile = "uniform" | "exponential";
 export type RadioMode = "flat_probability" | "distance_scaled_eirp";
 export type Channel = "radio" | "infrared" | "solar_system";
 
@@ -84,6 +85,17 @@ export interface CompareRequest {
   channels: Channel[];
   include_illustrative: boolean;
   seed: number;
+  /** v0.2.0: applied to finite_disk_3d only (server default "uniform"). */
+  disk_profile: DiskProfile;
+  /** v0.2.0: integrate the lookback window T over its log-uniform prior (default false). */
+  marginalize_lookback: boolean;
+}
+
+/** v0.2.0: prior and grid of a lookback-marginalised run (absent on fixed-T receipts). */
+export interface LookbackMarginalization {
+  parameter: string;
+  prior: { type: string; declared_bounds_gyr: [number, number]; effective_bounds_gyr: [number, number]; log_floor: number | null };
+  quadrature: { rule: string; n_points: number; lookback_gyr: number[]; weights: number[] };
 }
 
 export interface Component {
@@ -110,6 +122,9 @@ export interface ScoredHypothesis {
     local_approximation_valid: boolean;
     max_bubble_radius_kpc: number | null;
     t_valid_kyr?: number | null;
+    /** v0.2.0: "valid_finite_galaxy" under finite_disk_3d; "ok" | "VIOLATED" when marginalised. */
+    local_approx?: string | null;
+    finite_disk?: { disk_profile: string; galactic_disk_radius_kpc: number; density_normalisation: string } | null;
   } | null;
   radio?: {
     expected_reached: number | null;
@@ -150,6 +165,9 @@ export interface CompareResponse {
     git_sha: string;
     rng_seed: number;
     data_tiers_used: string[];
+    geometry_mode?: string;
+    disk_profile?: string;
+    lookback_marginalization?: LookbackMarginalization;
     results: {
       hypotheses: Record<string, ScoredHypothesis>;
       tier3_quarantine: {

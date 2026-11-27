@@ -21,8 +21,8 @@ import itertools
 import json
 import math
 import subprocess
-from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,11 +31,32 @@ import numpy as np
 
 from fermi_desk.errors import GeometryError, SchemaValidationError, Tier3ScoringError
 from fermi_desk.models import infrared, radio, solar_system
-from fermi_desk.models.expansion import GEOMETRY_MODES, ExpansionModel
+from fermi_desk.models.expansion import (
+    DISK_PROFILES,
+    FINITE_DISK,
+    GEOMETRY_MODES,
+    LOCAL_APPROX_FINITE,
+    LOCAL_APPROX_OK,
+    LOCAL_APPROX_VIOLATED,
+    ExpansionModel,
+)
 from fermi_desk.registry import FactorGraph, TargetTable, check_pointing_groups, load_targets
 from fermi_desk.schemas import Hypothesis, Survey
 
 LN10 = math.log(10.0)
+LOOKBACK = "lookback_window_gyr"
+LOOKBACK_MARGINALIZATION = "lookback_marginalization"
+MARGINAL_SPACE = (
+    "likelihood space: P(data | H) = sum_k w_k * prod_c P_c(data_c | H, T_k), evaluated as "
+    "logsumexp_k(ln w_k + sum_c ln P_c); log-probabilities are never averaged"
+)
+MARGINAL_TERM_SEMANTICS = (
+    "sequential conditional marginals (chain rule) in the listed term order: each term is "
+    "log10 P(term data | H, data of the terms before it), marginalised over the lookback "
+    "prior; the terms add up exactly to the joint marginal over the listed set. Verified "
+    "terms always precede illustrative ones, so no illustrative likelihood re-weights the "
+    "lookback posterior behind a verified term"
+)
 CHANNELS = ("radio", "infrared", "solar_system")
 # Data tiers that are NOT verified observational inputs (SPEC.md Sec. 2 invariant 6).
 ILLUSTRATIVE_TIERS = frozenset(
@@ -92,6 +113,16 @@ class RunConfig:
     # Milestone 2.5 policy ruling: the headline Bayes factor covers verified channels
     # only unless the caller deliberately folds illustrative channels in.
     include_illustrative_in_headline: bool = False
+    # v0.2.0 -------------------------------------------------------------------
+    # Density profile of finite_disk_3d ("uniform" | "exponential"); ignored otherwise.
+    disk_profile: str = "uniform"
+    # Integrate the lookback window T over its registry log-uniform prior (likelihood
+    # space, Gauss-Legendre in ln T) instead of fixing it. Default off: single-T runs
+    # and their results_sha256 are unchanged.
+    marginalize_lookback: bool = False
+    lookback_grid_points: int = 16
+    # Samples of the seeded per-target importance sampler (finite_disk_3d only).
+    n_importance: int = 16384
 
     def __post_init__(self) -> None:
         if self.geometry not in GEOMETRY_MODES:
@@ -103,6 +134,12 @@ class RunConfig:
             raise ValueError(f"Unknown channels {sorted(bad)}")
         if self.n_mc < 2:
             raise ValueError("n_mc must be >= 2")
+        if self.disk_profile not in DISK_PROFILES:
+            raise GeometryError(f"disk_profile must be one of {DISK_PROFILES}")
+        if self.lookback_grid_points < 2:
+            raise ValueError("lookback_grid_points must be >= 2")
+        if self.n_importance < 16:
+            raise ValueError("n_importance must be >= 16")
 
 
 # --------------------------------------------------------- parameter resolution
@@ -174,6 +211,16 @@ def resolve_parameters(
 
 
 def expansion_model(params: ResolvedParameters, cfg: RunConfig) -> ExpansionModel:
+    finite: dict = {}
+    if cfg.geometry == FINITE_DISK:
+        finite = {
+            "disk_profile": cfg.disk_profile,
+            "disk_radius": params.quantity("galactic_disk_radius_kpc"),
+            "solar_galactocentric_radius": params.quantity("solar_galactocentric_radius_kpc"),
+            "radial_scale_length": params.quantity("galactic_radial_scale_length_kpc"),
+            "importance_seed": cfg.seed,
+            "n_importance": cfg.n_importance,
+        }
     return ExpansionModel(
         geometry=cfg.geometry,
         origin_rate=params.quantity("origin_rate_per_kpc2_gyr"),
@@ -182,6 +229,7 @@ def expansion_model(params: ResolvedParameters, cfg: RunConfig) -> ExpansionMode
         scale_height=params.quantity("disk_scale_height_pc"),
         solar_height=params.quantity("solar_height_pc"),
         light_travel_delay=cfg.light_travel_delay,
+        **finite,
     )
 
 
@@ -237,11 +285,16 @@ def ir_signature_grid(
                 model.reach_probabilities(ctx.ir_footprint, ctx.config.condition_on_earth_unreached)
             )
         )
-        return p_reach * loud, {
+        info = {
             "host_fraction_source": "derived: mean P(star reached) over IR footprint lattice",
             "p_star_reached": p_reach,
             "footprint_points": len(ctx.ir_footprint),
         }
+        if model.is_finite:  # importance-sampled reach: report its Monte Carlo error
+            info["p_star_reached_se"] = model.expected_reached_se(
+                ctx.ir_footprint, ctx.config.condition_on_earth_unreached
+            ) / len(ctx.ir_footprint)
+        return p_reach * loud, info
     host = params.grid("ir_host_fraction")
     return np.outer(host, loud).ravel(), {
         "host_fraction_source": "declared ir_host_fraction",
@@ -326,9 +379,12 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
         "hypothesis_id": hyp.id,
         "tier": hyp.tier,
         "channels_evaluated": active,
+        # Parameters scoped to another geometry (Parameter.geometry_modes) are not part
+        # of this run's model and are not reported.
         "parameters": {
             k: {"value": v, "unit": ctx.graph.registry.get(k).unit}
             for k, v in sorted(params.fixed.items())
+            if ctx.graph.registry.get(k).applies_to(cfg.geometry)
         },
         "parameter_ranges": {
             k: {"min": float(g.min()), "max": float(g.max()), "grid_points": int(g.size)}
@@ -347,6 +403,11 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
             "max_bubble_radius_kpc": float(model.max_bubble_radius.to_value(u.kpc)),
             "local_approximation_valid": model.local_approximation_valid,
         }
+        if model.is_finite:
+            # Structured validity status + geometry (keys added for finite_disk_3d only,
+            # so thin_disk_2d / thick_disk_3d results stay byte-identical).
+            out["expansion"]["local_approx"] = model.local_approx_status
+            out["expansion"]["finite_disk"] = model.finite_disk_summary()
         if cond:
             comps[EARTH] = _component(model.log_p_earth_unreached(), 0.0, EARTH, [], [])
     else:
@@ -423,6 +484,32 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
                 "p_detect_given_reached": float(p_det[i_max]),
             },
         }
+        if model.is_finite:
+            fd = model.finite_disk_reach(ctx.targets.xyz)
+            out["radio"]["finite_disk_reach"] = {
+                "estimator": (
+                    "multiple-importance sampling (balance heuristic) of age-integrated "
+                    "reach kernels over slab-clipped balls about Earth and each target"
+                ),
+                "n_importance_samples": fd.n_samples,
+                "importance_seed": fd.seed,
+                "expected_reached_se": model.expected_reached_se(ctx.targets.xyz, cond),
+                "expected_reached_unconditional_se": model.expected_reached_se(
+                    ctx.targets.xyz, False
+                ),
+                "sum_lambda_conditional": fd.sum_conditional,
+                "sum_lambda_conditional_se": fd.sum_conditional_se,
+                "sum_lambda_unconditional": fd.sum_unconditional,
+                "sum_lambda_unconditional_se": fd.sum_unconditional_se,
+                "earth_lambda_importance_crosscheck": fd.earth_lambda_mc,
+                "earth_lambda_importance_crosscheck_se": fd.earth_lambda_mc_se,
+                "mc_proposal_points_accepted": mc.n_points_accepted,
+                "mc_proposal_density_bound": mc.proposal_density_bound,
+                "bounds_note": (
+                    "FKG / Markov / Frechet bounds use the importance-sampled reach "
+                    "probabilities, so they carry the Monte Carlo error reported here"
+                ),
+            }
         comps["radio"] = _component(
             math.log(mc.p_zero_targets_only),
             0.0,
@@ -519,6 +606,320 @@ def _joint(comps: dict, terms: list[str], channels: Sequence[str]) -> dict:
     }
 
 
+# ------------------------------------------------ lookback-window marginalisation
+@dataclass(frozen=True)
+class LookbackGrid:
+    """Deterministic Gauss-Legendre grid in ln T for the registry's log-uniform prior on T.
+
+    Bounds come from ``lookback_window_gyr.marginalization_prior_bounds`` with the SPEC.md
+    Sec. 4.1 prior-floor rule applied (effective lower edge = max(lower, log_floor)).
+    ``weights`` sum to 1: they are the prior mass assigned to each node.
+    """
+
+    declared_bounds_gyr: tuple[float, float]
+    effective_bounds_gyr: tuple[float, float]
+    log_floor: float | None
+    nodes_gyr: np.ndarray
+    weights: np.ndarray
+
+    def as_dict(self) -> dict:
+        return {
+            "parameter": LOOKBACK,
+            "prior": {
+                "type": "log_uniform",
+                "declared_bounds_gyr": list(self.declared_bounds_gyr),
+                "effective_bounds_gyr": list(self.effective_bounds_gyr),
+                "log_floor": self.log_floor,
+                "floor_rule": "effective lower edge = max(lower bound, log_floor)",
+            },
+            "quadrature": {
+                "rule": "Gauss-Legendre in ln T",
+                "n_points": int(self.nodes_gyr.size),
+                "lookback_gyr": self.nodes_gyr.tolist(),
+                "weights": self.weights.tolist(),
+            },
+        }
+
+
+def lookback_grid(graph: FactorGraph, n_points: int) -> LookbackGrid:
+    p = graph.registry.get(LOOKBACK)
+    if p.marginalization_prior_bounds is None:
+        raise SchemaValidationError(
+            f"{LOOKBACK} declares no marginalization_prior_bounds; cannot marginalise the lookback"
+        )
+    lo, hi = p.marginalization_log_bounds
+    x, w = np.polynomial.legendre.leggauss(int(n_points))
+    nodes = np.exp(math.log(lo) + (math.log(hi) - math.log(lo)) * (x + 1.0) / 2.0)
+    return LookbackGrid(
+        tuple(p.marginalization_prior_bounds), (lo, hi), p.log_floor, nodes, w / w.sum()
+    )
+
+
+def _logsumexp(ln: np.ndarray) -> float:
+    m = float(np.max(ln))
+    if not math.isfinite(m):
+        return m
+    return m + math.log(float(np.sum(np.exp(ln - m))))
+
+
+def chain_marginals(
+    node_log10_p: Mapping[str, Sequence[float]], weights: Sequence[float], terms: Sequence[str]
+) -> tuple[dict[str, float], float]:
+    """Chain-rule decomposition of the joint marginal over ``terms`` (log10 units).
+
+    ``J_m = log sum_k w_k prod_{c in terms[:m]} P_c(T_k)``; term ``m`` is ``J_m - J_{m-1}``,
+    i.e. ``log P(term m | H, terms before it)`` with T integrated out. Returns the
+    per-term values and the joint ``J_len(terms)``. Marginalisation is in likelihood
+    space (logsumexp); a zero-probability prefix yields ``-inf`` then ``nan``.
+    """
+    acc = np.log(np.asarray(weights, float))
+    prev = _logsumexp(acc)  # ln sum_k w_k = 0 up to rounding
+    out: dict[str, float] = {}
+    for t in terms:
+        acc = acc + np.asarray(node_log10_p[t], float) * LN10
+        cur = _logsumexp(acc)
+        out[t] = (cur - prev) / LN10 if math.isfinite(prev) else math.nan
+        prev = cur
+    return out, prev / LN10
+
+
+def _weighted(values: Sequence[float], weights: np.ndarray) -> float:
+    return float(np.sum(weights * np.asarray(values, float)))
+
+
+def evaluate_hypothesis_marginalized(hyp: Hypothesis, ctx: RunContext, grid: LookbackGrid) -> dict:
+    """Score one hypothesis with the lookback window integrated over its prior.
+
+    Every grid node is a full ``evaluate_hypothesis`` run at fixed ``T_k`` (same seed:
+    common random numbers across nodes). A hypothesis whose likelihood cannot depend on
+    T (no expansion parameters), or which constrains T itself, is evaluated once and
+    carried as a constant across the grid.
+    """
+    if hyp.is_quarantined:
+        raise Tier3ScoringError(
+            f"{hyp.id!r} is Tier-3 (quarantined): it cannot receive empirical exclusion scores"
+        )
+    cfg = ctx.config
+    if any(k == LOOKBACK for k, _ in cfg.parameter_overrides):
+        raise SchemaValidationError(
+            f"{LOOKBACK} cannot be both overridden and marginalised in one run"
+        )
+    params = resolve_parameters(ctx.graph, hyp, cfg.range_grid_points, cfg.parameter_overrides)
+    reason = None
+    if not all(params.has(p) for p in EXPANSION_PARAMS):
+        reason = "no expansion parameters: likelihood does not depend on the lookback window"
+    elif LOOKBACK in hyp.parameter_constraints:
+        reason = "hypothesis constrains the lookback window itself; its own value is used"
+    base = replace(cfg, marginalize_lookback=False)
+
+    def at(t: float | None) -> RunContext:
+        over = cfg.parameter_overrides if t is None else (*cfg.parameter_overrides, (LOOKBACK, t))
+        return replace(ctx, config=replace(base, parameter_overrides=over))
+
+    n = int(grid.nodes_gyr.size)
+    if reason is not None:
+        nodes = [evaluate_hypothesis(hyp, at(None))] * n
+    else:
+        nodes = [evaluate_hypothesis(hyp, at(float(t))) for t in grid.nodes_gyr]
+    out = _marginalize_nodes(nodes, grid, reason)
+    if reason is None:  # cheap deterministic convergence check of the grid itself
+        fine = lookback_grid(ctx.graph, 2 * n)
+        lam = [
+            expansion_model(
+                resolve_parameters(
+                    ctx.graph, hyp, cfg.range_grid_points, at(float(t)).config.parameter_overrides
+                ),
+                base,
+            ).earth_lambda()
+            for t in fine.nodes_gyr
+        ]
+        coarse = _logsumexp(
+            np.log(grid.weights) - np.array([nd["expansion"]["earth_lambda"] for nd in nodes])
+        )
+        dense = _logsumexp(np.log(fine.weights) - np.asarray(lam))
+        out[LOOKBACK_MARGINALIZATION]["earth_term_quadrature_check"] = {
+            "quantity": "log10 P(Earth unreached | H), lookback-marginalised (seed-free)",
+            "n_points": n,
+            "value": coarse / LN10,
+            "n_points_fine": 2 * n,
+            "value_fine": dense / LN10,
+            "abs_difference_dex": abs(coarse - dense) / LN10,
+        }
+    return out
+
+
+def _marginalize_nodes(nodes: Sequence[dict], grid: LookbackGrid, reason: str | None) -> dict:
+    """Collapse per-node hypothesis results into one lookback-marginalised result."""
+    first = nodes[0]
+    w = grid.weights
+    comps0 = first["components"]
+    node_log10 = {c: [nd["components"][c]["log10_p_data_given_h"] for nd in nodes] for c in comps0}
+    own_terms = list(first["own_joint"]["terms"])
+    chain, joint = chain_marginals(node_log10, w, own_terms)
+    comps: dict[str, dict] = {}
+    for c, comp in comps0.items():
+        if c in chain:
+            raw = chain[c]
+            before = own_terms[: own_terms.index(c)]
+            how = f"conditional on {before}" if before else "first term: prior marginal"
+        else:  # alternate decomposition (e.g. radio marginal beside radio+solar_system)
+            raw = chain_marginals(node_log10, w, [c])[0][c]
+            how = "standalone prior marginal (not part of the own-joint chain)"
+        comps[c] = {
+            **comp,
+            "log10_p_data_given_h": raw,
+            "log10_lr_vs_null": raw - comp["log10_null"],
+            "lookback_marginal": how,
+        }
+    # Lookback posterior given Earth unreached (the conditioning the radio / IR terms carry).
+    post = w
+    if EARTH in comps0:
+        ln_post = np.log(w) + np.asarray(node_log10[EARTH], float) * LN10
+        post = np.exp(ln_post - _logsumexp(ln_post))
+
+    out: dict = {
+        "hypothesis_id": first["hypothesis_id"],
+        "tier": first["tier"],
+        "channels_evaluated": first["channels_evaluated"],
+        "parameters": dict(first["parameters"]),
+        "parameter_ranges": first["parameter_ranges"],
+    }
+    if reason is None:
+        out["parameters"][LOOKBACK] = {
+            "value": None,
+            "unit": first["parameters"][LOOKBACK]["unit"],
+            "marginalized_log_uniform_bounds": list(grid.effective_bounds_gyr),
+        }
+
+    ex = [nd["expansion"] for nd in nodes]
+    if first["expansion"] is None:
+        out["expansion"] = None
+    else:
+        ln_unreached = _logsumexp(np.log(w) - np.array([e["earth_lambda"] for e in ex]))
+        violated = sum(not e["local_approximation_valid"] for e in ex)
+        finite = "finite_disk" in first["expansion"]
+        out["expansion"] = {
+            "geometry_mode": first["expansion"]["geometry_mode"],
+            "lookback_marginalized": reason is None,
+            "earth_lambda": -ln_unreached,
+            "p_earth_reached": float(-np.expm1(ln_unreached)),
+            "log10_p_earth_unreached": ln_unreached / LN10,
+            "max_bubble_radius_kpc": max(e["max_bubble_radius_kpc"] for e in ex),
+            "local_approximation_valid": violated == 0,
+            "local_approx": LOCAL_APPROX_FINITE
+            if finite
+            else (LOCAL_APPROX_VIOLATED if violated else LOCAL_APPROX_OK),
+            "local_approx_nodes_violated": int(violated) if reason is None else int(violated > 0),
+            "summary_semantics": (
+                "prior-weighted over the lookback grid: p_earth_reached = 1 - sum_k w_k "
+                "exp(-Lambda_E(T_k)); earth_lambda = -ln sum_k w_k exp(-Lambda_E(T_k))"
+            ),
+        }
+        if finite:
+            out["expansion"]["finite_disk"] = first["expansion"]["finite_disk"]
+
+    if "radio" in first:
+        rd = [nd["radio"] for nd in nodes]
+        static = (
+            "survey_id",
+            "radio_mode",
+            "n_targets",
+            "observed_detections",
+            "f_min_w_m2",
+            "mean_p_detect_given_reached",
+            "expected_reached_conditioned_on_earth_unreached",
+            "max_eirp_min_target",
+        )
+        averaged = (
+            "expected_reached",
+            "mc_expected_reached",
+            "expected_detections",
+            "p_zero_exact_mc",
+            "p_zero_independent_fkg_lower",
+            "p_zero_markov_lower",
+            "p_zero_frechet_upper",
+        )
+        out["radio"] = {k: rd[0][k] for k in static}
+        out["radio"]["expected_reached_unconditional"] = _weighted(
+            [r["expected_reached_unconditional"] for r in rd], w
+        )
+        for k in averaged:
+            out["radio"][k] = _weighted([r[k] for r in rd], post)
+        for k in ("mc_expected_reached_se", "p_zero_exact_mc_se"):
+            out["radio"][k] = _weighted([r[k] for r in rd], post)
+        out["radio"]["mc_points_sampled"] = int(sum(r["mc_points_sampled"] for r in rd))
+        out["radio"]["lookback_averaging"] = (
+            "expected_reached_unconditional is prior-weighted; every other number is "
+            "weighted by the lookback posterior given Earth unreached (the prior when "
+            "Earth conditioning is off); *_se are weighted linear sums of the per-node "
+            "standard errors (an upper bound: nodes share one seed)"
+        )
+    if "solar_system" in first:
+        ss = [nd["solar_system"] for nd in nodes]
+        out["solar_system"] = {
+            **ss[0],
+            "marginal_null_likelihood": _weighted(
+                [s["marginal_null_likelihood"] for s in ss], post
+            ),
+        }
+    if "infrared" in first:
+        ir = [nd["infrared"] for nd in nodes]
+        out["infrared"] = {
+            **ir[0],
+            "signature_fraction_min": min(i["signature_fraction_min"] for i in ir),
+            "signature_fraction_max": max(i["signature_fraction_max"] for i in ir),
+        }
+        for k in ("p_star_reached", "p_star_reached_se"):
+            if k in ir[0]:
+                out["infrared"][k] = _weighted([i[k] for i in ir], post)
+
+    out["components"] = comps
+    out["own_joint"] = {
+        "channels": first["own_joint"]["channels"],
+        "includes_earth_unreached": first["own_joint"]["includes_earth_unreached"],
+        "terms": own_terms,
+        "log10_p_data_given_h": joint,
+        "log10_lr_vs_null": joint - float(sum(comps0[t]["log10_null"] for t in own_terms)),
+    }
+    per_node = []
+    for k, nd in enumerate(nodes):
+        row = {
+            "lookback_gyr": float(grid.nodes_gyr[k]),
+            "prior_weight": float(w[k]),
+            "posterior_weight": float(post[k]),
+            "log10_p_by_component": {c: node_log10[c][k] for c in comps0},
+        }
+        if nd["expansion"] is not None:
+            e = nd["expansion"]
+            row["p_earth_reached"] = e["p_earth_reached"]
+            row["local_approx"] = e.get(
+                "local_approx",
+                LOCAL_APPROX_OK if e["local_approximation_valid"] else LOCAL_APPROX_VIOLATED,
+            )
+        if "radio" in nd:
+            for key in ("expected_reached", "p_zero_exact_mc", "p_zero_exact_mc_se"):
+                row[key] = nd["radio"][key]
+        if "p_star_reached" in nd.get("infrared", {}):
+            row["ir_p_star_reached"] = nd["infrared"]["p_star_reached"]
+        per_node.append(row)
+    out[LOOKBACK_MARGINALIZATION] = {
+        "marginalized": reason is None,
+        "not_marginalized_reason": reason,
+        "weights": w.tolist(),
+        "posterior_weights": np.asarray(post).tolist(),
+        "posterior_weight_semantics": "lookback posterior given Earth unreached"
+        if EARTH in comps0
+        else "lookback prior (no Earth-unreached conditioning)",
+        "node_log10_p": node_log10,
+        "per_node": per_node,
+    }
+    return out
+
+
+def _is_marginalized(h: Mapping) -> bool:
+    return LOOKBACK_MARGINALIZATION in h
+
+
 # ----------------------------------------------------------------- comparisons
 def _is_illustrative(tiers: Sequence[str]) -> bool:
     return any(t in ILLUSTRATIVE_TIERS for t in tiers)
@@ -541,20 +942,49 @@ def compare_pair(a: dict, b: dict) -> dict:
     Channel exclusion happens *before* term selection, so a joint term such as
     ``radio+solar_system`` is never dropped wholesale: the verified radio marginal
     is used in its place.
+
+    Lookback-marginalised results (v0.2.0): the likelihood no longer factorises over
+    terms, so each sum is the joint marginal over its own term set, decomposed by the
+    chain rule with verified terms first (``chain_marginals``). The verified sum is
+    therefore the exact marginal Bayes factor of the verified data alone: no
+    illustrative likelihood ever re-weights the lookback posterior behind it.
     """
     shared = sorted(set(a["channels_evaluated"]) & set(b["channels_evaluated"]))
     earth = EARTH in a["components"] and EARTH in b["components"]
     ta = _pair_terms(a, b, set(shared), earth)
+    marginal = _is_marginalized(a)
+    if marginal != _is_marginalized(b):
+        raise SchemaValidationError(
+            "cannot compare a lookback-marginalised result with a fixed-T one"
+        )
 
     def tiers_of(t: str) -> list[str]:
         return sorted({x for h in (a, b) for x in h["components"][t]["data_tiers"]})
 
-    def bf(t: str) -> float:
-        return (
-            a["components"][t]["log10_p_data_given_h"] - b["components"][t]["log10_p_data_given_h"]
-        )
+    def chain_bf(terms: Sequence[str]) -> dict[str, float]:
+        la, lb = a[LOOKBACK_MARGINALIZATION], b[LOOKBACK_MARGINALIZATION]
+        ca = chain_marginals(la["node_log10_p"], la["weights"], terms)[0]
+        cb = chain_marginals(lb["node_log10_p"], lb["weights"], terms)[0]
+        return {t: ca[t] - cb[t] for t in terms}
 
-    per = {t: bf(t) for t in ta}
+    if marginal:
+        ta = [t for t in ta if not _is_illustrative(tiers_of(t))] + [
+            t for t in ta if _is_illustrative(tiers_of(t))
+        ]
+        per = chain_bf(ta)
+
+        def bf(t: str) -> float:
+            return per[t] if t in per else chain_bf([t])[t]
+
+    else:
+
+        def bf(t: str) -> float:
+            return (
+                a["components"][t]["log10_p_data_given_h"]
+                - b["components"][t]["log10_p_data_given_h"]
+            )
+
+        per = {t: bf(t) for t in ta}
     tiers = sorted({x for t in ta for x in tiers_of(t)})
     illustrative = [t for t in ta if _is_illustrative(tiers_of(t))]
     illustrative_channels = sorted(
@@ -582,7 +1012,7 @@ def compare_pair(a: dict, b: dict) -> dict:
             }
         )
     tv = _pair_terms(a, b, set(verified_channels), earth)
-    per_v = {t: bf(t) for t in tv}
+    per_v = chain_bf(tv) if marginal else {t: bf(t) for t in tv}
     verified = {
         "policy": HEADLINE_VERIFIED,
         "channels": verified_channels,
@@ -592,7 +1022,16 @@ def compare_pair(a: dict, b: dict) -> dict:
         "excluded_illustrative_channels": illustrative_channels,
         "data_tiers": sorted({x for t in tv for x in tiers_of(t)}),
     }
+    extra: dict = {}
+    if marginal:
+        extra[LOOKBACK_MARGINALIZATION] = {
+            "space": MARGINAL_SPACE,
+            "term_semantics": MARGINAL_TERM_SEMANTICS,
+            "chain_order": list(ta),
+            "verified_chain_order": list(tv),
+        }
     return {
+        **extra,
         "numerator": a["hypothesis_id"],
         "denominator": b["hypothesis_id"],
         "channels_in_bf": shared,
@@ -714,6 +1153,7 @@ def score_hypotheses(
     """Score requested hypotheses; returns the context and the ``results`` block."""
     ctx = build_context(graph, cfg)
     ids = list(hypothesis_ids) if hypothesis_ids is not None else sorted(graph.hypotheses)
+    grid = lookback_grid(graph, cfg.lookback_grid_points) if cfg.marginalize_lookback else None
     scored: dict[str, dict] = {}
     quarantine: list[dict] = []
     for hid in ids:
@@ -729,7 +1169,11 @@ def score_hypotheses(
                 }
             )
             continue
-        scored[hid] = evaluate_hypothesis(hyp, ctx)
+        scored[hid] = (
+            evaluate_hypothesis(hyp, ctx)
+            if grid is None
+            else evaluate_hypothesis_marginalized(hyp, ctx, grid)
+        )
     results: dict = {
         "likelihood_conventions": {
             "log10_p_data_given_h": "raw log10 probability of the observed data under H",
@@ -750,6 +1194,27 @@ def score_hypotheses(
         results["headline"] = hl
     if cfg.ir_pair and "infrared" in ctx.surveys:
         results["ir_calibration_sweep"] = ir_reversal_sweep(ctx, *cfg.ir_pair)
+    if grid is not None:  # keys added only when marginalising: single-T results unchanged
+        results[LOOKBACK_MARGINALIZATION] = {
+            "enabled": True,
+            **grid.as_dict(),
+            "space": MARGINAL_SPACE,
+            "term_semantics": MARGINAL_TERM_SEMANTICS,
+            "hypotheses": {
+                hid: {
+                    "marginalized": h[LOOKBACK_MARGINALIZATION]["marginalized"],
+                    "not_marginalized_reason": h[LOOKBACK_MARGINALIZATION][
+                        "not_marginalized_reason"
+                    ],
+                }
+                for hid, h in scored.items()
+            },
+        }
+        if "ir_calibration_sweep" in results:
+            results["ir_calibration_sweep"]["lookback_note"] = (
+                "calibration sweep evaluated at the fixed registry lookback default, "
+                "not lookback-marginalised"
+            )
     return ctx, results
 
 
@@ -762,7 +1227,14 @@ def run_comparison(
     cfg_dict = asdict(cfg)
     created = datetime.now(UTC)
     digest = hashlib.sha256(json.dumps(cfg_dict, sort_keys=True).encode()).hexdigest()[:10]
+    extra: dict = {}
+    if cfg.geometry == FINITE_DISK:
+        extra["disk_profile"] = cfg.disk_profile
+    if cfg.marginalize_lookback:  # prior bounds, grid and weights (also inside results)
+        marg = results[LOOKBACK_MARGINALIZATION]
+        extra[LOOKBACK_MARGINALIZATION] = {k: marg[k] for k in ("parameter", "prior", "quadrature")}
     return {
+        **extra,
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
         "run_id": f"{created.strftime('%Y%m%dT%H%M%S%fZ')}-{digest}",
         "created_at_utc": created.isoformat(),

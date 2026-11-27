@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { post, type Channel, type CompareRequest, type CompareResponse, type Geometry, type RadioMode } from "../api";
+import {
+  post,
+  type Channel,
+  type CompareRequest,
+  type CompareResponse,
+  type DiskProfile,
+  type Geometry,
+  type RadioMode,
+} from "../api";
 import { ErrorBox, Hash, Loading, Panel, TierBadge, TierSetBadge, useApi } from "../components/ui";
 import {
   ILLUSTRATIVE_BANNER,
@@ -9,6 +17,16 @@ import {
   parseSeed,
   showIllustrativeBanner,
 } from "../lib/format";
+import {
+  DISK_PROFILE_LABELS,
+  DISK_PROFILE_OPTIONS,
+  GEOMETRY_OPTIONS,
+  MARGINALIZE_LABEL,
+  geometryRequest,
+  localApproxBadge,
+  lookbackSummary,
+  showDiskProfile,
+} from "../lib/geometry";
 
 export type View = "overview" | "macro" | "radio" | "infrared" | "adversary" | "queue";
 
@@ -29,6 +47,8 @@ export function MacroDesk({
   go: (v: View) => void;
 }) {
   const [geometry, setGeometry] = useState<Geometry>("thin_disk_2d");
+  const [diskProfile, setDiskProfile] = useState<DiskProfile>("uniform");
+  const [marginalize, setMarginalize] = useState(false);
   const [radioMode, setRadioMode] = useState<RadioMode>("flat_probability");
   const [earth, setEarth] = useState(true);
   const [channels, setChannels] = useState<Channel[]>(["radio", "infrared", "solar_system"]);
@@ -36,8 +56,9 @@ export function MacroDesk({
   const [seedText, setSeedText] = useState(String(seed));
   const [tab, setTab] = useState<"lr" | "raw">("lr");
 
+  const geo = geometryRequest({ geometry, diskProfile, marginalizeLookback: marginalize });
   const req: CompareRequest = {
-    geometry_mode: geometry,
+    ...geo,
     radio_mode: radioMode,
     condition_on_earth_unreached: earth,
     channels,
@@ -46,7 +67,7 @@ export function MacroDesk({
   };
   const { data, error, loading } = useApi(
     () => post<CompareResponse>("/api/compare", req),
-    [geometry, radioMode, earth, channels.join(","), illustrative, seed],
+    [geometry, geo.disk_profile, marginalize, radioMode, earth, channels.join(","), illustrative, seed],
   );
 
   const toggleChannel = (c: Channel) =>
@@ -60,6 +81,7 @@ export function MacroDesk({
   };
 
   const res = data?.receipt.results;
+  const marg = data?.receipt.lookback_marginalization ?? null;
   const hl = res?.headline;
   const head = hl?.headline;
   const banner = showIllustrativeBanner(head?.policy, head?.data_tiers, illustrative);
@@ -91,9 +113,18 @@ export function MacroDesk({
         <Seg
           label="Geometry"
           value={geometry}
-          options={["thin_disk_2d", "thick_disk_3d"]}
+          options={[...GEOMETRY_OPTIONS]}
           onChange={(v) => setGeometry(v as Geometry)}
         />
+        {showDiskProfile(geometry) ? (
+          <Seg
+            label="Disk profile"
+            value={diskProfile}
+            options={[...DISK_PROFILE_OPTIONS]}
+            labels={DISK_PROFILE_LABELS}
+            onChange={(v) => setDiskProfile(v as DiskProfile)}
+          />
+        ) : null}
         <Seg
           label="Radio mode"
           value={radioMode}
@@ -137,6 +168,10 @@ export function MacroDesk({
           <input type="checkbox" checked={illustrative} onChange={(e) => setIllustrative(e.target.checked)} />
           <span>Include Illustrative Channels in Headline BF</span>
         </label>
+        <label className={`marg-toggle ${marginalize ? "on" : ""}`}>
+          <input type="checkbox" checked={marginalize} onChange={(e) => setMarginalize(e.target.checked)} />
+          <span>{MARGINALIZE_LABEL}</span>
+        </label>
       </div>
 
       {error ? <ErrorBox error={error} /> : null}
@@ -174,9 +209,15 @@ export function MacroDesk({
               cached: {data ? String(data.cached) : "—"} · receipt git <Hash sha={data?.receipt.git_sha} /> ·
               seed <span className="num">{data?.receipt.rng_seed ?? seed}</span>
             </div>
+            <div className="muted small">
+              {data ? lookbackSummary(marg) : "—"}
+              {marg ? " · terms are chain-rule conditionals that sum to the joint marginal" : null}
+            </div>
           </div>
         </div>
-        {loading ? <Loading what="Bayes factors" /> : null}
+        {loading ? (
+          <Loading what={marginalize ? "Bayes factors over the lookback grid (one full run per T node — may take minutes)" : "Bayes factors"} />
+        ) : null}
         {(head?.headline_exclusion_notes ?? []).length > 0 ? (
           <ul className="notes">
             {head!.headline_exclusion_notes.map((n) => (
@@ -257,7 +298,9 @@ export function MacroDesk({
               </tr>
             </thead>
             <tbody>
-              {hyps.map((h) => (
+              {hyps.map((h) => {
+                const badge = localApproxBadge(h.expansion);
+                return (
                 <tr key={h.hypothesis_id}>
                   <td>{h.hypothesis_id}</td>
                   <td className="num">{h.tier}</td>
@@ -267,15 +310,13 @@ export function MacroDesk({
                     {h.radio ? `${fmtNum(h.radio.p_zero_exact_mc, 8)} ± ${fmtNum(h.radio.p_zero_exact_mc_se, 2)}` : "—"}
                   </td>
                   <td>
-                    {!h.expansion ? (
+                    {!badge ? (
                       "—"
-                    ) : h.expansion.local_approximation_valid ? (
-                      <span className="ok">ok</span>
                     ) : (
-                      <span className="badge-violated" title="v_exp × T exceeds the 8 kpc infinite-disk validity radius">
-                        LOCAL APPROX VIOLATED
-                        {h.expansion.t_valid_kyr ? (
-                          <span className="num"> · T_valid = {h.expansion.t_valid_kyr.toFixed(1)} kyr</span>
+                      <span className={badge.className} title={badge.title}>
+                        {badge.label}
+                        {badge.tValidKyr !== null ? (
+                          <span className="num"> · T_valid = {badge.tValidKyr.toFixed(1)} kyr</span>
                         ) : null}
                       </span>
                     )}
@@ -290,7 +331,8 @@ export function MacroDesk({
                     );
                   })}
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -298,6 +340,9 @@ export function MacroDesk({
           LR = P(data|H) / P(data|component null). For zero-detection radio / Solar System / Earth-unreached the null
           probability is exactly 1 (raw = LR); for the mid-IR count it is the silent-sky model. Tier-3 hypotheses are
           never scored here — see the Quarantine Shelf.
+          {marg
+            ? " With the lookback marginalised, P(Earth reached) is prior-weighted over T, E[N] and P0 are weighted by the lookback posterior given Earth unreached, and each component is conditional on the components to its left."
+            : null}
         </p>
       </Panel>
 
@@ -316,12 +361,14 @@ function Seg({
   options,
   onChange,
   warn,
+  labels,
 }: {
   label: string;
   value: string;
   options: string[];
   onChange: (v: string) => void;
   warn?: string | undefined;
+  labels?: Record<string, string> | undefined;
 }) {
   return (
     <div className="ctl">
@@ -329,7 +376,7 @@ function Seg({
       <div className="seg" role="radiogroup" aria-label={label}>
         {options.map((o) => (
           <button key={o} role="radio" aria-checked={o === value} className={o === value ? "on" : ""} onClick={() => onChange(o)}>
-            {o}
+            {labels?.[o] ?? o}
           </button>
         ))}
       </div>

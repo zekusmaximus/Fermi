@@ -24,6 +24,8 @@ DataTier = Literal[
 ]
 Channel = Literal["radio", "infrared", "solar_system"]
 PriorType = Literal["log_uniform", "uniform", "fixed", "fixed_or_bounded"]
+# Must equal fermi_desk.models.expansion.GEOMETRY_MODES (asserted in tests/test_schemas.py).
+GeometryMode = Literal["thin_disk_2d", "thick_disk_3d", "finite_disk_3d"]
 
 # astropy does not parse the word "dimensionless"; SPEC.md uses it, so it is the
 # single documented alias. Every other unit string must parse via u.Unit().
@@ -62,6 +64,15 @@ class Parameter(_Frozen):
     log_floor: float | None = None
     description: str
     citations: list[str] = Field(default_factory=list)
+    # v0.2.0: geometry modes this parameter applies to. None = every geometry. A
+    # parameter scoped to other geometries is never reported in a run's per-hypothesis
+    # `parameters` block, so adding finite-disk structure parameters leaves existing
+    # thin_disk_2d / thick_disk_3d receipts (and their results_sha256) untouched.
+    geometry_modes: list[GeometryMode] | None = None
+    # v0.2.0: bounds of the log-uniform prior used when this parameter is marginalised
+    # instead of fixed at `default` (lookback-window marginalisation). Subject to the
+    # prior-floor rule: the effective lower edge is max(lower, log_floor) and must be > 0.
+    marginalization_prior_bounds: tuple[float, float] | None = None
 
     @field_validator("unit")
     @classmethod
@@ -82,11 +93,40 @@ class Parameter(_Frozen):
             )
         if self.default is not None and not lo <= self.default <= hi:
             raise SchemaValidationError(f"{self.id}: default {self.default} outside {self.bounds}")
+        if self.geometry_modes is not None and not self.geometry_modes:
+            raise SchemaValidationError(f"{self.id}: geometry_modes must be omitted or non-empty")
+        if self.marginalization_prior_bounds is not None:
+            if self.prior_type != "log_uniform":
+                raise SchemaValidationError(
+                    f"{self.id}: marginalization_prior_bounds requires a log_uniform prior"
+                )
+            m_lo, m_hi = self.marginalization_log_bounds
+            if not (lo <= self.marginalization_prior_bounds[0] and m_hi <= hi):
+                raise SchemaValidationError(
+                    f"{self.id}: marginalization_prior_bounds "
+                    f"{self.marginalization_prior_bounds} outside bounds {self.bounds}"
+                )
+            if not 0.0 < m_lo < m_hi:
+                raise SchemaValidationError(
+                    f"{self.id}: marginalization prior needs 0 < lower < upper after applying "
+                    f"log_floor (got effective [{m_lo}, {m_hi}])"
+                )
         return self
 
     @property
     def astropy_unit(self) -> u.UnitBase:
         return parse_unit(self.unit)
+
+    @property
+    def marginalization_log_bounds(self) -> tuple[float, float]:
+        """Effective (lower, upper) of the marginalisation prior: max(lower, log_floor)."""
+        if self.marginalization_prior_bounds is None:
+            raise SchemaValidationError(f"{self.id}: no marginalization_prior_bounds declared")
+        lo, hi = self.marginalization_prior_bounds
+        return max(lo, self.log_floor) if self.log_floor is not None else lo, hi
+
+    def applies_to(self, geometry: str) -> bool:
+        return self.geometry_modes is None or geometry in self.geometry_modes
 
     def quantity(self, value: float) -> u.Quantity:
         return value * self.astropy_unit

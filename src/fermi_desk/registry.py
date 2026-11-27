@@ -27,6 +27,7 @@ from fermi_desk.errors import (
     SchemaValidationError,
 )
 from fermi_desk.models import hephaistos, hephaistos_fits
+from fermi_desk.models.expansion import DISK_PROFILES, FINITE_DISK, ExpansionModel
 from fermi_desk.schemas import (
     Hypothesis,
     ParameterRegistry,
@@ -661,6 +662,53 @@ def _check_anchor_claim(survey: Survey, root: Path, claim_path: str) -> str:
     return f"{claim['target_name']}: " + ", ".join(checked)
 
 
+def _check_finite_disk_geometry(reg: ParameterRegistry) -> str:
+    """Registry Galactic-structure defaults must build a valid finite_disk_3d model (offline)."""
+
+    def q(pid: str) -> u.Quantity:
+        p = reg.get(pid)
+        if p.default is None:
+            raise SchemaValidationError(f"{pid}: finite_disk_3d needs a registry default")
+        return p.quantity(p.default)
+
+    geo = {}
+    for profile in DISK_PROFILES:
+        model = ExpansionModel(
+            FINITE_DISK,
+            origin_rate=1.0 / (u.kpc**2 * u.Gyr),
+            expansion_speed=0.01 * u.dimensionless_unscaled,
+            lookback=1.0e-3 * u.Gyr,
+            scale_height=q("disk_scale_height_pc"),
+            solar_height=q("solar_height_pc"),
+            disk_profile=profile,
+            disk_radius=q("galactic_disk_radius_kpc"),
+            solar_galactocentric_radius=q("solar_galactocentric_radius_kpc"),
+            radial_scale_length=q("galactic_radial_scale_length_kpc"),
+        )
+        geo[profile] = model.finite_disk_summary()
+    g = geo["exponential"]
+    return (
+        f"R_gal = {g['galactic_disk_radius_kpc']:g} kpc, Sun at (R, Z) = "
+        f"({g['solar_cylindrical_radius_kpc']:.5f}, {g['solar_height_kpc']:.4f}) kpc "
+        f"(R_0 = {g['solar_galactocentric_distance_kpc']:g} kpc), h_z = "
+        f"{g['scale_height_kpc']:g} kpc, R_d = {g['radial_scale_length_kpc']:g} kpc; profiles "
+        f"{list(geo)} build offline (astropy Galactocentric frame, no network)"
+    )
+
+
+def _check_lookback_prior(reg: ParameterRegistry) -> str:
+    p = reg.get("lookback_window_gyr")
+    lo, hi = p.marginalization_log_bounds  # raises SchemaValidationError if undeclared
+    if p.default is not None and not lo <= p.default <= hi:
+        raise SchemaValidationError(
+            f"lookback default {p.default} lies outside its marginalisation prior [{lo}, {hi}]"
+        )
+    return (
+        f"log-uniform T in [{lo * 1e6:g} kyr, {hi * 1e3:g} Myr] (effective bounds after the "
+        f"log_floor rule; unit {p.unit}); fixed default {p.default:g} {p.unit} lies inside"
+    )
+
+
 def run_validation(root: Path | None = None) -> list[CheckResult]:
     """Run every schema / unit / checksum check, collecting failures instead of stopping."""
     results: list[CheckResult] = []
@@ -688,6 +736,8 @@ def run_validation(root: Path | None = None) -> list[CheckResult]:
                 f"{p.unit!r} -> {p.astropy_unit.to_string() or 'dimensionless_unscaled'}",
             )
         )
+    record("finite_disk_geometry", lambda: _check_finite_disk_geometry(reg))
+    record("lookback_marginalization_prior", lambda: _check_lookback_prior(reg))
     for h in graph.hypotheses.values():
         label = "QUARANTINED (monoculture_audit present)" if h.is_quarantined else "scorable"
         results.append(CheckResult(f"hypothesis:{h.id}", True, f"tier {h.tier}, {label}"))

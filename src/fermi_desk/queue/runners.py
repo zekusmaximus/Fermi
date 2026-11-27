@@ -69,9 +69,9 @@ def run_lookback_window_t_sweep(graph: FactorGraph, p: Mapping, seed: int) -> di
                     "p_earth_reached": h["expansion"]["p_earth_reached"],
                     "expected_reached_given_earth_unreached": h["radio"]["expected_reached"],
                     "max_bubble_radius_kpc": h["expansion"]["max_bubble_radius_kpc"],
-                    "local_approx": "ok"
-                    if h["expansion"]["local_approximation_valid"]
-                    else "VIOLATED",
+                    # finite_disk_3d reports its own status (valid_finite_galaxy).
+                    "local_approx": h["expansion"].get("local_approx")
+                    or ("ok" if h["expansion"]["local_approximation_valid"] else "VIOLATED"),
                 }
             rows.append(
                 {

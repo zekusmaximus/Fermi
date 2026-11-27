@@ -31,7 +31,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 4. **Strict Non-Double-Counting:**
    Every survey record declares a `pointing_group_id` and `evidence_channel`. Macro combined runs and single-channel drill-downs must never silently condition twice on the same pointings or stars.
 5. **Explicit Spatial Geometry (2D vs. 3D):**
-   Galactic expansion models must explicitly parameterize disk geometry (`geometry_mode: "thin_disk_2d" | "thick_disk_3d"`, scale height `h_z`). Scaling symmetries that only hold in 2D (e.g., doubling speed while quartering origin rate) must be tested against 3D thick-disk volumes where bubble radii are smaller than `h_z`.
+   Galactic expansion models must explicitly parameterize disk geometry (`geometry_mode: "thin_disk_2d" | "thick_disk_3d" | "finite_disk_3d"`, scale height `h_z`). Scaling symmetries that only hold in 2D (e.g., doubling speed while quartering origin rate) must be tested against 3D thick-disk volumes where bubble radii are smaller than `h_z`. `finite_disk_3d` (v0.2.0) additionally requires an explicit `disk_profile: "uniform" | "exponential"` and must converge to `thick_disk_3d` (uniform profile) while `v_exp * T << R_gal - R_sun`.
 6. **Strict Data Provenance Tagging:**
    Every numeric table and calibration curve must carry a `data_tier` tag:
    - `published_catalog` (verbatim published catalog/paper data with citation + hash)
@@ -65,7 +65,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   ├── schemas.py                  # Pydantic v2 models + Astropy unit validators
 │   ├── registry.py                 # Factor Graph loader & double-counting validator
 │   ├── models/
-│   │   ├── expansion.py            # 2D thin-disk & 3D thick-disk spatial correlation kernel
+│   │   ├── expansion.py            # 2D thin-disk, 3D thick-disk & finite-Galaxy (R_gal) spatial correlation kernel
 │   │   ├── radio.py                # Breakthrough Listen 692-star forward model (flat & per-target EIRP)
 │   │   ├── infrared.py             # Mid-IR waste-heat & calibration-reversal forward model
 │   │   ├── hephaistos.py           # WISE centroid vs. image-level blend-recovery grid (M2)
@@ -101,6 +101,27 @@ No other aliases are permitted.
 lower bound is `0.0` is undefined on its own and MUST declare an explicit positive
 `log_floor` (strictly below the upper bound). Grids and marginalisations use
 `max(lower_bound, log_floor)` as the effective lower edge.
+
+**Geometry scope (v0.2.0).** A parameter may declare `geometry_modes: [...]`. It is then
+part of the model only under those geometries and is omitted from the per-hypothesis
+`parameters` block of every other run. The finite-disk structure parameters
+(`galactic_disk_radius_kpc` = 15 kpc, `solar_galactocentric_radius_kpc` = 8.178 kpc,
+`galactic_radial_scale_length_kpc` = 2.6 kpc) are scoped to `finite_disk_3d`, so
+`thin_disk_2d` / `thick_disk_3d` receipts and their canonical `results_sha256` are
+unchanged. `disk_scale_height_pc` and `solar_height_pc` are reused, unscoped.
+
+**Finite-disk density normalisation (v0.2.0).** In Galactocentric cylindrical `(R, Z)`,
+with the Sun at `(R_E, Z_E) = (sqrt(R_0^2 - z_sun^2), z_sun)`:
+
+- `uniform`: `rho = Gamma_2d / (2 h_z)` for `R <= R_gal`, `|Z| <= h_z`.
+- `exponential`: `rho = Gamma_2d * exp(-(R - R_E)/R_d) * exp(-|Z|/h_z) / (2 h_z (1 - exp(-z_max/h_z)))`
+  for `R <= R_gal`, `|Z| <= z_max = 5 h_z`.
+
+Both give a column-integrated origin rate of exactly `Gamma_2d` at the Sun's radius.
+
+**Marginalisation prior (v0.2.0).** A `log_uniform` parameter may declare
+`marginalization_prior_bounds`; the prior-floor rule applies to it unchanged
+(`lookback_window_gyr`: `[5.0e-5, 1.0e-2]` Gyr, i.e. 50 kyr - 10 Myr).
 
 ```yaml
 parameters:
@@ -232,6 +253,18 @@ illustrative` (default off) folds them into the headline and is labelled loudly.
 Both IR contamination conventions (Suazo 2024 subsample, Zackrisson 2026 full
 sample) stay side-by-side in `ir-drilldown`; no winner is picked.
 
+**Lookback-window marginalisation (v0.2.0; proposed for planning ratification).** With
+`marginalize_lookback` (CLI `--marginalize-lookback`, default off) the lookback window `T`
+is integrated over the registry's log-uniform prior on a deterministic Gauss-Legendre grid
+in `ln T`. Marginalisation is in **likelihood space**:
+`P(data | H) = sum_k w_k * prod_c P_c(data_c | H, T_k)` via `logsumexp`; `log10 P` is never
+averaged. Because the likelihood then no longer factorises over channels, each reported sum
+is the joint marginal over its own term set, decomposed by the chain rule with **verified
+terms first**. The verified headline is therefore the marginal Bayes factor of the verified
+data alone: an `illustrative_calibration` term can never re-weight the lookback posterior
+behind it. Receipts record the prior bounds, grid, weights and per-node diagnostics; fixed-`T`
+receipts gain no keys and keep their `results_sha256`.
+
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
 Bailer-Jones DR2 distance (752.61 pc, ~1,071x) is the historical Wlodarczyk-Sroka
@@ -297,6 +330,9 @@ Every queued or executed job records:
    `R_gal = 15 kpc` (edge truncation of origin sites and bubble intersection with the disk
    boundary) replaces the local limit; until then the `lookback_window_t_sweep` Tier-0 job
    records the cutoff and BF sensitivity across 50 kyr-10 Myr.
+   **Implemented in v0.2.0** as `geometry_mode: finite_disk_3d` (receipts report
+   `local_approx: valid_finite_galaxy`); the two local modes are kept, byte-identical, and
+   still flag the violation.
 
 3. **unWISE coadd re-measurement of `sigma_sys` (Milestone 3 Part A.3).** The
    Milestone 2.5 floor (`sigma_sys = 0.436 arcsec`, 154 controls / 12 patches) was

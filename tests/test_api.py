@@ -54,6 +54,8 @@ def env(tmp_path_factory):
         runs_dir=tmp / "runs",
         static_dir=static,
         compare_n_mc=1000,
+        compare_n_importance=1024,
+        lookback_grid_points=4,
         ir_n_trials=4,
         adversary_n_mc=200,
         seed_jobs=_jobs(),
@@ -407,3 +409,158 @@ def test_reseed_refreshes_stale_cpu_estimate_without_touching_state(tmp_path):
         assert row["status"] == "claimed" and row["claimed_by"] == "x"
     finally:
         s.close()
+
+
+# ------------------------------------------- v0.2.0: finite disk & lookback marginalisation
+FINITE = {"geometry_mode": "finite_disk_3d", "channels": ["radio"]}
+
+
+def _post(client, body):
+    r = client.post("/api/compare", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_compare_default_response_is_intact_and_echoes_new_defaults(client):
+    """Landing defaults are the v0.1.2 run: thin disk, fixed T, verified headline."""
+    d = _post(client, {})
+    assert d["request"] == {
+        "geometry_mode": "thin_disk_2d",
+        "radio_mode": "flat_probability",
+        "condition_on_earth_unreached": True,
+        "channels": ["radio", "infrared", "solar_system"],
+        "include_illustrative": False,
+        "seed": 42,
+        "disk_profile": "uniform",
+        "marginalize_lookback": False,
+    }
+    rec = d["receipt"]
+    assert rec["geometry_mode"] == "thin_disk_2d" and rec["receipt_schema_version"] == 4
+    assert d["headline_policy"] == "verified_channels_only"
+    assert rec["results"]["headline"]["headline"]["terms"] == ["earth_unreached", "radio"]
+    assert "lookback_marginalization" not in rec and "disk_profile" not in rec
+    assert "lookback_marginalization" not in rec["results"]
+    fast = rec["results"]["hypotheses"]["rare_fast_expanders"]["expansion"]
+    assert fast["local_approximation_valid"] is False and "local_approx" not in fast
+    assert fast["t_valid_kyr"] == pytest.approx(52.185, abs=5e-4)
+    # explicit defaults are the same request (same cache entry, same receipt)
+    again = _post(client, {"disk_profile": "uniform", "marginalize_lookback": False})
+    assert again["cached"] is True and again["receipt"] == rec
+
+
+def test_compare_finite_disk_clears_local_approx_violation(client):
+    d = _post(client, FINITE)
+    assert d["request"]["geometry_mode"] == "finite_disk_3d"
+    assert d["request"]["disk_profile"] == "uniform"
+    rec = d["receipt"]
+    assert rec["geometry_mode"] == "finite_disk_3d" and rec["disk_profile"] == "uniform"
+    assert d["headline_policy"] == "verified_channels_only"
+    hyps = rec["results"]["hypotheses"]
+    fast = hyps["rare_fast_expanders"]["expansion"]
+    assert fast["local_approximation_valid"] is True
+    assert fast["local_approx"] == "valid_finite_galaxy"
+    assert (
+        fast["t_valid_kyr"] is None and "finite Galactic disk" in fast["local_validity_criterion"]
+    )
+    assert fast["finite_disk"]["galactic_disk_radius_kpc"] == 15.0
+    assert fast["finite_disk"]["solar_galactocentric_distance_kpc"] == 8.178
+    # same hypothesis under the infinite thick disk: still VIOLATED, and far more reachable
+    thick = _post(client, {"geometry_mode": "thick_disk_3d", "channels": ["radio"]})["receipt"]
+    t_fast = thick["results"]["hypotheses"]["rare_fast_expanders"]["expansion"]
+    assert t_fast["local_approximation_valid"] is False
+    assert t_fast["t_valid_kyr"] == pytest.approx(52.185, abs=5e-4)
+    assert fast["p_earth_reached"] < 0.05 * t_fast["p_earth_reached"]
+    # finite-disk reach numbers carry their Monte Carlo error
+    fd = hyps["frequent_slow_expanders"]["radio"]["finite_disk_reach"]
+    assert fd["n_importance_samples"] == 1024 and fd["expected_reached_se"] > 0
+    assert {"zoo_hypothesis", "dark_forest"}.isdisjoint(hyps)
+
+
+def test_compare_disk_profile_is_applied_to_finite_disk_and_cache_keyed(client):
+    uni = _post(client, FINITE)
+    exp = _post(client, {**FINITE, "disk_profile": "exponential"})
+    assert exp["cached"] is False and exp["receipt"]["disk_profile"] == "exponential"
+    p = {
+        k: v["receipt"]["results"]["hypotheses"]["rare_fast_expanders"]["expansion"]
+        for k, v in (("uniform", uni), ("exponential", exp))
+    }
+    assert p["exponential"]["finite_disk"]["disk_profile"] == "exponential"
+    assert p["exponential"]["finite_disk"]["radial_scale_length_kpc"] == 2.6
+    assert p["exponential"]["p_earth_reached"] != p["uniform"]["p_earth_reached"]
+    assert p["exponential"]["local_approx"] == "valid_finite_galaxy"
+    # exact cache keying on the full request: each profile is its own entry
+    assert _post(client, {**FINITE, "disk_profile": "exponential"})["cached"] is True
+    assert _post(client, FINITE)["cached"] is True
+    # validated but not applied outside finite_disk_3d: identical results to the default
+    thin = _post(client, {"channels": ["radio"]})
+    thin_exp = _post(client, {"channels": ["radio"], "disk_profile": "exponential"})
+    assert thin_exp["request"]["disk_profile"] == "exponential"
+    assert thin_exp["receipt"]["results"] == thin["receipt"]["results"]
+    assert thin_exp["receipt"]["config"]["disk_profile"] == "uniform"
+
+
+def test_compare_marginalize_lookback(client):
+    fixed = _post(client, {"channels": ["radio"]})
+    marg = _post(client, {"channels": ["radio"], "marginalize_lookback": True})
+    assert marg["cached"] is False and marg["request"]["marginalize_lookback"] is True
+    rec = marg["receipt"]
+    lm = rec["lookback_marginalization"]
+    assert lm["parameter"] == "lookback_window_gyr"
+    assert lm["prior"]["type"] == "log_uniform"
+    assert lm["prior"]["effective_bounds_gyr"] == [5.0e-5, 1.0e-2]
+    assert lm["quadrature"]["n_points"] == 4 == len(lm["quadrature"]["weights"])
+    assert sum(lm["quadrature"]["weights"]) == pytest.approx(1.0, abs=1e-12)
+    assert rec["config"]["marginalize_lookback"] is True
+    assert marg["headline_policy"] == "verified_channels_only"
+    head = rec["results"]["headline"]["headline"]
+    assert head["terms"] == ["earth_unreached", "radio"]
+    assert marg["headline_log10_bf"] != fixed["headline_log10_bf"]
+    fs = rec["results"]["hypotheses"]["frequent_slow_expanders"]
+    assert len(fs["lookback_marginalization"]["per_node"]) == 4
+    assert fs["parameters"]["lookback_window_gyr"]["value"] is None
+    # the infinite disk is still flagged: rare/fast is VIOLATED on part of the grid
+    fast = rec["results"]["hypotheses"]["rare_fast_expanders"]["expansion"]
+    assert fast["local_approximation_valid"] is False and fast["local_approx"] == "VIOLATED"
+    assert fast["local_approx_nodes_violated"] >= 1
+    assert _post(client, {"channels": ["radio"], "marginalize_lookback": True})["cached"] is True
+    # combined with the finite disk the violation clears on every node
+    both = _post(client, {**FINITE, "marginalize_lookback": True})["receipt"]
+    b_fast = both["results"]["hypotheses"]["rare_fast_expanders"]["expansion"]
+    assert b_fast["local_approx"] == "valid_finite_galaxy" and b_fast["t_valid_kyr"] is None
+    assert b_fast["local_approx_nodes_violated"] == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"geometry_mode": "finite_disk"},
+        {"geometry_mode": "finite_disk_2d"},
+        {"geometry_mode": "FINITE_DISK_3D"},
+        {"geometry_mode": "finite_disk_3d", "disk_profile": "sech2"},
+        {"disk_profile": "Uniform Slab"},
+        {"disk_profile": None},
+        {"disk_profile": 1},
+        {"marginalize_lookback": "yes"},
+        {"marginalize_lookback": 1},
+        {"marginalize_lookback": None},
+        {"geometry_mode": "finite_disk_3d", "lookback_grid_points": 64},
+        {"geometry_mode": "finite_disk_3d", "n_importance": 10},
+    ],
+)
+def test_compare_rejects_invalid_v020_requests(client, body):
+    assert client.post("/api/compare", json=body).status_code == 422
+
+
+def test_health_and_registry_expose_v020_parameters_offline(client):
+    h = _ok(client, "/api/health")
+    assert h["status"] == "ok" and h["validation_checks_passed"] == h["validation_checks_total"]
+    assert h["validation_checks_total"] >= 34 and h["receipt_schema_version"] == 4
+    r = _ok(client, "/api/registry")
+    params = {p["id"]: p for p in r["parameters"]}
+    assert params["galactic_disk_radius_kpc"]["default"] == 15.0
+    assert params["solar_galactocentric_radius_kpc"]["default"] == 8.178
+    assert params["galactic_radial_scale_length_kpc"]["default"] == 2.6
+    for pid in ("galactic_disk_radius_kpc", "galactic_radial_scale_length_kpc"):
+        assert params[pid]["unit"] == "kpc" and params[pid]["geometry_modes"] == ["finite_disk_3d"]
+    assert params["lookback_window_gyr"]["marginalization_prior_bounds"] == [5.0e-5, 1.0e-2]
+    assert params["disk_scale_height_pc"]["geometry_modes"] is None

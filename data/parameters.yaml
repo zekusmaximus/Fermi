@@ -31,7 +31,9 @@ parameters:
     description: >-
       Galactic stellar thin-disk vertical scale height. In thick_disk_3d mode the
       origin process is a uniform slab |z_mid| <= h_z with volumetric rate
-      Gamma_2d / (2 h_z), so the column-integrated rate equals Gamma_2d.
+      Gamma_2d / (2 h_z), so the column-integrated rate equals Gamma_2d. In
+      finite_disk_3d it is the slab half-thickness (disk_profile=uniform) or the
+      exponential scale height of exp(-|Z| / h_z) (disk_profile=exponential).
 
   - id: lookback_window_gyr
     symbol: "T"
@@ -39,12 +41,17 @@ parameters:
     prior_type: log_uniform
     default: 1.0e-3
     bounds: [1.0e-6, 10.0]
+    marginalization_prior_bounds: [5.0e-5, 1.0e-2]
     description: >-
-      Duration of the origin process before the present epoch. The expansion
-      kernel uses a local, translation-invariant disk/slab, valid only while
+      Duration of the origin process before the present epoch. thin_disk_2d and
+      thick_disk_3d use a local, translation-invariant disk/slab, valid only while
       v_exp * T is small compared with the Sun's Galactocentric radius (~8 kpc);
-      run receipts flag violations. The 1 Myr default is a round-decade
-      convention, NOT a fitted value; results depend strongly on T.
+      run receipts flag violations (finite_disk_3d has no such limit). The 1 Myr
+      default is a round-decade convention, NOT a fitted value; results depend
+      strongly on T. With --marginalize-lookback, T is instead integrated in
+      likelihood space over the log-uniform prior marginalization_prior_bounds
+      (50 kyr - 10 Myr: the span of the lookback_window_t_sweep job; also a
+      convention, not a fitted range).
 
   - id: solar_height_pc
     symbol: "z_sun"
@@ -52,9 +59,55 @@ parameters:
     prior_type: fixed
     default: 20.8
     bounds: [0.0, 50.0]
-    description: "Height of the Sun above the local Galactic mid-plane (thick_disk_3d only)."
+    description: "Height of the Sun above the local Galactic mid-plane (thick_disk_3d and finite_disk_3d)."
     citations:
       - "Bennett & Bovy 2019, MNRAS 482, 1417 (arXiv:1809.03507): z_sun = 20.8 +/- 0.3 pc"
+
+  # --- Galactic structure (finite_disk_3d only; v0.2.0). `geometry_modes` scopes these
+  # to the finite disk, so they never enter thin_disk_2d / thick_disk_3d receipts.
+  - id: galactic_disk_radius_kpc
+    symbol: "R_gal"
+    unit: "kpc"
+    prior_type: fixed_or_bounded
+    default: 15.0
+    bounds: [10.0, 30.0]
+    geometry_modes: ["finite_disk_3d"]
+    description: >-
+      Outer radius of the Galactic disk in finite_disk_3d: no civilization origin
+      exists at Galactocentric cylindrical radius R > R_gal. The 15 kpc default is
+      the round-number convention fixed by SPEC.md (v0.2 roadmap item 2); it is a
+      modelling convention for the edge of the star-forming disk, NOT a measured
+      truncation radius.
+
+  - id: solar_galactocentric_radius_kpc
+    symbol: "R_0"
+    unit: "kpc"
+    prior_type: fixed_or_bounded
+    default: 8.178
+    bounds: [7.5, 8.7]
+    geometry_modes: ["finite_disk_3d"]
+    description: >-
+      Distance from the Sun to the Galactic Centre (Sgr A*), used as
+      galcen_distance of the astropy Galactocentric frame. The Sun's cylindrical
+      radius is R_E = sqrt(R_0^2 - z_sun^2) = 8.17797 kpc.
+    citations:
+      - "GRAVITY Collaboration 2019, A&A 625, L10 (arXiv:1904.05721): R_0 = 8178 +/- 13 (stat) +/- 22 (sys) pc"
+
+  - id: galactic_radial_scale_length_kpc
+    symbol: "R_d"
+    unit: "kpc"
+    prior_type: fixed_or_bounded
+    default: 2.6
+    bounds: [1.5, 5.0]
+    geometry_modes: ["finite_disk_3d"]
+    description: >-
+      Radial exponential scale length of the origin-rate density in finite_disk_3d
+      with disk_profile=exponential: rho proportional to exp(-(R - R_E) / R_d),
+      normalised so the column-integrated rate at the Sun's cylindrical radius is
+      Gamma_2d. Unused by disk_profile=uniform. Assumes origins trace the stellar
+      thin disk.
+    citations:
+      - "Bland-Hawthorn & Gerhard 2016, ARA&A 54, 529 (arXiv:1602.07702): thin-disk scale length R_d = 2.6 +/- 0.5 kpc"
 
   - id: radio_detect_prob
     symbol: "p_radio"

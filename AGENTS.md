@@ -34,6 +34,9 @@ Do not invent scope outside the active milestone brief. If a milestone brief con
 6. **Keep Macro and Micro Layers Decoupled.**
    Instrument-level calibration modules (e.g., AllWISE blend recovery, per-target radio beam profiles) must output clean likelihood / completeness / false-positive objects consumed by `inference/engine.py`. Never hard-code instrument calibration quirks inside the macro expansion kernel.
 
+7. **Follow `DESIGN.md` on Every Frontend Change.**
+   Before modifying anything under `web/`, read `DESIGN.md` and enforce its data-tier color rules, 100% offline native-SVG constraint, inline control legibility standard (plain-English label, 1-line dynamic caption, and `?` popover on every new or edited control), and Easter egg guardrails.
+
 ---
 
 ## 3. Development Environment & Commands

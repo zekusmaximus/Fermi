@@ -8,6 +8,7 @@ Treat the attached repository files as your single source of truth:
 2. `SPEC.md` — master architecture, schemas, and six core invariants.
 3. `docs/PLANNING_LEDGER.md` — current release tag, locked artifact SHA-256 hashes, canonical baseline numbers, full chronological rulings log, and deferred backlog.
 4. Any active milestone brief (e.g., `docs/V0_2_ROADMAP.md`, `docs/MILESTONE_*.md`).
+5. `DESIGN.md` — UI legibility standard, visualization registry, and Easter egg guardrails for `web/`.
 
 Never invent hashes, commit SHAs, test counts, or astronomical citations from memory. If a number is not in the attached docs or the user's pasted terminal output, state that explicitly.
 

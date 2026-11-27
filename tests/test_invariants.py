@@ -16,6 +16,7 @@ from fermi_desk.cli import app
 from fermi_desk.errors import (
     DoubleCountingError,
     GeometryError,
+    MergePolicyError,
     SchemaValidationError,
     Tier3ScoringError,
     UnitValidationError,
@@ -219,8 +220,15 @@ def test_shared_pointing_group_raises_double_counting(graph):
     dup = bl.model_copy(update={"id": "bl_enriquez_2017_692_reanalysis"})
     with pytest.raises(DoubleCountingError):
         check_pointing_groups([bl, dup])
-    kept = check_pointing_groups([bl, dup], {bl.pointing_group_id: "keep_first"})
-    assert [s.id for s in kept] == [bl.id]
+    # v0.2.1: keep_first (load-order-dependent, drops a catalog wholesale) is forbidden. The
+    # pre-v0.2.1 call form must raise the explicit domain error, never silently keep one.
+    with pytest.raises(MergePolicyError, match="load order"):
+        check_pointing_groups([bl, dup], {bl.pointing_group_id: "keep_first"})
+    # union_targets_by_pointing needs a declared parent pointing: an undeclared duplicate
+    # is still a double-counting error, not something to merge.
+    with pytest.raises(DoubleCountingError):
+        check_pointing_groups([bl, dup], "union_targets_by_pointing")
+    assert [s.id for s in check_pointing_groups([bl])] == [bl.id]
 
 
 def test_engine_refuses_duplicate_pointing_groups(graph):
@@ -229,6 +237,23 @@ def test_engine_refuses_duplicate_pointing_groups(graph):
     g2 = FactorGraph(graph.root, graph.registry, graph.hypotheses, {**graph.surveys, "bl_dup": dup})
     with pytest.raises(DoubleCountingError):
         build_context(g2, RunConfig(geometry="thin_disk_2d", radio_mode="flat_probability", seed=1))
+    with pytest.raises(DoubleCountingError):  # no policy turns an undeclared duplicate into a merge
+        build_context(
+            g2,
+            RunConfig(
+                geometry="thin_disk_2d",
+                radio_mode="flat_probability",
+                seed=1,
+                pointing_merge_policy="union_targets_by_pointing",
+            ),
+        )
+    with pytest.raises(MergePolicyError):
+        RunConfig(
+            geometry="thin_disk_2d",
+            radio_mode="flat_probability",
+            seed=1,
+            pointing_merge_policy="keep_first",
+        )
 
 
 def test_conditioned_run_never_reapplies_earth_factor_via_solar_system(graph):

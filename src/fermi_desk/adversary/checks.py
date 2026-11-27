@@ -25,7 +25,7 @@ import pandas as pd
 import yaml
 from astropy.coordinates import SkyCoord
 
-from fermi_desk.errors import DoubleCountingError
+from fermi_desk.errors import DoubleCountingError, FermiDeskError, MergePolicyError
 from fermi_desk.inference.engine import (
     RunConfig,
     build_context,
@@ -38,7 +38,20 @@ from fermi_desk.inference.engine import (
 )
 from fermi_desk.models import hephaistos, radio
 from fermi_desk.models.expansion import C_KPC_PER_GYR
-from fermi_desk.registry import FactorGraph, check_pointing_groups, load_targets
+from fermi_desk.registry import (
+    MISSING_GAIA_ID,
+    FactorGraph,
+    MergedTargets,
+    check_pointing_groups,
+    load_background_summary,
+    load_targets,
+    resolve_pointing_groups,
+)
+from fermi_desk.schemas import (
+    POINTING_MERGE_POLICIES,
+    REJECT_DUPLICATE_POINTING_GROUP,
+    validate_pointing_merge_policy,
+)
 
 HIP1692_CLAIM = "data/adversary_claims/hip_1692.yaml"
 HEPHAISTOS_DE_CLAIM = "data/adversary_claims/hephaistos_candidates_d_e.yaml"
@@ -59,7 +72,10 @@ def _yaml(graph: FactorGraph, rel: str) -> dict:
 
 
 def _radio_survey(graph: FactorGraph):
-    return next(s for s in graph.surveys.values() if s.channel == "radio")
+    """The primary radio survey (a pointing extension is never a stand-alone survey)."""
+    return next(
+        s for s in graph.surveys.values() if s.channel == "radio" and not s.is_pointing_extension
+    )
 
 
 # ---------------------------------------------------------- distance revisions
@@ -274,6 +290,151 @@ def audit_duplicate_pointings(graph: FactorGraph) -> Finding:
     )
 
 
+def _recount_merge(merged: MergedTargets) -> dict:
+    """Independent recount of a star-level merge (never trusts its own provenance)."""
+    win, cl, gaia = merged.winner, merged.cluster, merged.gaia_dr3_source_id
+    dup = merged.duplicate_gaia_ids()
+    theta = merged.theta.to_value(u.arcmin)
+    theta_min = np.full(len(win), np.inf)
+    np.minimum.at(theta_min, cl, theta)
+    not_min = int(np.sum(theta[win] != theta_min))
+    # Unmerged collisions: a star with no Gaia id in any of its sightings lying closer than
+    # the fallback radius to a different star - unless both are distinct targets of the
+    # same primary list (published separate targets are never merged with each other).
+    tol = merged.provenance.angular_fallback_arcsec
+    star_has_id = np.zeros(len(win), bool)
+    star_has_id[cl[gaia != MISSING_GAIA_ID]] = True
+    primary_lists: dict[int, set[int]] = {}
+    for r in np.flatnonzero(merged.row_role == "primary"):
+        primary_lists.setdefault(int(cl[r]), set()).add(int(merged.survey_index[r]))
+    unmerged: dict[tuple[int, int], dict] = {}
+    rows = np.flatnonzero(~star_has_id[cl])
+    if rows.size and len(cl) > 1:
+        sky = SkyCoord(merged.ra_deg * u.deg, merged.dec_deg * u.deg)
+        i1, i2, sep, _ = sky.search_around_sky(sky[rows], tol * u.arcsec)
+        for a, b, s in zip(rows[i1], i2, sep.to_value(u.arcsec), strict=True):
+            ka, kb = int(cl[a]), int(cl[b])
+            if (
+                ka == kb
+                or s >= tol
+                or (primary_lists.get(ka, set()) & primary_lists.get(kb, set()))
+            ):
+                continue
+            unmerged.setdefault(
+                (min(ka, kb), max(ka, kb)),
+                {"a": str(merged.names[a]), "b": str(merged.names[b]), "separation_arcsec": s},
+            )
+    unmerged = list(unmerged.values())
+    p = merged.provenance
+    counts_ok = (
+        p.n_raw_targets == len(merged.cluster)
+        and p.n_merged_targets == len(win)
+        and p.n_raw_targets - p.n_merged_targets == p.n_dedup_gaia_id + p.n_dedup_angular_fallback
+    )
+    return {
+        "n_raw_targets_recounted": len(merged.cluster),
+        "n_merged_targets_recounted": len(win),
+        "n_duplicate_gaia_ids_post_merge": len(dup),
+        "duplicate_gaia_ids": [int(x) for x in dup[:20]],
+        "n_unmerged_angular_collisions": len(unmerged),
+        "unmerged_angular_collisions": unmerged[:20],
+        "n_kept_sightings_not_minimum_offset": not_min,
+        "provenance_counts_consistent": bool(counts_ok),
+        "merge_provenance": p.model_dump(),
+    }
+
+
+def audit_pointing_overlap(
+    graph: FactorGraph,
+    *,
+    policy: str = REJECT_DUPLICATE_POINTING_GROUP,
+    merged: MergedTargets | None = None,
+) -> Finding:
+    """Audit how surveys that share a pointing group are combined under ``policy``.
+
+    Fails loudly when ``keep_first`` (or any unknown policy) is requested, when the registry
+    would accept ``keep_first``, when surveys share a pointing group without a declared
+    parent-pointing relationship (unmerged collision), or when a
+    ``union_targets_by_pointing`` merge leaves a duplicated Gaia DR3 id, an unmerged
+    angular collision, or a kept sighting that is not the minimum-offset one. ``merged``
+    optionally audits a star-level merge directly (independent recount).
+    """
+    check = "pointing_overlap"
+    details: dict = {"policy_requested": policy, "allowed_policies": list(POINTING_MERGE_POLICIES)}
+    try:
+        validate_pointing_merge_policy(policy)
+    except MergePolicyError as exc:
+        details["error"] = str(exc)
+        return Finding(
+            check, "fail", "critical", f"forbidden merge policy {policy!r}: {exc}", details
+        )
+    surveys = list(graph.surveys.values())
+    try:
+        resolve_pointing_groups(surveys, "keep_first")
+        keep_first_refused = False
+    except MergePolicyError:
+        keep_first_refused = True
+    details["keep_first_refused_by_registry"] = keep_first_refused
+    problems = [] if keep_first_refused else ["registry accepted keep_first"]
+    try:
+        res = resolve_pointing_groups(surveys, policy)
+    except DoubleCountingError as exc:
+        details["unmerged_collisions"] = [str(exc)]
+        return Finding(check, "fail", "critical", f"unmerged pointing collision: {exc}", details)
+    details["held_out_extension_surveys"] = list(res.held_out)
+    merges = []
+    for m in res.merges:
+        for ext in m.extensions:
+            row: dict = {"pointing_group_id": m.pointing_group_id, "parent": m.parent.id}
+            row["extension"] = ext.id
+            try:
+                bf = load_background_summary(ext, m.parent, graph.root)
+            except (FermiDeskError, ValueError, OSError) as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                problems.append(f"{ext.id}: {row['error']}")
+            else:
+                da = bf.record.dedup_audit
+                row.update(
+                    data_tier=bf.record.data_tier,
+                    summary_sha256=bf.file_sha256,
+                    merge_provenance=bf.merge_provenance.model_dump(),
+                    n_duplicate_gaia_ids_vs_primary=da.n_duplicate_gaia_ids_vs_primary,
+                    n_duplicate_gaia_ids_within_background=da.n_duplicate_gaia_ids_within_background,
+                    n_suspected_unmatched_primary=da.n_suspected_unmatched_primary,
+                    offline_recomputation=bf.detail,
+                )
+            merges.append(row)
+    details["merges"] = merges
+    if merged is not None:
+        rc = _recount_merge(merged)
+        details["star_level_recount"] = rc
+        if rc["n_duplicate_gaia_ids_post_merge"]:
+            problems.append(
+                f"{rc['n_duplicate_gaia_ids_post_merge']} duplicated Gaia ids post-merge"
+            )
+        if rc["n_unmerged_angular_collisions"]:
+            problems.append(f"{rc['n_unmerged_angular_collisions']} unmerged angular collisions")
+        if rc["n_kept_sightings_not_minimum_offset"]:
+            problems.append("a kept sighting is not the minimum-offset one")
+        if not rc["provenance_counts_consistent"]:
+            problems.append("MergeProvenance counts disagree with the recount")
+    details["problems"] = problems
+    n_merged = len(merges) + (merged is not None)
+    return Finding(
+        check,
+        "fail" if problems else "pass",
+        "critical" if problems else "info",
+        "; ".join(problems)
+        if problems
+        else (
+            f"policy {res.policy}: keep_first refused; {n_merged} union merge(s) audited with 0 "
+            f"duplicated Gaia ids; declared extensions held out of this run: "
+            f"{[h['survey_id'] for h in res.held_out] or 'none'}"
+        ),
+        details,
+    )
+
+
 # ------------------------------------------------------- Hephaistos D/E anchors
 def _verdict(p: float, false_alarm: float) -> str:
     if p < false_alarm:
@@ -420,6 +581,7 @@ def run_adversary(
     findings = [
         audit_hip1692_distance_revision(graph, pair, seed=seed, n_mc=n_mc),
         audit_duplicate_pointings(graph),
+        audit_pointing_overlap(graph),
         audit_hephaistos_blend_anchors(graph, spec),
         audit_scaling_symmetry(graph, pair),
         audit_local_approximation(graph, sorted(graph.hypotheses)),

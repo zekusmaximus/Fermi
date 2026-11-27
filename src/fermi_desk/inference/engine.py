@@ -22,7 +22,7 @@ import json
 import math
 import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,8 +40,22 @@ from fermi_desk.models.expansion import (
     LOCAL_APPROX_VIOLATED,
     ExpansionModel,
 )
-from fermi_desk.registry import FactorGraph, TargetTable, check_pointing_groups, load_targets
-from fermi_desk.schemas import Hypothesis, Survey
+from fermi_desk.registry import (
+    BackgroundField,
+    FactorGraph,
+    TargetTable,
+    load_background_summary,
+    load_targets,
+    resolve_pointing_groups,
+)
+from fermi_desk.schemas import (
+    REJECT_DUPLICATE_POINTING_GROUP,
+    UNION_TARGETS_BY_POINTING,
+    Hypothesis,
+    MergeProvenance,
+    Survey,
+    validate_pointing_merge_policy,
+)
 
 LN10 = math.log(10.0)
 LOOKBACK = "lookback_window_gyr"
@@ -62,9 +76,21 @@ CHANNELS = ("radio", "infrared", "solar_system")
 ILLUSTRATIVE_TIERS = frozenset(
     {"illustrative_calibration", "synthetic_proxy", "synthetic_proxy_692"}
 )
-RECEIPT_SCHEMA_VERSION = 4
+# v5 (v0.2.1): receipts carry `pointing_merge_policy` and `merge_provenance`, and
+# `config.merge_policies` (per-group dict that admitted keep_first) is replaced by
+# `config.pointing_merge_policy`. `results` - the payload behind `results_sha256` - is
+# unchanged for single-survey runs.
+RECEIPT_SCHEMA_VERSION = 5
+# Reach nodes of the background shells are evaluated in blocks: the finite-disk importance
+# sampler shares its sample budget across one target set, so each block keeps its own.
+BACKGROUND_REACH_CHUNK = 512
 # Why each illustrative input is illustrative (surfaced as headline_exclusion_notes).
 ILLUSTRATIVE_INPUT_REASONS = {
+    "synthetic_background_field": (
+        "the merged background-field shells are a synthetic_proxy population (offline test "
+        "or dry-run fixture), not archive stars, so the radio term is held out of the "
+        "verified headline"
+    ),
     "transmitter_eirp_luminosity_function": (
         "distance_scaled_eirp mode: the log-normal transmitter EIRP luminosity function "
         "(median / sigma_dex) is illustrative_calibration, not a measured population, so the "
@@ -106,7 +132,11 @@ class RunConfig:
     light_travel_delay: bool = True
     headline_pair: tuple[str, str] | None = None
     ir_pair: tuple[str, str] | None = None
-    merge_policies: dict[str, str] = field(default_factory=dict)
+    # v0.2.1: how surveys sharing a pointing_group_id are combined. The default refuses
+    # every undeclared collision and leaves declared extensions out of the run;
+    # "union_targets_by_pointing" merges a declared extension into its parent star by star.
+    # "keep_first" raises MergePolicyError.
+    pointing_merge_policy: str = REJECT_DUPLICATE_POINTING_GROUP
     # Overrides of registry DEFAULTS only (e.g. lookback sweeps); never of a value
     # a hypothesis constrains itself.
     parameter_overrides: tuple[tuple[str, float], ...] = ()
@@ -140,6 +170,7 @@ class RunConfig:
             raise ValueError("lookback_grid_points must be >= 2")
         if self.n_importance < 16:
             raise ValueError("n_importance must be >= 16")
+        validate_pointing_merge_policy(self.pointing_merge_policy)  # MergePolicyError
 
 
 # --------------------------------------------------------- parameter resolution
@@ -312,15 +343,34 @@ class RunContext:
     targets: TargetTable | None
     ir_footprint: u.Quantity | None
     catalog_column_tiers: tuple[str, ...]
+    # v0.2.1 union_targets_by_pointing: background-field shells merged with the radio
+    # primaries (None for single-survey runs), their verified source and merge audit.
+    background: radio.BackgroundShells | None = None
+    background_field: BackgroundField | None = None
+    merge_provenance: MergeProvenance | None = None
+    held_out_surveys: tuple[dict, ...] = ()
 
 
 def build_context(graph: FactorGraph, cfg: RunConfig) -> RunContext:
-    selected = check_pointing_groups(
-        graph.surveys_for_channels(cfg.channels),
-        cfg.merge_policies,  # type: ignore[arg-type]
+    resolution = resolve_pointing_groups(
+        graph.surveys_for_channels(cfg.channels), cfg.pointing_merge_policy
     )
+    background_field = None
+    for merge in resolution.merges:
+        ext = merge.extensions
+        if (
+            merge.parent.channel != "radio"
+            or len(ext) != 1
+            or ext[0].background_summary_path is None
+        ):
+            raise SchemaValidationError(
+                f"{UNION_TARGETS_BY_POINTING} is implemented for exactly one radio "
+                f"background-summary extension per pointing group (got {[e.id for e in ext]} "
+                f"on {merge.parent.id})"
+            )
+        background_field = load_background_summary(ext[0], merge.parent, graph.root)
     by_channel: dict[str, Survey] = {}
-    for sv in selected:
+    for sv in resolution.active:
         if sv.channel in by_channel:
             raise SchemaValidationError(
                 f"Multiple {sv.channel} surveys selected ({by_channel[sv.channel].id}, {sv.id}); "
@@ -338,7 +388,80 @@ def build_context(graph: FactorGraph, cfg: RunConfig) -> RunContext:
         if sv.catalog_provenance_path:
             prov = json.loads((graph.root / sv.catalog_provenance_path).read_text("utf-8"))
             col_tiers |= {t for t in prov.get("column_data_tiers", {}) if t != "derived"}
-    return RunContext(graph, cfg, by_channel, targets, footprint, tuple(sorted(col_tiers)))
+    return RunContext(
+        graph,
+        cfg,
+        by_channel,
+        targets,
+        footprint,
+        tuple(sorted(col_tiers)),
+        background=background_field.shells if background_field else None,
+        background_field=background_field,
+        merge_provenance=background_field.merge_provenance if background_field else None,
+        held_out_surveys=resolution.held_out,
+    )
+
+
+def background_radio_term(
+    model: ExpansionModel,
+    shells: radio.BackgroundShells,
+    radio_mode: str,
+    p_radio: float,
+    luminosity_function: radio.LogNormalEIRP | None,
+    condition_on_earth_unreached: bool,
+) -> dict:
+    """Zero-detection term of the background-field shells (merged primary + background runs).
+
+    Spatial-correlation assumption (``radio.SHELL_CORRELATION_ASSUMPTION``): the primaries
+    keep the exact correlated Monte Carlo; the distant background shells are evaluated as
+    the independent product of marginal conditional-reach probabilities,
+
+        ln P0_bg = sum_cells N_c * log(1 - p_c * q_c),
+
+    with ``q_c`` the reach probability at the cell's beam-centre direction and distance-bin
+    centre (given Earth unreached when the run conditions on it) and ``p_c`` the detection
+    probability at the cell's off-axis EIRP_min. By Harris-FKG this is a LOWER bound on the
+    exact P0; the Frechet upper bound is returned beside it. ``p_radio = 0`` gives
+    ``ln P0_bg = 0`` exactly, so zero-emission invariance holds for merged runs in every
+    geometry and radio mode.
+    """
+    xyz, node_of_cell = shells.reach_nodes()
+    q_nodes = (
+        np.concatenate(
+            [
+                model.reach_probabilities(
+                    xyz[i : i + BACKGROUND_REACH_CHUNK], condition_on_earth_unreached
+                )
+                for i in range(0, len(xyz), BACKGROUND_REACH_CHUNK)
+            ]
+        )
+        if len(xyz)
+        else np.zeros(0)
+    )
+    q = q_nodes[node_of_cell]
+    p_det = radio.shell_detection_probabilities(radio_mode, p_radio, shells, luminosity_function)
+    z = radio.shell_zero_detection(p_det, q, shells.count)
+    n_stars = shells.n_stars
+    return {
+        "survey_id": shells.survey_id,
+        "data_tier": shells.data_tier,
+        "summary_sha256": shells.source_sha256,
+        "n_stars": n_stars,
+        "n_cells": shells.n_cells,
+        "n_reach_nodes": len(xyz),
+        "evaluation": "independent conditional-reach shell product (Harris-FKG lower bound)",
+        "spatial_correlation_assumption": radio.SHELL_CORRELATION_ASSUMPTION,
+        "mean_p_detect_given_reached": float(np.sum(shells.count * p_det) / n_stars)
+        if n_stars
+        else 0.0,
+        "expected_reached": z.expected_reached,
+        "expected_reached_conditioned_on_earth_unreached": condition_on_earth_unreached,
+        "expected_detections": z.expected_detections,
+        "log10_p_zero_independent_fkg_lower": z.log_p_zero_independent / LN10,
+        "p_zero_independent_fkg_lower": math.exp(z.log_p_zero_independent),
+        "p_zero_markov_lower": z.markov,
+        "p_zero_frechet_upper": z.frechet_upper,
+    }
 
 
 def _component(
@@ -510,8 +633,26 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
                     "probabilities, so they carry the Monte Carlo error reported here"
                 ),
             }
+        ln_radio = math.log(mc.p_zero_targets_only)
+        ln_radio_ss = math.log(mc.p_zero) if joint_ss else 0.0
+        if ctx.background is not None:
+            # union_targets_by_pointing: the shells multiply onto the primaries' exact MC term
+            # (keys below exist only in merged runs; single-survey results are unchanged).
+            bg = background_radio_term(
+                model, ctx.background, cfg.radio_mode, params.value("radio_detect_prob"), lf, cond
+            )
+            ln_bg = bg["log10_p_zero_independent_fkg_lower"] * LN10
+            bg["log10_p_zero_primary_mc"] = ln_radio / LN10
+            bg["log10_p_zero_merged"] = (ln_radio + ln_bg) / LN10
+            ln_radio += ln_bg
+            ln_radio_ss += ln_bg
+            out["radio"]["background"] = bg
+            out["radio"]["n_targets_merged"] = len(ctx.targets) + bg["n_stars"]
+            radio_tiers.append(ctx.background.data_tier)
+            if ctx.background.data_tier in ILLUSTRATIVE_TIERS:
+                radio_illustrative.append("synthetic_background_field")
         comps["radio"] = _component(
-            math.log(mc.p_zero_targets_only),
+            ln_radio,
             0.0,
             "radio",
             ["radio"],
@@ -520,7 +661,7 @@ def evaluate_hypothesis(hyp: Hypothesis, ctx: RunContext) -> dict:
         )
         if joint_ss:
             comps[RADIO_SS] = _component(
-                math.log(mc.p_zero),
+                ln_radio_ss,
                 0.0,
                 RADIO_SS,
                 ["radio", "solar_system"],
@@ -854,6 +995,26 @@ def _marginalize_nodes(nodes: Sequence[dict], grid: LookbackGrid, reason: str | 
             "Earth conditioning is off); *_se are weighted linear sums of the per-node "
             "standard errors (an upper bound: nodes share one seed)"
         )
+        if "background" in rd[0]:  # merged primary + background runs only
+            bgs = [r["background"] for r in rd]
+            avg = {
+                k: _weighted([b[k] for b in bgs], post)
+                for k in (
+                    "expected_reached",
+                    "expected_detections",
+                    "p_zero_independent_fkg_lower",
+                    "p_zero_markov_lower",
+                    "p_zero_frechet_upper",
+                )
+            }
+            p0 = avg["p_zero_independent_fkg_lower"]
+            drop = ("log10_p_zero_primary_mc", "log10_p_zero_merged")
+            out["radio"]["background"] = {
+                **{k: v for k, v in bgs[0].items() if k not in drop},
+                **avg,
+                "log10_p_zero_independent_fkg_lower": math.log10(p0) if p0 > 0 else -math.inf,
+            }
+            out["radio"]["n_targets_merged"] = rd[0]["n_targets_merged"]
     if "solar_system" in first:
         ss = [nd["solar_system"] for nd in nodes]
         out["solar_system"] = {
@@ -1144,7 +1305,37 @@ def _data_tiers(ctx: RunContext) -> list[str]:
             tiers |= {sv.infrared.counts_data_tier, sv.infrared.calibration_data_tier}
     if "radio" in ctx.surveys and ctx.config.radio_mode == "distance_scaled_eirp":
         tiers.add("illustrative_calibration")  # transmitter luminosity function
+    if ctx.background is not None:
+        tiers.add(ctx.background.data_tier)
     return sorted(tiers)
+
+
+def _active_surveys(ctx: RunContext) -> list[dict]:
+    rows = [
+        {
+            "id": s.id,
+            "channel": s.channel,
+            "pointing_group_id": s.pointing_group_id,
+            "data_tier": s.data_tier,
+            "catalog_sha256": s.catalog_sha256,
+        }
+        for s in ctx.surveys.values()
+    ]
+    if ctx.background is not None:  # merged extension: listed after the surveys it joins
+        parent = ctx.surveys["radio"]
+        rows.append(
+            {
+                "id": ctx.background.survey_id,
+                "channel": "radio",
+                "pointing_group_id": parent.pointing_group_id,
+                "data_tier": ctx.background.data_tier,
+                "catalog_sha256": None,
+                "background_summary_sha256": ctx.background.source_sha256,
+                "merged_into": parent.id,
+                "pointing_merge_policy": UNION_TARGETS_BY_POINTING,
+            }
+        )
+    return rows
 
 
 def score_hypotheses(
@@ -1245,16 +1436,12 @@ def run_comparison(
         "radio_mode": cfg.radio_mode,
         "condition_on_earth_unreached": cfg.condition_on_earth_unreached,
         "config": cfg_dict,
-        "active_surveys": [
-            {
-                "id": s.id,
-                "channel": s.channel,
-                "pointing_group_id": s.pointing_group_id,
-                "data_tier": s.data_tier,
-                "catalog_sha256": s.catalog_sha256,
-            }
-            for s in ctx.surveys.values()
-        ],
+        "active_surveys": _active_surveys(ctx),
+        # Receipt schema v5: the policy is always stated; merge_provenance is None unless
+        # union_targets_by_pointing actually merged an extension into its parent.
+        "pointing_merge_policy": cfg.pointing_merge_policy,
+        "merge_provenance": ctx.merge_provenance.model_dump() if ctx.merge_provenance else None,
+        "held_out_extension_surveys": list(ctx.held_out_surveys),
         "data_tiers_used": _data_tiers(ctx),
         "headline_policy": HEADLINE_WITH_ILLUSTRATIVE
         if cfg.include_illustrative_in_headline

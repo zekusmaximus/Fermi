@@ -67,8 +67,13 @@ JOB_DEFINITIONS: tuple[JobDefinition, ...] = (
         est_cpu_seconds=600.0,
         est_reviewer_minutes=180.0,
         source="SPEC.md Sec. 5 (Milestone 2)",
-        archival_script="(not yet written) needs the Wlodarczyk-Sroka 2020 online Table 1",
-        notes="Shares pointing_group_id bl_gbt_lband_2017 with BL 692: needs a merge policy.",
+        archival_script="scripts/fetch_wlodarczyk_sroka_288k.py",
+        notes=(
+            "Shares pointing_group_id bl_gbt_lband_2017 with BL 692: enters only through "
+            "union_targets_by_pointing (v0.2.1). The script reproduces the Wlodarczyk-Sroka "
+            "2020 method with Gaia DR3 cones on the 692 Enriquez 2017 pointings; the live "
+            "fetch is opt-in (--fetch) and belongs to v0.2.1b."
+        ),
     ),
     JobDefinition(
         job_id="wise_independent_control_fields",
@@ -264,17 +269,19 @@ class JobStore:
         for job in jobs:
             if self.get(job.job_id) is not None:
                 # Refresh registration metadata on existing rows (diagnostic fields added in
-                # Milestone 2.5; cost estimates revised in v0.1.1). The stored EIG is reused
-                # for the utility score; status, seeds and output hashes are never touched.
+                # Milestone 2.5; cost estimates revised in v0.1.1; archival script pointer
+                # in v0.2.1). The stored EIG is reused for the utility score; status, seeds
+                # and output hashes are never touched.
                 impact, priority = compute_job_diagnostic(graph, job)
                 self.conn.execute(
                     "UPDATE jobs SET diagnostic_impact=?, diagnostic_priority=?, source=?, "
-                    "est_cpu_seconds=?, est_reviewer_minutes=?, "
+                    "archival_script=?, est_cpu_seconds=?, est_reviewer_minutes=?, "
                     "utility_bits_per_hour=? WHERE job_id=?",
                     (
                         impact,
                         priority,
                         job.source,
+                        job.archival_script,
                         job.est_cpu_seconds,
                         job.est_reviewer_minutes,
                         utility_bits_per_hour(

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Literal
 
 import astropy.units as u
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from fermi_desk.errors import (
+    MergePolicyError,
     ProvenanceError,
     SchemaValidationError,
     Tier3SchemaError,
@@ -31,6 +33,41 @@ GeometryMode = Literal["thin_disk_2d", "thick_disk_3d", "finite_disk_3d"]
 # single documented alias. Every other unit string must parse via u.Unit().
 _UNIT_ALIASES: dict[str, u.UnitBase] = {"dimensionless": u.dimensionless_unscaled}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# ------------------------------------------------- pointing merge policy (v0.2.1)
+# How two surveys sharing a `pointing_group_id` are combined in one run. There are
+# exactly two policies; `keep_first` existed before v0.2.1 and is now refused everywhere
+# (schema, registry, engine, CLI, API) with `MergePolicyError`.
+PointingMergePolicy = Literal["reject_duplicate_pointing_group", "union_targets_by_pointing"]
+REJECT_DUPLICATE_POINTING_GROUP = "reject_duplicate_pointing_group"
+UNION_TARGETS_BY_POINTING = "union_targets_by_pointing"
+POINTING_MERGE_POLICIES: tuple[str, ...] = (
+    REJECT_DUPLICATE_POINTING_GROUP,
+    UNION_TARGETS_BY_POINTING,
+)
+KEEP_FIRST_FORBIDDEN_REASON = (
+    "pointing merge policy 'keep_first' is forbidden: it resolves a pointing-group "
+    "collision by keeping whichever survey happens to load first and discarding the other "
+    "catalog wholesale, so the result depends on file load order and silently loses data "
+    "(primary targets and background-field stars inside a shared beam are complementary "
+    "catalogs, not duplicates). Use 'union_targets_by_pointing' (per-star Gaia DR3 "
+    "de-duplication, minimum-offset sighting kept) for a survey that declares its parent "
+    "pointing, or keep the default 'reject_duplicate_pointing_group'."
+)
+
+
+def validate_pointing_merge_policy(value: object) -> str:
+    """Return a valid policy name; ``keep_first`` and unknown values raise ``MergePolicyError``.
+
+    Never aliases or silently downgrades: a forbidden policy is an error at every boundary.
+    """
+    if value == "keep_first":
+        raise MergePolicyError(KEEP_FIRST_FORBIDDEN_REASON)
+    if not isinstance(value, str) or value not in POINTING_MERGE_POLICIES:
+        raise MergePolicyError(
+            f"unknown pointing merge policy {value!r}; allowed: {POINTING_MERGE_POLICIES}"
+        )
+    return value
 
 
 def parse_unit(unit: str) -> u.UnitBase:
@@ -309,11 +346,51 @@ class Survey(_Frozen):
     solar_system: SolarSystemSpec | None = None
     anchor_claims: list[str] = Field(default_factory=list)
     citations: list[str] = Field(default_factory=list)
+    # v0.2.1: a survey observed inside another survey's pointings (e.g. background-field
+    # stars in the BL 692 beams) declares its parent and the union policy. It is never an
+    # independent survey: it only enters a run through `union_targets_by_pointing`.
+    pointing_merge_policy: PointingMergePolicy = REJECT_DUPLICATE_POINTING_GROUP
+    parent_pointing_survey_id: str | None = None
+    # Compact promoted background-field summary (BackgroundSummaryFile), pinned by SHA-256.
+    background_summary_path: str | None = None
+    background_summary_sha256: str | None = None
+
+    @field_validator("pointing_merge_policy", mode="before")
+    @classmethod
+    def _check_merge_policy(cls, v: object) -> str:
+        return validate_pointing_merge_policy(v)  # MergePolicyError propagates unwrapped
+
+    @property
+    def is_pointing_extension(self) -> bool:
+        return self.parent_pointing_survey_id is not None
 
     @model_validator(mode="after")
     def _channel_contract(self) -> Survey:
+        if (self.pointing_merge_policy == UNION_TARGETS_BY_POINTING) != self.is_pointing_extension:
+            raise SchemaValidationError(
+                f"{self.id}: pointing_merge_policy {UNION_TARGETS_BY_POINTING!r} and "
+                "parent_pointing_survey_id must be declared together (a survey either is an "
+                "extension of a parent pointing or it is not)"
+            )
+        if self.parent_pointing_survey_id == self.id:
+            raise SchemaValidationError(f"{self.id}: a survey cannot be its own parent pointing")
+        if (self.background_summary_path is None) != (self.background_summary_sha256 is None):
+            raise ProvenanceError(
+                f"{self.id}: background_summary_path and background_summary_sha256 must be "
+                "given together"
+            )
+        if self.background_summary_sha256 is not None and not _SHA256_RE.match(
+            self.background_summary_sha256
+        ):
+            raise ProvenanceError(f"{self.id}: background_summary_sha256 must be a 64-hex SHA-256")
+        if self.background_summary_path is not None and not self.is_pointing_extension:
+            raise SchemaValidationError(
+                f"{self.id}: a background summary is only valid on a survey that declares "
+                "parent_pointing_survey_id"
+            )
         if self.channel == "radio" and (
-            self.radio_sensitivity is None or self.catalog_path is None
+            self.radio_sensitivity is None
+            or (self.catalog_path is None and self.background_summary_path is None)
         ):
             raise SchemaValidationError(
                 f"Radio survey {self.id!r} needs radio_sensitivity and catalog_path"
@@ -571,4 +648,353 @@ class WiseFitsGate2File(_Open):
             raise ProvenanceError("frozen_at_utc lies outside the run window")
         if self.withheld.rng_seed != self.rng_seed:
             raise SchemaValidationError("withheld rng_seed disagrees with rng_seed")
+        return self
+
+
+# ------------------------------------------ union_targets_by_pointing (v0.2.1)
+BL_LBAND_POINTING_GROUP = "bl_gbt_lband_2017"
+BACKGROUND_SUMMARY_MAX_BYTES = 5 * 1024 * 1024  # promoted artifact must stay strictly below
+BACKGROUND_SUMMARY_PATH = "data/catalogs/bl_gbt_lband_background_summary.json"
+# Frozen v0.2.1 protocol of a reproduced_archive background summary.
+BL_LBAND_N_POINTINGS = 692
+BL_LBAND_BEAM_FWHM_ARCMIN = 8.4
+BACKGROUND_D_MAX_PC = 10000.0
+BACKGROUND_VALIDATION_SAMPLE = 1000
+DistanceMethod = Literal["gaia_dr3_inverse_parallax", "bailer_jones_2021_geo"]
+
+
+def _iso_utc(value: str, name: str) -> str:
+    try:
+        datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError(f"{name} {value!r} is not an ISO-8601 timestamp") from exc
+    return value
+
+
+class MergeProvenance(_Frozen):
+    """Receipt record of one ``union_targets_by_pointing`` merge (star-level audit).
+
+    ``n_raw_targets - n_merged_targets == n_dedup_gaia_id + n_dedup_angular_fallback``
+    always holds: every removed row is attributed to exactly one de-duplication key.
+    """
+
+    pointing_group_id: str = Field(min_length=1)
+    policy: Literal["union_targets_by_pointing"]
+    input_surveys: list[str] = Field(min_length=2)
+    input_sha256s: list[str] = Field(min_length=2)
+    n_raw_targets: int = Field(ge=0)
+    n_merged_targets: int = Field(ge=0)
+    n_dedup_gaia_id: int = Field(ge=0)
+    n_dedup_angular_fallback: int = Field(ge=0)
+    n_multi_beam_resolved: int = Field(ge=0)
+    # Audit detail beyond the required counters.
+    angular_fallback_arcsec: float = Field(gt=0)
+    n_raw_by_survey: dict[str, int]
+    n_merged_by_role: dict[str, int]
+    n_background_absorbed_by_primary: int = Field(ge=0)
+    n_angular_links_refused: int = Field(ge=0)
+    n_duplicate_gaia_ids_post_merge: Literal[0]
+    collision_rule: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _contract(self) -> MergeProvenance:
+        if len(self.input_surveys) != len(self.input_sha256s):
+            raise ProvenanceError("merge provenance: one sha256 per input survey is required")
+        if len(set(self.input_surveys)) != len(self.input_surveys):
+            raise ProvenanceError("merge provenance: input surveys must be distinct")
+        if any(not _SHA256_RE.match(s) for s in self.input_sha256s):
+            raise ProvenanceError("merge provenance: input_sha256s must be 64-hex SHA-256")
+        removed = self.n_raw_targets - self.n_merged_targets
+        if removed != self.n_dedup_gaia_id + self.n_dedup_angular_fallback:
+            raise ProvenanceError(
+                f"merge provenance: {removed} rows removed but {self.n_dedup_gaia_id} + "
+                f"{self.n_dedup_angular_fallback} attributed to de-duplication keys"
+            )
+        if set(self.n_raw_by_survey) != set(self.input_surveys) or (
+            sum(self.n_raw_by_survey.values()) != self.n_raw_targets
+        ):
+            raise ProvenanceError("merge provenance: n_raw_by_survey disagrees with the inputs")
+        if sum(self.n_merged_by_role.values()) != self.n_merged_targets:
+            raise ProvenanceError("merge provenance: n_merged_by_role disagrees with the total")
+        return self
+
+
+class BackgroundDistanceCuts(_Frozen):
+    """Every cut between raw cone sightings and sightings that carry a distance."""
+
+    d_max_pc: float = Field(gt=0)
+    inverse_parallax_min_snr: float = Field(gt=0)
+    bailer_jones_min_snr_exclusive: float = Field(ge=0)
+    n_cone_sightings_raw: int = Field(ge=0)
+    n_dropped_invalid_parallax: int = Field(ge=0)
+    n_dropped_no_bailer_jones: int = Field(ge=0)
+    n_dropped_beyond_d_max: int = Field(ge=0)
+    n_dropped_outside_cone_recheck: int = Field(ge=0)
+    n_sightings_with_distance: int = Field(ge=0)
+    n_sightings_inverse_parallax: int = Field(ge=0)
+    n_sightings_bailer_jones_geo: int = Field(ge=0)
+    # Unique background stars after union_targets_by_pointing, by distance method.
+    n_background_stars: int = Field(ge=0)
+    n_background_inverse_parallax: int = Field(ge=0)
+    n_background_bailer_jones_geo: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _arithmetic(self) -> BackgroundDistanceCuts:
+        dropped = (
+            self.n_dropped_invalid_parallax
+            + self.n_dropped_no_bailer_jones
+            + self.n_dropped_beyond_d_max
+            + self.n_dropped_outside_cone_recheck
+        )
+        if self.n_cone_sightings_raw - dropped != self.n_sightings_with_distance:
+            raise ProvenanceError("distance cuts: raw - dropped != sightings with a distance")
+        if (
+            self.n_sightings_inverse_parallax + self.n_sightings_bailer_jones_geo
+            != self.n_sightings_with_distance
+        ):
+            raise ProvenanceError("distance cuts: per-method sighting counts do not add up")
+        if (
+            self.n_background_inverse_parallax + self.n_background_bailer_jones_geo
+            != self.n_background_stars
+        ):
+            raise ProvenanceError("distance cuts: per-method background star counts do not add up")
+        if not self.bailer_jones_min_snr_exclusive < self.inverse_parallax_min_snr:
+            raise SchemaValidationError(
+                "distance cuts: the Bailer-Jones SNR floor must lie below the inverse-parallax one"
+            )
+        return self
+
+
+class BackgroundDedupAudit(_Frozen):
+    """Exact de-duplication counts of the background field against the locked primaries."""
+
+    n_primary_targets: int = Field(ge=1)
+    n_primary_with_gaia_id: int = Field(ge=0)
+    n_background_sightings_matched_to_primary_gaia_id: int = Field(ge=0)
+    n_background_sightings_matched_to_primary_angular: int = Field(ge=0)
+    n_duplicate_gaia_ids_vs_primary: Literal[0]
+    n_duplicate_gaia_ids_within_background: Literal[0]
+    angular_fallback_arcsec: float = Field(gt=0)
+    angular_match_epoch: str = Field(min_length=1)
+    # Surviving background stars close to an ID-less primary at a compatible distance:
+    # reported for human review, never silently removed (they stay in the shells).
+    n_suspected_unmatched_primary: int = Field(ge=0)
+    suspected_unmatched_primary: list[dict] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _counts(self) -> BackgroundDedupAudit:
+        if self.n_primary_with_gaia_id > self.n_primary_targets:
+            raise SchemaValidationError("dedup audit: more primary Gaia IDs than primaries")
+        if len(self.suspected_unmatched_primary) != self.n_suspected_unmatched_primary:
+            raise SchemaValidationError("dedup audit: suspected_unmatched_primary count mismatch")
+        return self
+
+
+class ShellBinningSpec(_Frozen):
+    distance_bin_dex: float = Field(gt=0)
+    distance_log10_pc_min: float
+    n_distance_bins: int = Field(ge=1)
+    eirp_bin_dex: float = Field(gt=0)
+    eirp_log10_w_min: float
+    n_eirp_bins: int = Field(ge=1)
+    representative: Literal["geometric_bin_centre"]
+
+
+class BackgroundShellTable(_Frozen):
+    """Per-pointing ``(distance_bin, eirp_min_bin)`` star counts (sparse, sorted cells).
+
+    A cell is addressed by ``(pointing_index, distance_bin, eirp_min_bin)``; its stars are
+    evaluated at the beam-centre direction of the pointing and the geometric bin centres.
+    Keeping the pointing index makes the table sufficient for all three geometry modes
+    (2D needs distance only, 3D the height ``d sin b``, the finite disk the full direction).
+    """
+
+    binning: ShellBinningSpec
+    pointing_names: list[str] = Field(min_length=1)
+    pointing_index: list[int]
+    distance_bin: list[int]
+    eirp_min_bin: list[int]
+    count: list[int]
+    n_cells: int = Field(ge=0)
+    n_stars: int = Field(ge=0)
+    cells_sha256: str
+
+    @model_validator(mode="after")
+    def _shape(self) -> BackgroundShellTable:
+        cols = (self.pointing_index, self.distance_bin, self.eirp_min_bin, self.count)
+        if any(len(c) != self.n_cells for c in cols):
+            raise SchemaValidationError("shell table: column lengths disagree with n_cells")
+        if len(set(self.pointing_names)) != len(self.pointing_names):
+            raise SchemaValidationError("shell table: duplicate pointing names")
+        if not _SHA256_RE.match(self.cells_sha256):
+            raise ProvenanceError("shell table: cells_sha256 must be a 64-hex SHA-256")
+        if sum(self.count) != self.n_stars:
+            raise SchemaValidationError("shell table: counts do not sum to n_stars")
+        b = self.binning
+        limits = (len(self.pointing_names), b.n_distance_bins, b.n_eirp_bins)
+        prev: tuple[int, int, int] | None = None
+        for key in zip(self.pointing_index, self.distance_bin, self.eirp_min_bin, strict=True):
+            if any(not 0 <= k < lim for k, lim in zip(key, limits, strict=True)):
+                raise SchemaValidationError(f"shell table: cell {key} outside the declared grid")
+            if prev is not None and key <= prev:
+                raise SchemaValidationError("shell table: cells must be strictly sorted, unique")
+            prev = key
+        if any(c < 1 for c in self.count):
+            raise SchemaValidationError("shell table: every stored cell needs count >= 1")
+        return self
+
+
+class BackgroundSampleStar(_Frozen):
+    gaia_dr3_source_id: int = Field(gt=0)
+    ra_deg: float  # catalog epoch of the source service (Gaia DR3: 2016.0); defines theta
+    dec_deg: float
+    ra_match_deg: float  # epoch of the primary catalog (J2000.0); used by the angular fallback
+    dec_match_deg: float
+    pointing_index: int = Field(ge=0)
+    theta_arcmin: float = Field(ge=0)
+    distance_pc: float = Field(gt=0)
+    distance_method: DistanceMethod
+    eirp_min_w: float = Field(gt=0)
+    distance_bin: int = Field(ge=0)
+    eirp_min_bin: int = Field(ge=0)
+
+
+class PrimaryMatchedSighting(_Frozen):
+    """A background sighting absorbed by a primary target (removed before shell binning)."""
+
+    gaia_dr3_source_id: int = Field(gt=0)
+    primary_target_name: str
+    match: Literal["gaia_dr3_source_id", "angular_fallback"]
+    pointing_index: int = Field(ge=0)
+    theta_arcmin: float = Field(ge=0)
+    separation_arcsec: float = Field(ge=0)
+
+
+class BackgroundValidationSample(_Frozen):
+    rng_seed: int
+    n_background_requested: int = Field(ge=1)
+    selection: str = Field(min_length=1)
+    background: list[BackgroundSampleStar]
+    primary_matched: list[PrimaryMatchedSighting]
+
+    @model_validator(mode="after")
+    def _unique(self) -> BackgroundValidationSample:
+        ids = [s.gaia_dr3_source_id for s in self.background]
+        if len(set(ids)) != len(ids):
+            raise SchemaValidationError("validation sample: duplicated gaia_dr3_source_id")
+        if len(ids) > self.n_background_requested:
+            raise SchemaValidationError("validation sample larger than requested")
+        return self
+
+
+class BackgroundSummaryFile(_Frozen):
+    """Compact promoted background-field artifact (``BACKGROUND_SUMMARY_PATH``, v0.2.1).
+
+    ``reproduced_archive`` files come from ``scripts/fetch_wlodarczyk_sroka_288k.py
+    --promote-from`` only and must carry a clean commit, complete pointing coverage and
+    their source receipt. ``synthetic_proxy`` files are offline test and dry-run fixtures;
+    the engine treats that tier as illustrative.
+    """
+
+    id: str = Field(min_length=1)
+    schema_version: Literal[1]
+    data_tier: Literal["reproduced_archive", "synthetic_proxy"]
+    description: str = Field(min_length=1)
+    methodology_note: str = Field(min_length=1)
+    code_git_sha: str
+    fetched_at_utc: str
+    query_window_utc: tuple[str, str]
+    source_service: str = Field(min_length=1)
+    adql_template: str = Field(min_length=1)
+    pointing_group_id: Literal["bl_gbt_lband_2017"]
+    parent_survey_id: str = Field(min_length=1)
+    primary_catalog_path: str = Field(min_length=1)
+    primary_catalog_sha256: str
+    n_pointings: int = Field(ge=1)
+    n_pointings_completed: int = Field(ge=0)
+    beam_fwhm_arcmin: float = Field(gt=0)
+    cone_radius_arcmin: float = Field(gt=0)
+    f_min_w_m2: float = Field(gt=0)
+    distance_cuts: BackgroundDistanceCuts
+    merge_provenance: MergeProvenance
+    dedup_audit: BackgroundDedupAudit
+    shells: BackgroundShellTable
+    validation_sample: BackgroundValidationSample
+    spatial_correlation_assumption: str = Field(min_length=1)
+    source_receipt: SourceReceipt | None = None
+    content_sha256: str
+
+    @model_validator(mode="after")
+    def _contract(self) -> BackgroundSummaryFile:
+        if not _SHA256_RE.match(self.content_sha256):
+            raise ProvenanceError("content_sha256 must be a 64-hex SHA-256")
+        if not _SHA256_RE.match(self.primary_catalog_sha256):
+            raise ProvenanceError("primary_catalog_sha256 must be a 64-hex SHA-256")
+        _iso_utc(self.fetched_at_utc, "fetched_at_utc")
+        for t in self.query_window_utc:
+            _iso_utc(t, "query_window_utc")
+        if abs(self.cone_radius_arcmin - self.beam_fwhm_arcmin / 2.0) > 1e-9:
+            raise SchemaValidationError("cone_radius_arcmin must equal beam_fwhm_arcmin / 2")
+        sh, mp, dc, da = self.shells, self.merge_provenance, self.distance_cuts, self.dedup_audit
+        if len(sh.pointing_names) != self.n_pointings:
+            raise SchemaValidationError("n_pointings disagrees with shells.pointing_names")
+        if self.n_pointings_completed > self.n_pointings:
+            raise SchemaValidationError("n_pointings_completed exceeds n_pointings")
+        if mp.pointing_group_id != self.pointing_group_id:
+            raise ProvenanceError("merge provenance covers a different pointing group")
+        if mp.input_surveys[0] != self.parent_survey_id or (
+            mp.input_sha256s[0] != self.primary_catalog_sha256
+        ):
+            raise ProvenanceError("merge provenance was not computed against the parent catalog")
+        if sh.n_stars != dc.n_background_stars or (
+            mp.n_merged_by_role.get("background", 0) != sh.n_stars
+        ):
+            raise ProvenanceError("shell star count disagrees with the merge / distance-cut counts")
+        if mp.n_merged_by_role.get("primary", 0) != da.n_primary_targets:
+            raise ProvenanceError("merge kept a different number of primaries than the catalog")
+        vs = self.validation_sample
+        matched = {
+            k: sum(m.match == k for m in vs.primary_matched)
+            for k in ("gaia_dr3_source_id", "angular_fallback")
+        }
+        if matched["gaia_dr3_source_id"] != da.n_background_sightings_matched_to_primary_gaia_id:
+            raise ProvenanceError("primary-matched Gaia-ID sightings disagree with the dedup audit")
+        if matched["angular_fallback"] != da.n_background_sightings_matched_to_primary_angular:
+            raise ProvenanceError("primary-matched angular sightings disagree with the dedup audit")
+        if len(vs.primary_matched) != mp.n_background_absorbed_by_primary:
+            raise ProvenanceError("validation sample must list every primary-matched sighting")
+        if len(vs.background) != min(vs.n_background_requested, sh.n_stars):
+            raise ProvenanceError("validation sample size != min(requested, background stars)")
+        if self.data_tier == "reproduced_archive":
+            if not _GIT_SHA_RE.match(self.code_git_sha):
+                raise ProvenanceError(
+                    f"code_git_sha {self.code_git_sha!r} is not a clean 40-hex commit (dirty run?)"
+                )
+            if self.n_pointings_completed != self.n_pointings:
+                raise ProvenanceError(
+                    f"incomplete pointing coverage: {self.n_pointings_completed} of "
+                    f"{self.n_pointings} pointings"
+                )
+            if self.source_receipt is None:
+                raise ProvenanceError("reproduced_archive summary needs its source_receipt")
+            canonical = {
+                "n_pointings": (self.n_pointings, BL_LBAND_N_POINTINGS),
+                "beam_fwhm_arcmin": (self.beam_fwhm_arcmin, BL_LBAND_BEAM_FWHM_ARCMIN),
+                "distance_cuts.d_max_pc": (dc.d_max_pc, BACKGROUND_D_MAX_PC),
+                "distance_cuts.inverse_parallax_min_snr": (dc.inverse_parallax_min_snr, 5.0),
+                "distance_cuts.bailer_jones_min_snr_exclusive": (
+                    dc.bailer_jones_min_snr_exclusive,
+                    1.0,
+                ),
+            }
+            off = {k: got for k, (got, want) in canonical.items() if got != want}
+            if off:
+                raise ProvenanceError(
+                    f"reproduced_archive summary departs from the frozen v0.2.1 protocol: {off}"
+                )
+            if vs.n_background_requested < BACKGROUND_VALIDATION_SAMPLE:
+                raise ProvenanceError(
+                    f"reproduced_archive summary needs a validation sample of at least "
+                    f"{BACKGROUND_VALIDATION_SAMPLE} background stars"
+                )
         return self

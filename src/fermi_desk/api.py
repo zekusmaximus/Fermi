@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
+from fermi_desk import __version__
 from fermi_desk.errors import FermiDeskError, QueueStateError
 from fermi_desk.inference.engine import (
     CHANNELS,
@@ -53,6 +54,11 @@ from fermi_desk.registry import (
     load_fits_gate2,
     load_sigma_sys_calibration,
     run_validation,
+)
+from fermi_desk.schemas import (
+    REJECT_DUPLICATE_POINTING_GROUP,
+    PointingMergePolicy,
+    validate_pointing_merge_policy,
 )
 
 PAIR = ("frequent_slow_expanders", "rare_fast_expanders")
@@ -114,6 +120,14 @@ class CompareRequest(BaseModel):
     # only; marginalize_lookback integrates T over its registry log-uniform prior.
     disk_profile: Literal["uniform", "exponential"] = "uniform"
     marginalize_lookback: StrictBool = False
+    # v0.2.1. "keep_first" is refused with an explicit MergePolicyError (HTTP 422), never
+    # aliased; the default leaves declared pointing extensions out of the run.
+    pointing_merge_policy: PointingMergePolicy = REJECT_DUPLICATE_POINTING_GROUP
+
+    @field_validator("pointing_merge_policy", mode="before")
+    @classmethod
+    def _merge_policy(cls, v: object) -> str:
+        return validate_pointing_merge_policy(v)
 
     @field_validator("channels")
     @classmethod
@@ -154,6 +168,7 @@ class HealthOut(_Out):
     fits_gate2_data_tier: str | None
     receipt_schema_version: int
     read_only: bool
+    version: str  # fermi_desk.__version__ (single source: pyproject.toml)
 
 
 class RegistryOut(_Out):
@@ -204,6 +219,11 @@ ADVERSARY_CITATIONS = {
         "Enriquez et al. 2017, ApJ 849, 104 (BL 692 pointings)",
         "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720 (GBT L-band FWHM 8.4')",
     ],
+    "pointing_overlap": [
+        "SPEC.md Sec. 2 invariant 4 (strict non-double-counting) and v0.2 roadmap item 1 "
+        "(union_targets_by_pointing; keep_first forbidden)",
+        "Wlodarczyk-Sroka, Garrett & Siemion 2020, MNRAS 498, 5720 (background stars in BL beams)",
+    ],
     "scaling_symmetry_2d_vs_3d": ["SPEC.md Sec. 2 invariant 5 (explicit 2D vs 3D geometry)"],
     "local_approximation": ["SPEC.md v0.2 roadmap item 2 (finite-Galaxy disk, R_gal = 15 kpc)"],
     "illustrative_tier_quarantine": ["SPEC.md Sec. 2 invariant 6 (data provenance tagging)"],
@@ -249,11 +269,13 @@ def create_app(
     runs_dir = runs_dir or root / "runs"
     jobs = tuple(seed_jobs) if seed_jobs is not None else JOB_DEFINITIONS
     ir_survey = next(s for s in graph.surveys.values() if s.channel == "infrared")
-    radio_survey = next(s for s in graph.surveys.values() if s.channel == "radio")
+    radio_survey = next(
+        s for s in graph.surveys.values() if s.channel == "radio" and not s.is_pointing_extension
+    )
 
     app = FastAPI(
         title="Fermi Paradox Constraint Desk",
-        version="0.3.0",
+        version=__version__,
         description="Offline read / replay API over the verified fermi-desk engine.",
     )
     app.add_middleware(
@@ -329,6 +351,7 @@ def create_app(
             marginalize_lookback=req.marginalize_lookback,
             lookback_grid_points=lookback_grid_points,
             n_importance=compare_n_importance,
+            pointing_merge_policy=req.pointing_merge_policy,
         )
         rec = run_comparison(graph, cfg)
         for h in rec["results"]["hypotheses"].values():
@@ -437,6 +460,7 @@ def create_app(
             **provenance(git_sha),
             "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
             "read_only": read_only,
+            "version": __version__,
         }
 
     @app.get("/api/registry", response_model=RegistryOut)
@@ -517,6 +541,9 @@ def create_app(
                         "script": (
                             f"uv run python {script} --n-controls 120 --seed 42"
                             if r["job_id"] == "wise_independent_control_fields"
+                            # Offline rehearsal only: the live fetch needs an explicit --fetch.
+                            else f"uv run python {script} --dry-run"
+                            if r["job_id"] == "wlodarczyk_sroka_288k_background_extension"
                             else f"uv run python {script}"
                         )
                         if runnable

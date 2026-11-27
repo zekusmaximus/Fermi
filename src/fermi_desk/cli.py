@@ -12,7 +12,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from fermi_desk.errors import FermiDeskError
+from fermi_desk.errors import DoubleCountingError, FermiDeskError
 from fermi_desk.inference.engine import (
     CHANNELS,
     HEADLINE_VERIFIED,
@@ -32,6 +32,7 @@ from fermi_desk.models.expansion import (
 )
 from fermi_desk.models.radio import RADIO_MODES
 from fermi_desk.registry import load_factor_graph, run_validation
+from fermi_desk.schemas import POINTING_MERGE_POLICIES, REJECT_DUPLICATE_POINTING_GROUP
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help=__doc__)
 queue_app = typer.Typer(add_completion=False, no_args_is_help=True, help="BOED job queue.")
@@ -262,27 +263,41 @@ def compare(
     n_importance: Annotated[
         int, typer.Option(min=16, help=f"{FINITE_DISK} per-target importance samples.")
     ] = 16384,
+    pointing_merge_policy: Annotated[
+        str,
+        typer.Option(
+            help=(
+                f"How surveys sharing a pointing group are combined, one of "
+                f"{POINTING_MERGE_POLICIES}. The default refuses undeclared collisions and "
+                "leaves declared background extensions out; keep_first is forbidden."
+            )
+        ),
+    ] = REJECT_DUPLICATE_POINTING_GROUP,
     out_dir: Annotated[Path | None, typer.Option(help="Receipt directory (default runs/).")] = None,
     root: Root = None,
 ) -> None:
     """Headline hypothesis comparison; writes a JSON RunReceipt to runs/."""
-    cfg = RunConfig(
-        include_illustrative_in_headline=include_illustrative,
-        geometry=geometry,
-        radio_mode=radio_mode,
-        seed=seed,
-        channels=tuple(c.strip() for c in channels.split(",") if c.strip()),
-        condition_on_earth_unreached=condition_on_earth_unreached,
-        n_mc=n_mc,
-        headline_pair=_pair(pair),
-        ir_pair=_pair(ir_pair),
-        disk_profile=disk_profile,
-        marginalize_lookback=marginalize_lookback,
-        lookback_grid_points=lookback_grid_points,
-        n_importance=n_importance,
-    )
-    graph = load_factor_graph(root)
-    receipt = run_comparison(graph, cfg)
+    try:
+        cfg = RunConfig(
+            include_illustrative_in_headline=include_illustrative,
+            geometry=geometry,
+            radio_mode=radio_mode,
+            seed=seed,
+            channels=tuple(c.strip() for c in channels.split(",") if c.strip()),
+            condition_on_earth_unreached=condition_on_earth_unreached,
+            n_mc=n_mc,
+            headline_pair=_pair(pair),
+            ir_pair=_pair(ir_pair),
+            disk_profile=disk_profile,
+            marginalize_lookback=marginalize_lookback,
+            lookback_grid_points=lookback_grid_points,
+            n_importance=n_importance,
+            pointing_merge_policy=pointing_merge_policy,
+        )
+        graph = load_factor_graph(root)
+        receipt = run_comparison(graph, cfg)
+    except DoubleCountingError as exc:  # includes MergePolicyError (keep_first)
+        _fail(exc)
     res = receipt["results"]
     rows = list(res["hypotheses"].items())
     finite = geometry == FINITE_DISK
@@ -369,6 +384,35 @@ def compare(
     if marg and "headline" in res:
         pair_ids = (res["headline"]["numerator"], res["headline"]["denominator"])
         _print_lookback_nodes(res, pair_ids)
+    for held in receipt["held_out_extension_surveys"]:
+        console.print(
+            "[yellow]  pointing extension held out[/] "
+            + escape(f"{held['survey_id']} (parent {held['parent_pointing_survey_id']}): ")
+            + escape(held["reason"])
+        )
+    mp = receipt["merge_provenance"]
+    if mp:
+        console.print(
+            escape(
+                f"  {mp['policy']} [{mp['pointing_group_id']}]: {' + '.join(mp['input_surveys'])} "
+                f"-> {mp['n_merged_targets']} stars from {mp['n_raw_targets']} raw sightings "
+                f"({mp['n_dedup_gaia_id']} Gaia-id + {mp['n_dedup_angular_fallback']} angular "
+                f"de-duplications, {mp['n_multi_beam_resolved']} multi-beam stars kept at "
+                "minimum offset); background shells use the independent conditional-reach "
+                "product (FKG lower bound on P0), primaries the exact correlated MC"
+            )
+        )
+        for hid, h in rows:
+            bg = (h.get("radio") or {}).get("background")
+            if bg:
+                console.print(
+                    escape(
+                        f"  {hid}: background E[N reached] = {bg['expected_reached']:.5g}, "
+                        f"E[detections] = {bg['expected_detections']:.5g}, log10 P0 (FKG lower) = "
+                        f"{bg['log10_p_zero_independent_fkg_lower']:.6g}, Frechet upper P0 = "
+                        f"{bg['p_zero_frechet_upper']:.8f} [{bg['data_tier']}]"
+                    )
+                )
 
     names = ("earth_unreached", "radio", "solar_system", "radio+solar_system", "infrared")
     present = [c for c in names if any(c in h["components"] for _, h in rows)]

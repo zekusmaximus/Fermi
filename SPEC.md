@@ -66,7 +66,7 @@ Every milestone and pull request must preserve six non-negotiable invariants:
 │   ├── registry.py                 # Factor Graph loader & double-counting validator
 │   ├── models/
 │   │   ├── expansion.py            # 2D thin-disk, 3D thick-disk & finite-Galaxy (R_gal) spatial correlation kernel
-│   │   ├── radio.py                # Breakthrough Listen 692-star forward model (flat & per-target EIRP)
+│   │   ├── radio.py                # Breakthrough Listen 692-star forward model (flat & per-target EIRP), off-axis beam & background shells
 │   │   ├── infrared.py             # Mid-IR waste-heat & calibration-reversal forward model
 │   │   ├── hephaistos.py           # WISE centroid vs. image-level blend-recovery grid (M2)
 │   │   └── solar_system.py         # Local Solar System / ISO null-bound forward model
@@ -265,6 +265,39 @@ data alone: an `illustrative_calibration` term can never re-weight the lookback 
 behind it. Receipts record the prior bounds, grid, weights and per-node diagnostics; fixed-`T`
 receipts gain no keys and keep their `results_sha256`.
 
+**Pointing merge policy (v0.2.1a; proposed for planning ratification).** A run states one
+`pointing_merge_policy` (CLI `--pointing-merge-policy`, API `pointing_merge_policy`):
+
+- `reject_duplicate_pointing_group` (default): two surveys sharing a `pointing_group_id`
+  without a declared parent-pointing relationship raise `DoubleCountingError` - under
+  *every* policy. A survey that declares `parent_pointing_survey_id` (and therefore
+  `pointing_merge_policy: union_targets_by_pointing`) is an *extension* of its parent,
+  never an independent survey: under the default policy it stays out of the run and is
+  listed in the receipt's `held_out_extension_surveys`, so the parent runs exactly as a
+  single-survey run (same `results_sha256`).
+- `union_targets_by_pointing`: the extension's stars are merged into the parent star by
+  star. Keys: exact Gaia DR3 `source_id`; angular separation `< 3 arcsec` only when either
+  record lacks an id (never joining two different ids, nor two targets of one published
+  primary list). Of several sightings of one star the minimum beam offset `theta_min` is
+  kept (on-axis primary first). The merge is recorded as `MergeProvenance`
+  (`pointing_group_id`, `policy`, `input_surveys`, `input_sha256s`, `n_raw_targets`,
+  `n_merged_targets`, `n_dedup_gaia_id`, `n_dedup_angular_fallback`,
+  `n_multi_beam_resolved`).
+- `keep_first` is **forbidden**: schema, registry, engine, CLI and API raise
+  `MergePolicyError` (a `DoubleCountingError`); it is never accepted or aliased.
+
+**Off-axis sensitivity and background shells (v0.2.1a; proposed).** A star at offset
+`theta` from a beam centre has `EIRP_min(d, theta) = 4 pi d^2 F_min / B(theta)` with
+`B(theta) = exp(-4 ln2 (theta / FWHM)^2)` (GBT L-band `FWHM = 8.4 arcmin`; `B(0) = 1`,
+`B(FWHM/2) = 1/2`). Background-field stars enter as a compact, SHA-256-pinned summary
+(`data/catalogs/bl_gbt_lband_background_summary.json`, `< 5 MB`): per-pointing counts on a
+`(distance, EIRP_min)` grid, de-duplicated against the primaries before binning. Merged
+runs keep the exact correlated Monte Carlo for the primaries and multiply on the
+independent conditional-reach shell product `prod (1 - p_c q_c)^N_c`, which by Harris-FKG
+is a **lower bound** on `P(no detection | H)` (it can only overstate the null's
+constraining power); the Frechet upper bound is reported beside it. A `synthetic_proxy`
+background is illustrative and leaves the verified headline.
+
 **HIP 1692 canonical distance (planning ruling, Milestone 2).** Gaia DR3 inverse
 parallax (788.71 pc, ~1,176x EIRP_min) is canonical in `bl_692_targets.csv`; the
 Bailer-Jones DR2 distance (752.61 pc, ~1,071x) is the historical Wlodarczyk-Sroka
@@ -280,6 +313,12 @@ Every queued or executed job records:
   model uncertainty or validity boundary they resolve (text computed from the job parameters)
   plus a rank among compute jobs (1 = first). Tier-1 archival jobs leave both NULL and are ranked
   by EIG bits/hr. `fermi-desk queue list` renders the two tiers as separate tables.
+
+**Run receipt schema v5 (v0.2.1a; proposed for planning ratification).** Comparison receipts
+carry `pointing_merge_policy` (default `reject_duplicate_pointing_group`), `merge_provenance`
+(`null` unless a union merge happened) and `held_out_extension_surveys`; `config.merge_policies`
+is replaced by `config.pointing_merge_policy`. `results_sha256` still hashes the numerical
+`results` block only, so every single-survey `v0.1.x` / `v0.2.0` hash is unchanged.
 
 ---
 
@@ -323,6 +362,9 @@ Every queued or executed job records:
    de-duplicate stars by Gaia DR3 `source_id` so each star enters the likelihood exactly
    once, attach per-star sensitivity (off-axis beam attenuation for background stars), and
    record the merge (input checksums, duplicate count) in the run receipt.
+   **Implemented offline in v0.2.1a** (Sec. 4.3 "Pointing merge policy"): `keep_first` no
+   longer exists and raises `MergePolicyError`; the live Gaia DR3 ingestion
+   (`scripts/fetch_wlodarczyk_sroka_288k.py --fetch`, then `--promote-from`) is v0.2.1b.
 2. **Finite-Galaxy disk geometry (`R_gal = 15 kpc`).** The expansion kernel is a local
    infinite-disk approximation valid only while `v_exp * T <= 8 kpc`; for
    `rare_fast_expanders` (`v_exp = 0.5 c`) this gives `T_valid = 52.2 kyr`, so receipts at

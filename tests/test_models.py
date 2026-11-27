@@ -279,9 +279,12 @@ def test_unconditioned_run_includes_solar_system_jointly(graph):
 
 # ================================================================== v0.2.0 finite disk
 R_GAL, R_0, R_D = 15.0 * u.kpc, 8.178 * u.kpc, 2.6 * u.kpc
-CANONICAL_SHA256 = {  # docs/PLANNING_LEDGER.md Sec. 3 (seed 42, receipt schema v4)
+# docs/PLANNING_LEDGER.md Sec. 3 (seed 42). Recorded under receipt schema v4; receipt schema
+# v5 (v0.2.1) adds merge-policy fields OUTSIDE `results`, so the hashes must not move.
+CANONICAL_SHA256 = {
     "thin_disk_2d": "4b70118aaded7861cb14d77379843dfacec2d4c517bbce5efc9654e139fbc269",
     "thick_disk_3d": "be2053912fc0a1d6970878a473dc3ee37d92d62f7904e73dfe369762634f5d41",
+    "finite_disk_3d": "87a746589ac07447fdad129f335cd32f164dc11e170220f7a7a81ce0b13b9422",
 }
 
 
@@ -303,10 +306,15 @@ def fd_model(gamma, v, t_gyr=1e-3, profile="uniform", n_importance=8192, seed=42
 
 
 @pytest.mark.parametrize(
-    "geometry", ["thin_disk_2d", pytest.param("thick_disk_3d", marks=pytest.mark.slow)]
+    "geometry",
+    [
+        "thin_disk_2d",
+        pytest.param("thick_disk_3d", marks=pytest.mark.slow),
+        pytest.param("finite_disk_3d", marks=pytest.mark.slow),  # v0.2.0 uniform profile
+    ],
 )
 def test_canonical_v01x_baselines_are_byte_identical(graph, geometry):
-    """Zero regression: default single-T runs reproduce the locked v0.1.x results hashes."""
+    """Zero regression: default single-T runs reproduce the locked v0.1.x / v0.2.0 hashes."""
     cfg = RunConfig(
         geometry=geometry,
         radio_mode="flat_probability",
@@ -316,6 +324,14 @@ def test_canonical_v01x_baselines_are_byte_identical(graph, geometry):
     )
     rec = run_comparison(graph, cfg)
     assert results_digest(rec) == CANONICAL_SHA256[geometry]
+    # Receipt schema v5: merge fields live beside `results`, never inside it.
+    assert rec["receipt_schema_version"] == 5
+    assert rec["pointing_merge_policy"] == "reject_duplicate_pointing_group"
+    # The default policy never merges: a declared extension is held out and listed.
+    assert rec["merge_provenance"] is None
+    assert [h["survey_id"] for h in rec["held_out_extension_surveys"]] == [
+        s.id for s in graph.surveys.values() if s.is_pointing_extension
+    ]
     if geometry == "thin_disk_2d":
         assert rec["headline_log10_bf"] == pytest.approx(-8.04966e-05, rel=1e-6)
         assert rec["headline_policy"] == "verified_channels_only"

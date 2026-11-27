@@ -16,6 +16,7 @@ from fermi_desk.adversary.checks import (
     audit_hip1692_distance_revision,
     audit_illustrative_tiers,
     audit_local_approximation,
+    audit_pointing_overlap,
     audit_scaling_symmetry,
     run_adversary,
 )
@@ -127,6 +128,36 @@ def test_adversary_receipt_is_seed_deterministic(graph):
     b = run_adversary(graph, seed=9, pair=PAIR, n_mc=100)
     assert a["results_sha256"] == b["results_sha256"]
     assert not any(f["status"] == "fail" for f in a["results"]["findings"])
+    # v0.2.1: the merge-policy audit is part of every adversary run.
+    overlap = next(f for f in a["results"]["findings"] if f["check"] == "pointing_overlap")
+    assert overlap["status"] == "pass" and overlap["details"]["merges"] == []
+    assert overlap["details"]["policy_requested"] == "reject_duplicate_pointing_group"
+
+
+def test_pointing_overlap_audit_fails_loudly_on_keep_first_and_unmerged_collisions(
+    graph, data_copy
+):
+    """keep_first is a critical failure; so is any pointing-group collision left unmerged."""
+    ok = audit_pointing_overlap(graph)
+    assert (ok.status, ok.severity) == ("pass", "info")
+    assert ok.details["keep_first_refused_by_registry"] is True
+    assert set(ok.details["allowed_policies"]) == {
+        "reject_duplicate_pointing_group",
+        "union_targets_by_pointing",
+    }
+    bad = audit_pointing_overlap(graph, policy="keep_first")
+    assert (bad.status, bad.severity) == ("fail", "critical")
+    assert "load order" in bad.details["error"]
+    # A second, undeclared survey on the BL pointing group: unmerged collision under both
+    # the default policy and union_targets_by_pointing (no declared parent pointing).
+    src = data_copy / "data" / "surveys" / "bl_enriquez_2017_692.yaml"
+    doc = yaml.safe_load(src.read_text())
+    doc["id"] = "bl_duplicate"
+    (src.parent / "bl_duplicate.yaml").write_text(yaml.safe_dump(doc))
+    dup_graph = load_factor_graph(data_copy)
+    for policy in ("reject_duplicate_pointing_group", "union_targets_by_pointing"):
+        f = audit_pointing_overlap(dup_graph, policy=policy)
+        assert (f.status, f.severity) == ("fail", "critical") and f.details["unmerged_collisions"]
 
 
 def test_build_context_targets_carry_coordinates(graph):

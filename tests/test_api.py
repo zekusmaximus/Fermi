@@ -81,7 +81,8 @@ def test_health_reports_provenance(client):
     assert h["validation_checks_passed"] == h["validation_checks_total"] >= 30
     assert h["catalog_sha256"].startswith("c299d61d")
     assert h["wise_calibration_sha256"].startswith("2da2a234")
-    assert h["receipt_schema_version"] == 4 and h["git_sha"]
+    assert h["receipt_schema_version"] == 5 and h["git_sha"]
+    assert h["version"] == "0.2.1"  # v0.2.0-R6: one version string everywhere
     # v0.1.2: live control-sample provenance, read from the verified calibration files.
     assert (h["n_controls"], h["n_calibration"], h["n_withheld"]) == (154, 77, 77)
     assert h["calibration_data_tier"] == "reproduced_archive"
@@ -153,6 +154,10 @@ def test_adversary_receipt(client):
     r = _ok(client, "/api/adversary?seed=42")
     checks = {f["check"]: f for f in r["results"]["findings"]}
     assert checks["local_approximation"]["status"] == "finding"
+    # v0.2.1: the merge-policy audit runs with the feed and cites its sources.
+    overlap = checks["pointing_overlap"]
+    assert overlap["status"] == "pass" and overlap["citations"]
+    assert overlap["details"]["keep_first_refused_by_registry"] is True
     assert len(checks["duplicate_pointings"]["details"]["beam_sharing_pairs"]) == 16
     assert all(f["repro_command"].endswith("--seed 42") for f in checks.values())
     assert checks["hip1692_distance_revision"]["citations"]
@@ -231,6 +236,11 @@ def test_queue_lists_split_tiers(client):
     )
     assert t1[0]["linked_evidence"]["withheld_at_measured_floor"]["n_stars"] == 77
     assert t1[0]["commands"]["script"].startswith("uv run python scripts/")
+    # v0.2.1: the background-extension job points at its opt-in script, offline mode only.
+    bg = next(j for j in t1 if j["job_id"] == "wlodarczyk_sroka_288k_background_extension")
+    assert bg["archival_script"] == "scripts/fetch_wlodarczyk_sroka_288k.py"
+    assert bg["commands"]["script"].endswith("fetch_wlodarczyk_sroka_288k.py --dry-run")
+    assert bg["status"] == "open" and bg["output_sha256"] is None  # not executed in v0.2.1a
     assert all(j["expected_eig_bits"] == 0.0 and j["diagnostic_impact"] for j in t0)
     assert [j["diagnostic_priority"] for j in t0] == sorted(j["diagnostic_priority"] for j in t0)
     assert "queue.sqlite" in q["queue_path"]
@@ -403,10 +413,19 @@ def test_reseed_refreshes_stale_cpu_estimate_without_touching_state(tmp_path):
             "WHERE job_id='eirp_luminosity_function_sweep'"
         )
         s.conn.commit()
+        # v0.2.1: a queue seeded before the fetch script existed gets its pointer refreshed.
+        s.conn.execute(
+            "UPDATE jobs SET archival_script='(not yet written)' "
+            "WHERE job_id='wlodarczyk_sroka_288k_background_extension'"
+        )
+        s.conn.commit()
         assert s.seed(graph, _jobs()) == []
         row = s.get("eirp_luminosity_function_sweep")
         assert row["est_cpu_seconds"] == 240.0
         assert row["status"] == "claimed" and row["claimed_by"] == "x"
+        bg = s.get("wlodarczyk_sroka_288k_background_extension")
+        assert bg["archival_script"] == "scripts/fetch_wlodarczyk_sroka_288k.py"
+        assert bg["status"] == "open" and bg["output_sha256"] is None
     finally:
         s.close()
 
@@ -433,9 +452,12 @@ def test_compare_default_response_is_intact_and_echoes_new_defaults(client):
         "seed": 42,
         "disk_profile": "uniform",
         "marginalize_lookback": False,
+        "pointing_merge_policy": "reject_duplicate_pointing_group",
     }
     rec = d["receipt"]
-    assert rec["geometry_mode"] == "thin_disk_2d" and rec["receipt_schema_version"] == 4
+    assert rec["geometry_mode"] == "thin_disk_2d" and rec["receipt_schema_version"] == 5
+    assert rec["pointing_merge_policy"] == "reject_duplicate_pointing_group"
+    assert rec["merge_provenance"] is None  # the default policy never merges
     assert d["headline_policy"] == "verified_channels_only"
     assert rec["results"]["headline"]["headline"]["terms"] == ["earth_unreached", "radio"]
     assert "lookback_marginalization" not in rec and "disk_profile" not in rec
@@ -554,7 +576,7 @@ def test_compare_rejects_invalid_v020_requests(client, body):
 def test_health_and_registry_expose_v020_parameters_offline(client):
     h = _ok(client, "/api/health")
     assert h["status"] == "ok" and h["validation_checks_passed"] == h["validation_checks_total"]
-    assert h["validation_checks_total"] >= 34 and h["receipt_schema_version"] == 4
+    assert h["validation_checks_total"] >= 38 and h["receipt_schema_version"] == 5
     r = _ok(client, "/api/registry")
     params = {p["id"]: p for p in r["parameters"]}
     assert params["galactic_disk_radius_kpc"]["default"] == 15.0
@@ -564,3 +586,58 @@ def test_health_and_registry_expose_v020_parameters_offline(client):
         assert params[pid]["unit"] == "kpc" and params[pid]["geometry_modes"] == ["finite_disk_3d"]
     assert params["lookback_window_gyr"]["marginalization_prior_bounds"] == [5.0e-5, 1.0e-2]
     assert params["disk_scale_height_pc"]["geometry_modes"] is None
+
+
+# ------------------------------- v0.2.1: merge policy at the API boundary, version sync
+def test_compare_refuses_keep_first_with_an_explicit_domain_error(client):
+    r = client.post("/api/compare", json={"pointing_merge_policy": "keep_first"})
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "MergePolicyError"
+    assert "keep_first" in body["detail"] and "load order" in body["detail"]
+    for bad in ("keep_last", "union", "", None, 1):
+        assert client.post("/api/compare", json={"pointing_merge_policy": bad}).status_code == 422
+
+
+def test_compare_accepts_union_policy_and_reports_no_merge_without_an_extension(client):
+    """union_targets_by_pointing is a valid request. While no survey declares a parent
+    pointing (v0.2.1a) it has nothing to merge and the run is the single-survey run
+    (identical results, merge_provenance null); once v0.2.1b pins a background extension
+    the same request must carry a merge_provenance instead."""
+    from fermi_desk.registry import load_factor_graph
+
+    base = {"channels": ["radio"], "seed": 7}
+    plain = _post(client, base)["receipt"]
+    d = _post(client, {**base, "pointing_merge_policy": "union_targets_by_pointing"})
+    rec = d["receipt"]
+    assert d["request"]["pointing_merge_policy"] == "union_targets_by_pointing"
+    assert rec["pointing_merge_policy"] == "union_targets_by_pointing"
+    assert rec["held_out_extension_surveys"] == []  # union never holds an extension out
+    if any(s.is_pointing_extension for s in load_factor_graph(ROOT).surveys.values()):
+        assert rec["merge_provenance"]["policy"] == "union_targets_by_pointing"
+    else:
+        assert rec["merge_provenance"] is None
+        assert rec["results"] == plain["results"]
+        assert [s["id"] for s in rec["active_surveys"]] == ["bl_enriquez_2017_692"]
+
+
+def test_version_is_synchronised_across_pyproject_package_and_api(client, env):
+    """v0.2.0-R6: pyproject.toml is the single source; the package, the installed
+    distribution metadata, the FastAPI app, /openapi.json and /api/health all agree."""
+    import tomllib
+    from importlib.metadata import version as installed_version
+
+    import fermi_desk
+
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))
+    declared = pyproject["project"]["version"]
+    assert declared == "0.2.1"
+    assert fermi_desk.__version__ == declared
+    assert installed_version("fermi-desk") == declared, "stale install: run `uv sync`"
+    assert client.app.version == declared
+    assert _ok(client, "/openapi.json")["info"]["version"] == declared
+    assert _ok(client, "/api/health")["version"] == declared
+    # The version is not written anywhere else in the package sources.
+    for path in (ROOT / "src" / "fermi_desk").rglob("*.py"):
+        text = path.read_text("utf-8")
+        assert 'version="0.' not in text and '__version__ = "' not in text, path

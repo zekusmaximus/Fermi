@@ -32,6 +32,10 @@ class DoubleCountingError(FermiDeskError):
     """Two surveys sharing a pointing_group_id were passed into one joint inference run."""
 
 
+class MergePolicyError(DoubleCountingError):
+    """A forbidden (``keep_first``) or unknown pointing merge policy was requested."""
+
+
 class Tier3ScoringError(FermiDeskError):
     """A quarantined (Tier-3) hypothesis was passed into empirical likelihood scoring."""
 

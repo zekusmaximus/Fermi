@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 import astropy.units as u
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from fermi_desk.errors import (
     MergePolicyError,
@@ -661,6 +668,12 @@ BL_LBAND_BEAM_FWHM_ARCMIN = 8.4
 BACKGROUND_D_MAX_PC = 10000.0
 BACKGROUND_VALIDATION_SAMPLE = 1000
 DistanceMethod = Literal["gaia_dr3_inverse_parallax", "bailer_jones_2021_geo"]
+# Ruling v0.2.1-R4: Gaia DR3 source ids are 64-bit integers (up to ~6.9e18, far above
+# 2^53), and a JSON number that large is silently rounded by JavaScript consumers. Every
+# id written into an artifact from v0.2.1 on is therefore a decimal STRING; a JSON
+# number in its place is a schema error (pydantic never coerces int -> str here).
+# Locked v0.1.x artifacts keep their integer ids and are stringified at the API boundary.
+GaiaSourceIdStr = Annotated[str, StringConstraints(pattern=r"^[1-9][0-9]{0,18}$")]
 
 
 def _iso_utc(value: str, name: str) -> str:
@@ -765,6 +778,23 @@ class BackgroundDistanceCuts(_Frozen):
         return self
 
 
+class SuspectedUnmatchedPrimary(_Frozen):
+    """A surviving background star that may be an ID-less primary (review only).
+
+    Within 120 arcsec (J2000) of a primary without a Gaia id and within 30% of its
+    distance. Ruling v0.2.1-R3: listed, counted and reported - never removed. Each one
+    that really is the primary is counted twice (once on-axis, once in a shell).
+    """
+
+    primary_target_name: str = Field(min_length=1)
+    gaia_dr3_source_id: GaiaSourceIdStr
+    separation_arcsec: float = Field(ge=0)
+    distance_pc: float = Field(gt=0)
+    primary_distance_pc: float = Field(gt=0)
+    pointing_index: int = Field(ge=0)  # beam of the star's kept (minimum-offset) sighting
+    theta_arcmin: float = Field(ge=0)
+
+
 class BackgroundDedupAudit(_Frozen):
     """Exact de-duplication counts of the background field against the locked primaries."""
 
@@ -779,7 +809,7 @@ class BackgroundDedupAudit(_Frozen):
     # Surviving background stars close to an ID-less primary at a compatible distance:
     # reported for human review, never silently removed (they stay in the shells).
     n_suspected_unmatched_primary: int = Field(ge=0)
-    suspected_unmatched_primary: list[dict] = Field(default_factory=list)
+    suspected_unmatched_primary: list[SuspectedUnmatchedPrimary] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _counts(self) -> BackgroundDedupAudit:
@@ -845,7 +875,7 @@ class BackgroundShellTable(_Frozen):
 
 
 class BackgroundSampleStar(_Frozen):
-    gaia_dr3_source_id: int = Field(gt=0)
+    gaia_dr3_source_id: GaiaSourceIdStr
     ra_deg: float  # catalog epoch of the source service (Gaia DR3: 2016.0); defines theta
     dec_deg: float
     ra_match_deg: float  # epoch of the primary catalog (J2000.0); used by the angular fallback
@@ -862,7 +892,7 @@ class BackgroundSampleStar(_Frozen):
 class PrimaryMatchedSighting(_Frozen):
     """A background sighting absorbed by a primary target (removed before shell binning)."""
 
-    gaia_dr3_source_id: int = Field(gt=0)
+    gaia_dr3_source_id: GaiaSourceIdStr
     primary_target_name: str
     match: Literal["gaia_dr3_source_id", "angular_fallback"]
     pointing_index: int = Field(ge=0)

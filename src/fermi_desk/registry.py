@@ -815,7 +815,7 @@ def build_background_summary(
     pick = np.sort(rng.choice(len(bg_rows), size=min(n_req, len(bg_rows)), replace=False))
     sample = [
         {
-            "gaia_dr3_source_id": int(gaia[r]),
+            "gaia_dr3_source_id": str(int(gaia[r])),  # v0.2.1-R4: string, never a number
             "ra_deg": float(sky_ra_deg[r]),
             "dec_deg": float(sky_dec_deg[r]),
             "ra_match_deg": float(merged.ra_deg[r]),
@@ -850,7 +850,7 @@ def build_background_summary(
             by_id = gaia[r] != MISSING_GAIA_ID and gaia[r] == gaia[wr]
             matched.append(
                 {
-                    "gaia_dr3_source_id": int(gaia[r]),
+                    "gaia_dr3_source_id": str(int(gaia[r])),
                     "primary_target_name": str(merged.names[wr]),
                     "match": "gaia_dr3_source_id" if by_id else "angular_fallback",
                     "pointing_index": int(merged.pointing_index[r]),
@@ -1079,7 +1079,7 @@ def _recompute_background_summary(
         for key, k in zip(keys.tolist(), n_in.tolist(), strict=True):
             if cell_count.get(tuple(key), 0) < k:
                 raise ProvenanceError(f"validation stars in cell {key} exceed the stored count")
-        ids = np.array([s.gaia_dr3_source_id for s in bg], np.int64)
+        ids = np.array([int(s.gaia_dr3_source_id) for s in bg], np.int64)  # exact
         if np.intersect1d(ids, prim.gaia_dr3_source_id[has_id]).size:
             raise DoubleCountingError("a validation background star duplicates a primary Gaia id")
         if (~has_id).any():
@@ -1094,6 +1094,38 @@ def _recompute_background_summary(
                     "primary without a Gaia id (unmerged collision)"
                 )
     index = {str(x): i for i, x in enumerate(prim.names)}
+    # Suspected unmatched primaries (ruling v0.2.1-R3: listed, never removed): every one
+    # must be a star that really is in the shells, next to an ID-less primary.
+    suspects: dict[str, tuple[int, int, int]] = {}
+    primary_ids = set(prim.gaia_dr3_source_id[has_id].tolist())
+    for sp in da.suspected_unmatched_primary:
+        j = index.get(sp.primary_target_name)
+        if j is None or has_id[j]:
+            raise ProvenanceError(
+                f"suspected unmatched primary names {sp.primary_target_name!r}, which is not "
+                "a primary without a Gaia id"
+            )
+        if int(sp.gaia_dr3_source_id) in primary_ids:
+            raise DoubleCountingError("a suspected star carries a primary Gaia id")
+        if sp.pointing_index >= len(prim) or sp.theta_arcmin > cone + 1e-9:
+            raise ProvenanceError("suspected star lies outside every recorded beam")
+        e_sp = radio.min_detectable_eirp_off_axis(
+            sp.distance_pc * u.pc, sp.theta_arcmin * u.arcmin, f_q, fwhm_q
+        )
+        cell = (
+            sp.pointing_index,
+            int(binning.distance_bin(sp.distance_pc * u.pc)[0]),
+            int(binning.eirp_bin(e_sp)[0]),
+        )
+        suspects[sp.gaia_dr3_source_id] = cell  # one star may neighbour two primaries
+    per_cell: dict[tuple[int, int, int], int] = {}
+    for cell in suspects.values():
+        per_cell[cell] = per_cell.get(cell, 0) + 1
+    for cell, k in per_cell.items():
+        if cell_count.get(cell, 0) < k:
+            raise ProvenanceError(
+                f"suspected unmatched primaries in cell {cell} exceed the stored shell count"
+            )
     for m in rec.validation_sample.primary_matched:
         j = index.get(m.primary_target_name)
         if j is None:
@@ -1101,7 +1133,7 @@ def _recompute_background_summary(
                 f"primary-matched sighting names unknown target {m.primary_target_name!r}"
             )
         pid = int(prim.gaia_dr3_source_id[j])
-        if m.match == "gaia_dr3_source_id" and pid != m.gaia_dr3_source_id:
+        if m.match == "gaia_dr3_source_id" and pid != int(m.gaia_dr3_source_id):
             raise ProvenanceError(f"{m.primary_target_name}: Gaia-id match with a different id")
         if m.match == "angular_fallback" and (pid != MISSING_GAIA_ID or m.separation_arcsec >= tol):
             raise ProvenanceError(
@@ -1127,7 +1159,9 @@ def _recompute_background_summary(
         f"({prim.sha256[:8]}...): {mp.n_dedup_gaia_id} Gaia-id + {mp.n_dedup_angular_fallback} "
         f"angular removals, {mp.n_multi_beam_resolved} multi-beam stars, 0 duplicated Gaia ids; "
         f"{len(bg)} validation stars: theta, off-axis EIRP_min [W] and bins recomputed; "
-        f"{len(rec.validation_sample.primary_matched)} primary-matched sightings verified"
+        f"{len(rec.validation_sample.primary_matched)} primary-matched sightings verified; "
+        f"{da.n_suspected_unmatched_primary} suspected_unmatched_primary row(s) "
+        f"({len(suspects)} distinct stars) kept in the shells and reported (v0.2.1-R3)"
     )
     return detail, shells
 

@@ -467,7 +467,9 @@ def suspected_unmatched_primaries(merged: MergedTargets, primary: SightingTable)
 
     A background star within 120 arcsec (J2000 positions) of an ID-less primary whose
     distance agrees within 30% is listed for human review. Nothing is removed here: the
-    de-duplication rule is Gaia id, then the 3 arcsec fallback, and nothing else.
+    de-duplication rule is Gaia id, then the 3 arcsec fallback, and nothing else. Each row
+    records the star's own shell cell (pointing_index + distance + theta), so a reader can
+    evaluate any result with and without these stars (ruling v0.2.1-R3).
     """
     win = merged.winner
     bg = win[merged.winner_role == "background"]
@@ -483,17 +485,21 @@ def suspected_unmatched_primaries(merged: MergedTargets, primary: SightingTable)
     rows = [
         {
             "primary_target_name": str(primary.names[no_id[p]]),
-            "gaia_dr3_source_id": int(merged.gaia_dr3_source_id[bg[s]]),
+            # v0.2.1-R4: a decimal string (64-bit ids exceed 2^53)
+            "gaia_dr3_source_id": str(int(merged.gaia_dr3_source_id[bg[s]])),
             "separation_arcsec": float(a),
             "distance_pc": float(ds),
             "primary_distance_pc": float(dp),
+            # beam of the kept (minimum-offset) sighting: with distance_pc and theta_arcmin
+            # it addresses the star's shell cell exactly
+            "pointing_index": int(merged.pointing_index[bg[s]]),
             "theta_arcmin": float(merged.theta.to_value(u.arcmin)[bg[s]]),
         }
         for p, s, a, ds, dp in zip(
             i_p[ok], i_s[ok], sep.to_value(u.arcsec)[ok], d_s[ok], d_p[ok], strict=True
         )
     ]
-    return sorted(rows, key=lambda r: (r["primary_target_name"], r["gaia_dr3_source_id"]))
+    return sorted(rows, key=lambda r: (r["primary_target_name"], int(r["gaia_dr3_source_id"])))
 
 
 def assemble(

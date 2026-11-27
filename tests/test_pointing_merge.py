@@ -15,6 +15,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import re
 import shutil
 import urllib.request
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ from fermi_desk.models import radio
 from fermi_desk.registry import (
     MISSING_GAIA_ID,
     SightingTable,
+    background_summary_bytes,
     check_pointing_groups,
     load_background_summary,
     load_factor_graph,
@@ -68,6 +70,7 @@ from fermi_desk.schemas import (
     BackgroundSummaryFile,
     MergeProvenance,
     Survey,
+    SuspectedUnmatchedPrimary,
     validate_pointing_merge_policy,
 )
 
@@ -717,6 +720,58 @@ def test_tampered_background_summary_is_rejected(merged_root, synthetic, tmp_pat
         root_with(seal({**doc, "shells": cells}))()
 
 
+def test_suspected_unmatched_primary_rows_are_recomputed_against_the_shells(
+    merged_root, synthetic, tmp_path
+):
+    """validate re-derives each suspected star's shell cell: it must be a real shell star
+    next to a primary WITHOUT a Gaia id (ruling v0.2.1-R3: listed, never removed)."""
+    from fermi_desk.registry import seal_background_summary as seal
+
+    parent_doc = yaml.safe_load((ROOT / "data/surveys" / f"{PARENT}.yaml").read_text("utf-8"))
+    doc = synthetic.doc
+    prim = synthetic.primary
+    no_id = str(prim.names[np.flatnonzero(prim.gaia_dr3_source_id == MISSING_GAIA_ID)[0]])
+    with_id = str(prim.names[np.flatnonzero(prim.gaia_dr3_source_id != MISSING_GAIA_ID)[0]])
+    star = doc["validation_sample"]["background"][0]
+    row = {
+        "primary_target_name": no_id,
+        "gaia_dr3_source_id": star["gaia_dr3_source_id"],
+        "separation_arcsec": 10.0,
+        "distance_pc": star["distance_pc"],
+        "primary_distance_pc": star["distance_pc"],
+        "pointing_index": star["pointing_index"],
+        "theta_arcmin": star["theta_arcmin"],
+    }
+
+    def load(rows):
+        audit = {
+            **doc["dedup_audit"],
+            "n_suspected_unmatched_primary": len(rows),
+            "suspected_unmatched_primary": rows,
+        }
+        root = tmp_path / f"case{len(list(tmp_path.iterdir()))}"
+        shutil.copytree(merged_root / "data", root / "data")
+        _write_extension(root, seal({**doc, "dedup_audit": audit}), parent_doc)
+        g = load_factor_graph(root)
+        return load_background_summary(g.surveys[EXT], g.surveys[PARENT], root)
+
+    bf = load([row])
+    assert bf.record.dedup_audit.n_suspected_unmatched_primary == 1
+    assert "1 suspected_unmatched_primary row(s) (1 distinct stars) kept" in bf.detail
+    # The same star beside two primaries is one star, not two.
+    assert "(1 distinct stars)" in load([row, {**row, "separation_arcsec": 11.0}]).detail
+    other = (star["pointing_index"] + 1) % len(prim)  # 1.5 pc there: no such shell cell
+    cases = (
+        ({**row, "primary_target_name": with_id}, "not a primary without a Gaia id"),
+        ({**row, "primary_target_name": "no such target"}, "not a primary without a Gaia id"),
+        ({**row, "theta_arcmin": 4.3}, "outside every recorded beam"),
+        ({**row, "pointing_index": other, "distance_pc": 1.5}, "exceed the stored shell count"),
+    )
+    for bad, message in cases:
+        with pytest.raises(ProvenanceError, match=message):
+            load([bad])
+
+
 def test_reproduced_archive_summary_needs_clean_sha_complete_coverage_and_receipt(synthetic):
     """Schema gate (in memory only): the reproduced_archive tier cannot be claimed without a
     clean commit, all pointings and a source receipt."""
@@ -783,6 +838,75 @@ def test_coarser_shell_bins_shrink_the_summary_and_stay_self_consistent(script, 
     assert merged.provenance == synthetic.merged.provenance  # binning never changes the merge
     restored = radio.ShellBinning.from_dict(rec.shells.binning.model_dump())
     assert restored == coarse
+
+
+def test_summary_artifact_serialises_every_gaia_id_as_a_string(synthetic, script):
+    """Ruling v0.2.1-R4: Gaia DR3 source ids exceed 2^53, so the artifact stores them as
+    decimal strings (a JSON number would be rounded by any JavaScript consumer). A numeric
+    id is a schema error, and the string form round-trips to the exact 64-bit integer."""
+    doc = synthetic.doc
+    sample = doc["validation_sample"]
+    ids = [s["gaia_dr3_source_id"] for s in sample["background"]]
+    ids += [m["gaia_dr3_source_id"] for m in sample["primary_matched"]]
+    assert ids and all(isinstance(x, str) and x.isdigit() for x in ids)
+    big = [int(x) for x in ids if int(x) > 2**53]
+    assert big and all(int(float(x)) != x for x in big[:20])  # float64 / JS would corrupt them
+    raw = background_summary_bytes(doc)
+    assert re.search(rb'"gaia_dr3_source_id":\s*[0-9-]', raw) is None  # never a JSON number
+    assert len(re.findall(rb'"gaia_dr3_source_id":"[1-9][0-9]*"', raw)) == len(ids)
+    rec = BackgroundSummaryFile.model_validate(json.loads(raw))
+    assert [s.gaia_dr3_source_id for s in rec.validation_sample.background] == ids[
+        : len(sample["background"])
+    ]
+    # A numeric id (the pre-R4 form) no longer validates, in either list.
+    star, matched = dict(sample["background"][0]), dict(sample["primary_matched"][0])
+    numeric_star = {**star, "gaia_dr3_source_id": int(star["gaia_dr3_source_id"])}
+    numeric_match = {**matched, "gaia_dr3_source_id": int(matched["gaia_dr3_source_id"])}
+    for bad_sample in (
+        {**sample, "background": [numeric_star, *sample["background"][1:]]},
+        {**sample, "primary_matched": [numeric_match, *sample["primary_matched"][1:]]},
+    ):
+        with pytest.raises(ValueError, match="gaia_dr3_source_id"):
+            BackgroundSummaryFile.model_validate({**doc, "validation_sample": bad_sample})
+    for junk in ("", "0123", "-5", "1.5e18", "12345678901234567890"):
+        with pytest.raises(ValueError):
+            BackgroundSummaryFile.model_validate(
+                {
+                    **doc,
+                    "validation_sample": {
+                        **sample,
+                        "background": [
+                            {**star, "gaia_dr3_source_id": junk},
+                            *sample["background"][1:],
+                        ],
+                    },
+                }
+            )
+
+
+def test_suspected_unmatched_primary_is_listed_with_a_string_id_and_never_removed(script):
+    """Ruling v0.2.1-R3: a background star near an ID-less primary at a compatible distance
+    but outside the 3 arcsec fallback stays in the merge and is listed for review."""
+    big = 6898272528885931234  # > 2^53
+    primary = sightings(PARENT, "primary", [("P no id", None, 10.0, 10.0, 5.0, 0, 0.0)])
+    background = sightings(
+        EXT,
+        "background",
+        [
+            ("near", big, 10.0, 10.0 + 10.0 * ARCSEC, 5.2, 0, 0.17),  # 10 arcsec, +4% distance
+            ("far", big + 1, 10.0, 10.0 + 60.0 * ARCSEC, 900.0, 0, 1.0),  # wrong distance
+        ],
+    )
+    merged = union_targets_by_pointing(GROUP, [primary, background])
+    assert len(merged) == 3 and merged.provenance.n_dedup_angular_fallback == 0  # not removed
+    (row,) = script.suspected_unmatched_primaries(merged, primary)
+    assert row["gaia_dr3_source_id"] == str(big) and row["primary_target_name"] == "P no id"
+    assert row["separation_arcsec"] == pytest.approx(10.0, abs=1e-6)
+    rec = SuspectedUnmatchedPrimary.model_validate(row)
+    assert int(rec.gaia_dr3_source_id) == big
+    assert (rec.pointing_index, rec.theta_arcmin) == (0, 0.17)  # addresses its shell cell
+    with pytest.raises(ValueError):
+        SuspectedUnmatchedPrimary.model_validate({**row, "gaia_dr3_source_id": big})
 
 
 def test_distance_rules_count_every_cut(script):
